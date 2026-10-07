@@ -1,0 +1,1655 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Managed Kubernetes: EKS vs GKE vs AKS — Flavors, Intricacies, and Cluster Lifecycle - Temporal Cloud Infrastructure Ramp-Up</title>
+<link rel="stylesheet" href="style.css">
+<script>
+(function(){
+  try{
+    var t=localStorage.getItem('rampup-theme');
+    if(t){document.documentElement.setAttribute('data-theme',t);}
+  }catch(e){}
+  window.__toggleTheme=function(){
+    var el=document.documentElement;
+    var cur=el.getAttribute('data-theme');
+    if(!cur){
+      cur=window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';
+    }
+    var next=cur==='dark'?'light':'dark';
+    el.setAttribute('data-theme',next);
+    try{localStorage.setItem('rampup-theme',next);}catch(e){}
+  };
+})();
+</script>
+
+</head>
+<body>
+<div class="shell"><aside class="sidebar">
+  <div class="brand"><a href="../index.html">
+    <div class="brand-title">Temporal Cloud Infrastructure Ramp-Up</div>
+    <div class="brand-sub">New-role ramp-up &middot; public sources only</div>
+  </a></div>
+  <div class="nav-label">Guides</div>
+  <nav class="nav"><a href="01-golang.html"><span class="num">01</span><span>Go</span></a><a href="02-grpc.html"><span class="num">02</span><span>gRPC &amp; Protobuf</span></a><a href="03-multicloud-aws-gcp-azure.html"><span class="num">03</span><span>Multi-Cloud</span></a><a href="04-managed-kubernetes-eks-gke-aks.html" class="active"><span class="num">04</span><span>Managed Kubernetes</span></a><a href="05-cni-and-host-networking.html"><span class="num">05</span><span>CNI &amp; Host Networking</span></a><a href="06-karpenter.html"><span class="num">06</span><span>Karpenter</span></a><a href="07-kyverno.html"><span class="num">07</span><span>Kyverno</span></a><a href="08-terraform.html"><span class="num">08</span><span>Terraform</span></a><a href="09-helm.html"><span class="num">09</span><span>Helm</span></a><a href="10-vault.html"><span class="num">10</span><span>Vault</span></a><a href="11-cert-manager-and-pki.html"><span class="num">11</span><span>cert-manager &amp; PKI</span></a><a href="12-cell-lifecycle-synthesis.html"><span class="num">12</span><span>Cell Lifecycle</span></a><a href="13-gitops-argocd-flux.html"><span class="num">13</span><span>GitOps</span></a><a href="14-observability-for-cells.html"><span class="num">14</span><span>Observability</span></a><a href="15-temporal-programming-model.html"><span class="num">15</span><span>Temporal: Programming Model</span></a><a href="16-temporal-server-internals.html"><span class="num">16</span><span>Temporal Server Internals</span></a><a href="17-cell-based-architecture.html"><span class="num">17</span><span>Cell-Based Architecture</span></a></nav>
+  <div class="nav-label" style="margin-top:1rem">Practice</div>
+  <nav class="nav"><a href="../drill.html"><span class="num">&#9670;</span><span>Drill deck</span></a></nav>
+</aside><div class="main"><article class="doc"><div class="topbar">
+  <div class="crumbs"><span class="pill">Guide 04</span><span class="pill">86 refs</span><span class="pill">13,607 words</span></div>
+  <div style="display:flex;gap:.5rem;align-items:center">
+    <span>~68 min read</span>
+    <button class="iconbtn" onclick="__toggleTheme()">theme</button>
+  </div>
+</div><h1>Managed Kubernetes: EKS vs GKE vs AKS — Flavors, Intricacies, and Cluster Lifecycle</h1>
+<div class="lede"><p><strong>Why this matters.</strong> Cell lifecycle for Temporal Cloud means provisioning, upgrading, and tearing down isolated Kubernetes-based capacity units across AWS, GCP, and Azure. Temporal's own engineering writing describes Temporal Cloud as a cell-based architecture where each cell is a self-contained unit with its own account, VPC, and Kubernetes cluster, and says the same principles were carried to GCP using equivalent primitives (<a href="https://temporal.io/blog/building-durable-cloud-control-systems-with-temporal">Temporal blog</a>). That means the unit of work you ship is <em>a cluster</em>, repeated hundreds of times, on three providers whose version policies, upgrade semantics, node abstractions, identity models, and teardown failure modes are all different. Almost none of that difference is Kubernetes — it is the seam between Kubernetes and the cloud. This guide is about that seam.</p></div>
+<p>Everything below was verified against primary docs on <strong>2026-08-29</strong>. This is the fastest-churning area in cloud infrastructure; every version window and default here has a source link so you can re-verify. Where I could not verify something, I say so explicitly.</p>
+<hr />
+<h2 id="the-mental-model">The mental model<a class="anchor" href="#the-mental-model">#</a></h2>
+<p>Hold four ideas.</p>
+<p><strong>1. Managed Kubernetes is a contract about who holds the pager for <code>etcd</code>, not a product.</strong> All three clouds run apiserver, etcd, scheduler, and controller-manager for you and hide the machines. What differs is the <em>edge</em> of that contract: which flags you can set, whether you can read etcd, what happens when the provider decides your version is too old, and what the provider does to your nodes without asking. Everything painful in fleet operations lives at that edge.</p>
+<p><strong>2. The version treadmill is the product.</strong> Kubernetes ships roughly three minor releases a year (<a href="https://kubernetes.io/releases/">Kubernetes releases</a>), each supported for about a year upstream. Every managed offering wraps that with its own support window, its own escape hatch (paid extended support), and its own forcing function. If you own N clusters on three clouds, you are running a continuous, never-finished upgrade pipeline. Design for that, not for "we'll upgrade in Q3."</p>
+<p><strong>3. A cell is cattle, and the hard part is not <code>create</code>, it is <code>converge</code> and <code>delete</code>.</strong> Creating a cluster is a single API call plus twenty minutes. Making a cluster <em>identical</em> to 300 siblings, and deleting one without leaving orphaned load balancers, disks, ENIs, DNS records, and IAM roles behind, is the actual engineering. Finalizers and cloud-controller-created resources are where teardown goes wrong.</p>
+<p><strong>4. Three clouds means three failure vocabularies, one abstraction.</strong> Your job is to build one cell lifecycle API whose implementation branches only where the clouds genuinely differ, and to <em>know</em> exactly where those branches are. The list of genuine differences is shorter than it looks — version policy, node abstraction, IP model, identity federation, and teardown ordering. Everything else can be one code path.</p>
+<p>A useful frame for the whole guide:</p>
+<div class="codehilite"><pre><span></span><code>                 things all three clouds do the same
+  ┌───────────────────────────────────────────────────────────┐
+  │ Kubernetes API, RBAC, PDBs, drain/eviction, StatefulSets, │
+  │ CSI, CRDs, controllers, kubelet, containerd               │
+  └───────────────────────────────────────────────────────────┘
+                 things that MUST branch per cloud
+  ┌───────────────────────────────────────────────────────────┐
+  │ version + support window       auto-upgrade semantics     │
+  │ node abstraction + OS image    pod IP model               │
+  │ workload identity federation   human/CI authn             │
+  │ default StorageClass + AZ      add-on lifecycle           │
+  │ quota model                    teardown ordering          │
+  └───────────────────────────────────────────────────────────┘
+</code></pre></div>
+
+<hr />
+<h2 id="core-concepts">Core concepts<a class="anchor" href="#core-concepts">#</a></h2>
+<h3 id="the-control-plane-from-an-operators-point-of-view">The control plane, from an operator's point of view<a class="anchor" href="#the-control-plane-from-an-operators-point-of-view">#</a></h3>
+<p>You know what these components do. What matters when you <em>operate</em> clusters is what each one costs you when it degrades, and who can touch it.</p>
+<ul>
+<li><strong>kube-apiserver</strong> — the only component anything else talks to. It is stateless and horizontally scalable, and it is the first thing that browns out under fleet-wide load (a badly written controller doing <code>LIST</code> on every pod every 5 seconds will take it down). All three clouds scale it for you, and none let you set arbitrary flags.</li>
+<li><strong>etcd</strong> — the consistent store. It is the thing that actually cannot be lost, and the thing you cannot see on any managed offering. Upstream guidance sets a default 8 GiB storage limit, and EKS documents that limit explicitly and tells you to watch <code>etcd_db_total_size_in_bytes</code> (<a href="https://docs.aws.amazon.com/eks/latest/best-practices/known_limits_and_service_quotas.html">EKS known limits</a>, <a href="https://etcd.io/docs/v3.5/dev-guide/limit/">etcd limits</a>). GKE surfaces it as a first-class quota of 6 GB (<a href="https://docs.cloud.google.com/kubernetes-engine/quotas">GKE quotas</a>).</li>
+<li><strong>kube-scheduler</strong> and <strong>kube-controller-manager</strong> — leader-elected, managed, invisible. You mostly interact with them through symptoms: pods pending forever (scheduler, or more likely quota/taints), or PVs not binding (controller-manager plus CSI).</li>
+<li><strong>cloud-controller-manager</strong> — the component that turns <code>Service type=LoadBalancer</code> into a real load balancer and node objects into real VMs. This one matters enormously for teardown, because it is the thing that creates cloud resources on your behalf and must be alive to delete them.</li>
+<li><strong>kubelet</strong> — on your nodes, running your version. The version skew policy allows kubelet to be up to <strong>three</strong> minor versions older than the apiserver from Kubernetes 1.25 onward (two before that), and kubelet must never be <em>newer</em> than the apiserver (<a href="https://kubernetes.io/releases/version-skew-policy/">version skew policy</a>). This single rule is why every managed upgrade is control-plane-first, and why you can defer node upgrades for a while — but not forever.</li>
+</ul>
+<h4 id="what-managed-means-component-by-component">What "managed" means, component by component</h4>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>EKS</th>
+<th>GKE</th>
+<th>AKS</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>apiserver hosting</td>
+<td>AWS-owned account, exposed via ENIs in your VPC</td>
+<td>Google-owned project, peered/PSC to your VPC</td>
+<td>Microsoft-owned; optionally projected into a delegated subnet of your VNet via <a href="https://learn.microsoft.com/en-us/azure/aks/api-server-vnet-integration">API Server VNet Integration</a></td>
+</tr>
+<tr>
+<td>apiserver flags</td>
+<td>Not settable. Narrow allowlist of features via cluster config (authn mode, logging, encryption)</td>
+<td>Not settable. Feature toggles via cluster config</td>
+<td>Not settable. Feature toggles via cluster config</td>
+</tr>
+<tr>
+<td>Admission plugins</td>
+<td>Fixed set; you add webhooks</td>
+<td>Fixed set; you add webhooks (plus GKE-forced ones on Autopilot)</td>
+<td>Fixed set; you add webhooks</td>
+</tr>
+<tr>
+<td>etcd access</td>
+<td>None. Backups are AWS's problem, not yours; no restore-to-point-in-time knob exposed</td>
+<td>None. 6 GB quota is visible (<a href="https://docs.cloud.google.com/kubernetes-engine/quotas">GKE quotas</a>)</td>
+<td>None. Control-plane scaling differs by tier (<a href="https://learn.microsoft.com/en-us/azure/aks/free-standard-pricing-tiers">AKS tiers</a>)</td>
+</tr>
+<tr>
+<td>etcd size limit</td>
+<td>8 GiB (upstream default), documented by AWS (<a href="https://docs.aws.amazon.com/eks/latest/best-practices/known_limits_and_service_quotas.html">EKS limits</a>)</td>
+<td>6 GB quota (<a href="https://docs.cloud.google.com/kubernetes-engine/quotas">GKE quotas</a>)</td>
+<td>Not published as a per-cluster number; tier-dependent (<a href="https://learn.microsoft.com/en-us/azure/aks/free-standard-pricing-tiers">AKS tiers</a>)</td>
+</tr>
+<tr>
+<td>Control-plane SLA</td>
+<td>Paid tier only concept does not apply; single tier</td>
+<td>Regional clusters carry a higher SLA than zonal (<a href="https://cloud.google.com/kubernetes-engine/sla">GKE SLA</a>)</td>
+<td>Free tier has <strong>no</strong> financially backed SLA; Standard/Premium do (<a href="https://learn.microsoft.com/en-us/azure/aks/free-standard-pricing-tiers">AKS tiers</a>)</td>
+</tr>
+<tr>
+<td>Control-plane cost</td>
+<td>~$0.10/cluster/hour standard, <strong>$0.60/cluster/hour in extended support</strong> (<a href="https://aws.amazon.com/blogs/containers/amazon-eks-extended-support-for-kubernetes-versions-pricing/">AWS pricing blog</a>)</td>
+<td>Cluster management fee per cluster; see <a href="https://cloud.google.com/kubernetes-engine/pricing">GKE pricing</a> (I did not re-verify the exact rate in this pass)</td>
+<td>Free $0, Standard ~$0.10/cluster/hour, Premium ~$0.60/cluster/hour (<a href="https://learn.microsoft.com/en-us/azure/aks/free-standard-pricing-tiers">AKS tiers</a>)</td>
+</tr>
+</tbody>
+</table>
+<p>The operational punchline: <strong>you cannot debug etcd on any of them.</strong> Your only levers are (a) keep object count and object size down, (b) watch the size metric where exposed, and (c) treat "cluster is full" as a cell-splitting signal rather than a tuning problem. For a cell architecture that is actually good news — it pushes you toward more, smaller cells, which is what you want anyway.</p>
+<hr />
+<h3 id="version-and-support-windows-the-big-comparison">Version and support windows: the big comparison<a class="anchor" href="#version-and-support-windows-the-big-comparison">#</a></h3>
+<p>This is the table to internalize. Dates verified 2026-08-29.</p>
+<table>
+<thead>
+<tr>
+<th>Dimension</th>
+<th>EKS</th>
+<th>GKE</th>
+<th>AKS</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Standard support per minor</td>
+<td><strong>14 months</strong> from EKS release (<a href="https://docs.aws.amazon.com/eks/latest/userguide/kubernetes-versions-extended.html">EKS extended support docs</a>)</td>
+<td>~<strong>14 months</strong> from Regular-channel availability (<a href="https://docs.cloud.google.com/kubernetes-engine/versioning">GKE versioning</a>)</td>
+<td><strong>12 months</strong> from AKS GA; N-2 GA minors supported (<a href="https://learn.microsoft.com/en-us/azure/aks/supported-kubernetes-versions">AKS supported versions</a>)</td>
+</tr>
+<tr>
+<td>Extended support</td>
+<td><strong>+12 months</strong> (26 total) (<a href="https://docs.aws.amazon.com/eks/latest/userguide/kubernetes-versions-extended.html">AWS</a>)</td>
+<td><strong>+~10 months</strong> via the <strong>Extended channel</strong> (~24 total) (<a href="https://docs.cloud.google.com/kubernetes-engine/versioning">GKE versioning</a>)</td>
+<td><strong>LTS</strong>: +12 months (~24 total) (<a href="https://learn.microsoft.com/en-us/azure/aks/long-term-support">AKS LTS</a>)</td>
+</tr>
+<tr>
+<td>Extended support cost</td>
+<td>$0.60/cluster/hr vs $0.10 — <strong>6x</strong> (<a href="https://aws.amazon.com/blogs/containers/amazon-eks-extended-support-for-kubernetes-versions-pricing/">AWS blog</a>)</td>
+<td>Channel change, no separate per-cluster surcharge documented on the versioning page</td>
+<td>Requires <strong>Premium tier</strong> (~$0.60/cluster/hr), billed only once the minor exits community support (<a href="https://learn.microsoft.com/en-us/azure/aks/long-term-support">AKS LTS</a>)</td>
+</tr>
+<tr>
+<td>Extended support opt-in</td>
+<td>Cluster <code>upgradePolicy</code> field: <code>STANDARD</code> or <code>EXTENDED</code> (<a href="https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-eks-cluster-upgradepolicy.html">UpgradePolicy</a>)</td>
+<td>Enroll cluster in <strong>Extended</strong> release channel</td>
+<td>Set cluster tier to Premium <strong>and</strong> select the LTS support plan</td>
+</tr>
+<tr>
+<td>Release channels</td>
+<td>None. You pick an exact minor</td>
+<td><strong>Rapid / Regular / Stable / Extended</strong> (<a href="https://docs.cloud.google.com/kubernetes-engine/docs/concepts/release-channels">release channels</a>)</td>
+<td>Auto-upgrade channels: <code>patch</code>, <code>stable</code>, <code>rapid</code>, <code>node-image</code>, <code>none</code> (<a href="https://learn.microsoft.com/en-us/azure/aks/auto-upgrade-cluster">AKS auto-upgrade</a>)</td>
+</tr>
+<tr>
+<td>Minor auto-upgrade by default</td>
+<td><strong>No</strong> for in-support versions. <strong>Yes</strong> as a forced upgrade after extended support ends</td>
+<td><strong>Yes</strong> — every channel auto-upgrades minors except Extended, which auto-upgrades patches only (<a href="https://docs.cloud.google.com/kubernetes-engine/docs/concepts/release-channels">release channels</a>)</td>
+<td>Only if you set an auto-upgrade channel; <code>none</code> is a valid (and dangerous) choice</td>
+</tr>
+<tr>
+<td>Patch auto-upgrade</td>
+<td>Control-plane patches applied by AWS</td>
+<td>Yes, per channel</td>
+<td>Only with <code>patch</code>/<code>stable</code>/<code>rapid</code> channel</td>
+</tr>
+<tr>
+<td>Node OS image auto-update</td>
+<td>No, you drive AMI updates</td>
+<td>Yes, node auto-upgrade tied to channel</td>
+<td>Separate <code>NodeImage</code>/<code>SecurityPatch</code> channel (<a href="https://learn.microsoft.com/en-us/azure/aks/auto-upgrade-node-os-image">node OS auto-upgrade</a>)</td>
+</tr>
+<tr>
+<td>Maintenance windows</td>
+<td>Not a first-class concept for version upgrades</td>
+<td><strong>Maintenance windows + exclusions</strong>, first-class (<a href="https://docs.cloud.google.com/kubernetes-engine/docs/concepts/maintenance-windows-and-exclusions">windows and exclusions</a>)</td>
+<td><strong>Planned Maintenance</strong>: <code>aksManagedAutoUpgradeSchedule</code> and <code>aksManagedNodeOSUpgradeSchedule</code>; 4h+ windows recommended (<a href="https://learn.microsoft.com/en-us/azure/aks/auto-upgrade-cluster">auto-upgrade</a>)</td>
+</tr>
+<tr>
+<td>What happens at true EOL</td>
+<td>AWS force-upgrades the <strong>control plane</strong> (not nodes) to the oldest supported version, with <strong>no advance notification</strong> (<a href="https://docs.aws.amazon.com/eks/latest/userguide/kubernetes-versions-extended.html">EKS extended support</a>)</td>
+<td>GKE auto-upgrades the cluster to keep it operable (<a href="https://docs.cloud.google.com/kubernetes-engine/docs/release-schedule">release schedule footnote 3</a>)</td>
+<td>Cluster becomes unsupported; upgrades are your responsibility</td>
+</tr>
+<tr>
+<td>Skip minors?</td>
+<td>No. One minor at a time</td>
+<td>No. One minor at a time</td>
+<td>No. One minor at a time</td>
+</tr>
+</tbody>
+</table>
+<h4 id="where-each-cloud-actually-is-today-2026-08-29">Where each cloud actually is, today (2026-08-29)</h4>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>EKS</th>
+<th>GKE</th>
+<th>AKS</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Minors on standard support</td>
+<td><strong>1.34, 1.35, 1.36</strong> (<a href="https://docs.aws.amazon.com/eks/latest/userguide/kubernetes-versions-standard.html">EKS standard support notes</a>)</td>
+<td>1.32 (EOS 2026-04-27, now extended-only), <strong>1.33</strong> (EOS 2026-08-12), <strong>1.34</strong>, <strong>1.35</strong>, <strong>1.36</strong> (<a href="https://docs.cloud.google.com/kubernetes-engine/docs/release-schedule">GKE release schedule</a>)</td>
+<td><strong>1.33</strong> (EOL ~July 2026, LTS-eligible), <strong>1.34</strong>, <strong>1.35</strong>; 1.36 rolling out — verify on the <a href="https://learn.microsoft.com/en-us/azure/aks/supported-kubernetes-versions">supported versions page</a></td>
+</tr>
+<tr>
+<td>Newest minor generally available</td>
+<td>1.36</td>
+<td>1.36 (Rapid 2026-04-28, Regular 2026-06-09)</td>
+<td>Verify; AKS trails upstream by ~2 months at GA</td>
+</tr>
+<tr>
+<td>Nearest cliff you should care about</td>
+<td>EKS 1.33 standard support ended 2026-07-29</td>
+<td>GKE 1.33 end of standard support <strong>2026-08-12</strong> (17 days ago)</td>
+<td>AKS 1.33 community support ended ~July 2026</td>
+</tr>
+</tbody>
+</table>
+<p>Two things fall out of that table immediately.</p>
+<p><strong>GKE publishes exact future dates and you should build your roadmap on them.</strong> The <a href="https://docs.cloud.google.com/kubernetes-engine/docs/release-schedule">GKE release schedule</a> gives per-minor availability, auto-upgrade start, end of standard support, and end of extended support for every channel, and it is updated monthly. Nothing equivalent exists on EKS or AKS with that fidelity. Scrape it.</p>
+<p><strong>The three clouds will never be on the same minor at the same time.</strong> GKE Rapid gets 1.36 on 2026-04-28; EKS gets it later; AKS later still. If your cell software depends on any Kubernetes feature gate, your minimum supported version is set by AKS, and your maximum by GKE Rapid. Pick a target <em>band</em> (e.g. "all cells on N or N-1, where N is the newest minor available on all three") and enforce it in CI.</p>
+<h4 id="the-surprise-upgrade-risk-ranked">The surprise-upgrade risk, ranked</h4>
+<ol>
+<li><strong>GKE, by a mile.</strong> Every channel except Extended auto-upgrades your <em>minor version</em> on a schedule Google publishes but you do not control. Rollouts are multi-day (typically four or more days), paused on weekends and holidays, and the exact day depends on your region, your maintenance windows, your exposure to deprecated APIs, and your rollout-sequencing config (<a href="https://docs.cloud.google.com/kubernetes-engine/docs/release-schedule">release schedule</a>). Maintenance exclusions are the brake — and for clusters <em>not</em> in a channel, exclusions cap out at 30 days.</li>
+<li><strong>AKS, if you set a channel.</strong> <code>rapid</code> will move you to the newest minor. <code>stable</code> moves you to N-1. Either can fire inside your maintenance window without a human. <code>none</code> avoids it but then nothing patches either.</li>
+<li><strong>EKS, only at the cliff.</strong> EKS will not move your minor while it is supported. But once extended support ends, AWS force-upgrades the control plane "at any time after the end of extended support date" with <strong>no notification</strong>, and does <em>not</em> upgrade your nodes or add-ons (<a href="https://docs.aws.amazon.com/eks/latest/userguide/kubernetes-versions-extended.html">EKS extended support</a>). That is the worst possible shape of surprise: your apiserver jumps and your kubelets and add-ons do not.</li>
+</ol>
+<p>One more GKE-specific landmine: <strong>"No channel" (formerly "Static") is deprecated and will be removed on 2027-06-14</strong>, after which GKE enrolls all remaining clusters in the Stable channel (<a href="https://docs.cloud.google.com/kubernetes-engine/docs/release-schedule">release schedule</a>). If any of your GKE cells were created channel-less to avoid auto-upgrades, you have a hard deadline.</p>
+<hr />
+<h3 id="upgrade-mechanics">Upgrade mechanics<a class="anchor" href="#upgrade-mechanics">#</a></h3>
+<p>The shape is identical everywhere and worth stating once:</p>
+<div class="codehilite"><pre><span></span><code>1. Pre-flight        detect removed APIs, unsupported add-on versions, PDB deadlocks
+2. Control plane     provider-driven, ~10-40 min, apiserver moves to N+1
+3. Add-ons           CNI, CoreDNS, kube-proxy, CSI must be within compat matrix for N+1
+4. Nodes             rolling / surge / blue-green replacement, drains workloads
+5. Post-flight       verify DaemonSets, verify PVs re-attached, verify PDBs healthy
+</code></pre></div>
+
+<p>The version skew policy is what makes step 2 safe to do before step 4: kubelet may be up to three minors behind the apiserver (<a href="https://kubernetes.io/releases/version-skew-policy/">skew policy</a>). It is also what makes the reverse fatal — never let a node run a kubelet newer than the control plane.</p>
+<h4 id="node-replacement-semantics-side-by-side">Node replacement semantics side by side</h4>
+<table>
+<thead>
+<tr>
+<th>Behavior</th>
+<th>EKS managed node groups</th>
+<th>GKE node pools</th>
+<th>AKS node pools</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Strategy knobs</td>
+<td><code>maxUnavailable</code> <strong>or</strong> <code>maxUnavailablePercentage</code>; <code>updateStrategy</code> of <code>DEFAULT</code> (respects PDBs) or <code>FORCE</code> (<a href="https://docs.aws.amazon.com/eks/latest/APIReference/API_NodegroupUpdateConfig.html">NodegroupUpdateConfig</a>)</td>
+<td><code>maxSurge</code> + <code>maxUnavailable</code> (surge strategy) <strong>or</strong> blue/green (<a href="https://docs.cloud.google.com/kubernetes-engine/docs/concepts/node-pool-upgrade-strategies">node upgrade strategies</a>)</td>
+<td><code>maxSurge</code>, <code>drainTimeoutInMinutes</code>, <code>nodeSoakDurationInMinutes</code> (<a href="https://learn.microsoft.com/en-us/azure/aks/upgrade-aks-node-pools-rolling">rolling upgrades</a>)</td>
+</tr>
+<tr>
+<td>Defaults</td>
+<td>1 node unavailable</td>
+<td><code>maxSurge=1, maxUnavailable=0</code> — surge-first, never dips below capacity (<a href="https://docs.cloud.google.com/kubernetes-engine/docs/concepts/node-pool-upgrade-strategies">GKE</a>)</td>
+<td><code>maxSurge=1</code>, drain timeout <strong>30 min</strong>, soak <strong>0 min</strong> (<a href="https://learn.microsoft.com/en-us/azure/aks/upgrade-aks-node-pools-rolling">AKS</a>)</td>
+</tr>
+<tr>
+<td>Drain timeout</td>
+<td><strong>15 minutes</strong> per node; without <code>FORCE</code>, the update fails if pods do not leave (<a href="https://docs.aws.amazon.com/eks/latest/userguide/managed-node-update-behavior.html">EKS update behavior</a>)</td>
+<td>Governed by pod <code>terminationGracePeriodSeconds</code> and PDBs; blue/green adds a soak phase</td>
+<td>Configurable <strong>5 min – 24 h</strong>, default 30 min</td>
+</tr>
+<tr>
+<td>Blue/green node pool</td>
+<td>Not built in — you create a second node group and shift</td>
+<td><strong>Yes</strong>, first-class blue/green upgrade strategy with batched drain and soak (<a href="https://docs.cloud.google.com/kubernetes-engine/docs/concepts/node-pool-upgrade-strategies">GKE</a>)</td>
+<td>Not built in as an upgrade strategy — you create a second pool</td>
+</tr>
+<tr>
+<td>Ignores PDBs?</td>
+<td>Only with <code>FORCE</code></td>
+<td>Surge upgrades respect eviction; blue/green batches respect it too</td>
+<td>Drain timeout expiry effectively forces past a stuck PDB</td>
+</tr>
+<tr>
+<td>Extra capacity needed</td>
+<td>Yes — new nodes launch before old drain</td>
+<td><code>maxSurge&gt;0</code> needs Compute Engine quota; blue/green <strong>temporarily doubles</strong> the pool (<a href="https://docs.cloud.google.com/kubernetes-engine/docs/concepts/node-pool-upgrade-strategies">GKE</a>)</td>
+<td>Yes — AKS explicitly warns upgrades consume extra subnet IPs and vCPU quota (<a href="https://learn.microsoft.com/en-us/azure/aks/quotas-skus-regions">AKS quotas</a>)</td>
+</tr>
+</tbody>
+</table>
+<p>Three consequences for a fleet:</p>
+<ul>
+<li><strong>Quota is an upgrade dependency.</strong> Surge and blue/green need headroom in vCPU quota <em>and</em> subnet IP space. AKS calls this out directly: "When you upgrade an AKS cluster, extra resources are temporarily consumed... If you don't have the available IP address space or vCPU quota to handle these temporary resources, the cluster upgrade process fails" (<a href="https://learn.microsoft.com/en-us/azure/aks/quotas-skus-regions">AKS quotas</a>). If you sized cell subnets exactly to steady state, your upgrades will fail at 3am.</li>
+<li><strong>PDBs are the thing that stalls you, and the fix is not <code>--force</code>.</strong> A <code>PodDisruptionBudget</code> with <code>minAvailable</code> equal to the replica count makes the pod permanently un-evictable (<a href="https://kubernetes.io/docs/concepts/workloads/pods/disruptions/">disruptions</a>). A single-replica Deployment with <code>maxUnavailable: 0</code> does the same. Across 300 cells, one bad PDB in one tenant namespace stalls one upgrade — which is exactly why you want a fleet-wide PDB linter, not a fleet-wide <code>FORCE</code>.</li>
+<li><strong><code>terminationGracePeriodSeconds</code> multiplies.</strong> Drain sends SIGTERM, waits up to the grace period, then SIGKILL (<a href="https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination">pod termination</a>). A Temporal worker with a 300s grace period, on a node with 40 such pods draining serially behind a PDB, will blow through EKS's 15-minute node drain timeout. Measure real drain time per node class before you set fleet upgrade concurrency.</li>
+</ul>
+<h4 id="statefulsets-make-all-of-this-worse">StatefulSets make all of this worse</h4>
+<p>A StatefulSet updates pods in strict reverse-ordinal order, one at a time, waiting for each to become Ready (<a href="https://kubernetes.io/docs/concepts/workloads/controllers/statefulset/">StatefulSet docs</a>). During a node upgrade, each replacement pod must (a) get scheduled, (b) get its PV detached from the old node and attached to the new one, and (c) pass readiness. If the PV is a <strong>zonal</strong> disk and the new node lands in another AZ, step (b) never completes and the pod is stuck <code>Pending</code> forever with a volume node affinity conflict. This is the single most common stateful-upgrade outage on all three clouds.</p>
+<p>Kubernetes 1.35 added <code>maxUnavailable</code> for StatefulSets as beta, which lets stateful rollouts go parallel (<a href="https://docs.aws.amazon.com/eks/latest/userguide/kubernetes-versions-standard.html">EKS 1.35 notes</a>). Useful, but it does not fix the AZ problem — see the storage section.</p>
+<h4 id="the-api-deprecation-problem">The API deprecation problem</h4>
+<p>Every Kubernetes minor removes APIs that were deprecated several releases earlier (<a href="https://kubernetes.io/docs/reference/using-api/deprecation-guide/">deprecation guide</a>). At fleet scale you will not find these by reading manifests, because the offender is usually a controller, an operator, or a Helm chart three layers down.</p>
+<p>Detection tooling, in order of usefulness:</p>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>Cloud</th>
+<th>How it detects</th>
+<th>Blind spot</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="https://docs.aws.amazon.com/eks/latest/userguide/cluster-insights.html">EKS Cluster Insights / Upgrade Insights</a></td>
+<td>EKS</td>
+<td>AWS-curated findings surfaced via API and console</td>
+<td>Only checks things AWS models; not a full manifest scan</td>
+</tr>
+<tr>
+<td><a href="https://docs.cloud.google.com/kubernetes-engine/docs/deprecations">GKE deprecation insights</a></td>
+<td>GKE</td>
+<td><strong>Observed apiserver calls</strong> from real user agents</td>
+<td>Catches only what actually called recently — a monthly cronjob may be missed</td>
+</tr>
+<tr>
+<td><a href="https://github.com/doitintl/kube-no-trouble"><code>kubent</code> / kube-no-trouble</a></td>
+<td>Any</td>
+<td>Scans live cluster objects, Helm release manifests, and files</td>
+<td>Cannot see a controller that will call a removed API but has no stored object</td>
+</tr>
+<tr>
+<td>Static CI scan of your own charts</td>
+<td>Any</td>
+<td>Pre-merge</td>
+<td>Does not cover third-party charts you install at bootstrap</td>
+</tr>
+</tbody>
+</table>
+<p>Run <strong>all</strong> of them. The GKE model and the <code>kubent</code> model are complementary: one catches runtime callers with no stored objects, the other catches stored objects with no recent callers. Neither alone is sufficient.</p>
+<p>Deprecations currently live on your roadmap, from primary sources:</p>
+<ul>
+<li><strong>1.35</strong>: cgroup v1 support removed — kubelet refuses to start on cgroup v1 nodes by default; containerd 1.x support ends (you must be on containerd 2.0+ before the next minor); IPVS mode of kube-proxy deprecated (<a href="https://docs.aws.amazon.com/eks/latest/userguide/kubernetes-versions-standard.html">EKS 1.35 notes</a>).</li>
+<li><strong>1.36</strong>: <code>gitRepo</code> volumes permanently disabled (<a href="https://github.com/kubernetes/enhancements/issues/5040">KEP-5040</a>); <code>StrictIPCIDRValidation</code> on by default, so <code>10.0.0.5/24</code>-style non-canonical CIDRs and leading-zero IPs are <strong>rejected on create/update</strong> (<a href="https://github.com/kubernetes/enhancements/issues/4858">KEP-4858</a>); SELinux volume labeling GA; Service <code>.spec.externalIPs</code> deprecated (<a href="https://github.com/kubernetes/enhancements/issues/5707">KEP-5707</a>).</li>
+<li><strong>Ecosystem, not Kubernetes</strong>: Ingress NGINX was retired by the upstream project in March 2026 — no further bug fixes or security patches (<a href="https://kubernetes.io/blog/2026/01/29/ingress-nginx-statement/">Kubernetes statement</a>). If any cell bootstraps it, that is a live security debt with no drop-in replacement.</li>
+</ul>
+<p>The <code>StrictIPCIDRValidation</code> one is worth calling out specifically for a cell platform: your cell templates are full of CIDRs. A single <code>192.168.0.5/24</code> in a NetworkPolicy or a Helm value that was silently accepted for years will start failing on create at 1.36. Grep your templates now.</p>
+<hr />
+<h3 id="node-management-the-compute-menu">Node management: the compute menu<a class="anchor" href="#node-management-the-compute-menu">#</a></h3>
+<p>This is where the three clouds diverge most in <em>concepts</em>, not just names.</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>EKS</th>
+<th>GKE</th>
+<th>AKS</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Fully self-managed</td>
+<td>Self-managed node groups / raw ASGs — you own the AMI, bootstrap, and lifecycle hooks</td>
+<td>Not really a thing; node pools are the floor</td>
+<td>VM node pools; you own less than on EKS</td>
+</tr>
+<tr>
+<td>Provider-managed groups</td>
+<td><strong>Managed node groups</strong> — AWS handles ASG, drain, AMI rollout</td>
+<td><strong>Node pools</strong> (Standard mode)</td>
+<td><strong>Node pools</strong> (agent pools)</td>
+</tr>
+<tr>
+<td>Serverless per-pod</td>
+<td><strong>Fargate</strong> — one microVM per pod, no nodes. Note it still runs cgroup v1 as of 1.35 (<a href="https://docs.aws.amazon.com/eks/latest/userguide/kubernetes-versions-standard.html">EKS 1.35 notes</a>)</td>
+<td>Autopilot's per-pod billing model is the analogue</td>
+<td><strong>Virtual nodes</strong> (ACI-backed)</td>
+</tr>
+<tr>
+<td>Fully-managed node layer</td>
+<td><strong>EKS Auto Mode</strong> — AWS runs Karpenter off-cluster plus managed networking, LB, and block storage (<a href="https://aws.amazon.com/blogs/aws/streamline-kubernetes-cluster-management-with-new-amazon-eks-auto-mode">AWS announcement</a>)</td>
+<td><strong>Autopilot</strong> — Google owns nodes entirely; plus <strong>Autopilot ComputeClasses in Standard clusters</strong> since Sept 2025 (<a href="https://docs.cloud.google.com/kubernetes-engine/docs/concepts/about-autopilot-mode-standard-clusters">GKE docs</a>)</td>
+<td><strong>Node Auto-Provisioning (NAP)</strong> — managed Karpenter addon, GA (<a href="https://learn.microsoft.com/en-us/azure/aks/node-auto-provisioning">AKS NAP</a>); the exact GA date is not stated on any primary Microsoft page, so treat "mid-2025" as approximate</td>
+</tr>
+<tr>
+<td>Just-in-time provisioner</td>
+<td>Karpenter (self-run) or Auto Mode (AWS-run)</td>
+<td><strong>Node auto-provisioning</strong> creates node pools on demand (<a href="https://cloud.google.com/kubernetes-engine/docs/how-to/node-auto-provisioning">GKE NAP</a>)</td>
+<td>NAP, built on <a href="https://github.com/Azure/karpenter-provider-azure">Azure/karpenter-provider-azure</a></td>
+</tr>
+<tr>
+<td>Max nodes per pool/group</td>
+<td>Bounded by ASG + EC2 quota</td>
+<td><strong>1,000 per zone</strong> (2,000 for TPU nodes) (<a href="https://docs.cloud.google.com/kubernetes-engine/quotas">GKE quotas</a>)</td>
+<td><strong>1,000 per node pool</strong>, <strong>100 pools per cluster</strong> (<a href="https://learn.microsoft.com/en-us/azure/aks/quotas-skus-regions">AKS quotas</a>)</td>
+</tr>
+</tbody>
+</table>
+<p>Two of the three clouds have now converged on <strong>Karpenter as the managed node autoscaler</strong>: EKS Auto Mode runs Karpenter off-cluster where you never see the pods or the Helm chart, and AKS NAP is the AKS Karpenter provider shipped as a managed addon. GKE's node auto-provisioning predates Karpenter and works differently — it creates and deletes <em>node pools</em>, not individual nodes. For a cell platform this convergence is real but narrower than it looks: <code>karpenter.sh/v1</code> <code>NodePool</code> genuinely is portable, while the <em>NodeClass</em> is not — <code>EC2NodeClass</code> is at <code>karpenter.k8s.aws/v1</code> and <code>AKSNodeClass</code> is still at <code>karpenter.azure.com/v1beta1</code>, so a cross-cloud abstraction has to carry an API-version skew. See the <a href="06-karpenter.html#multi-cloud-status--verified-not-assumed">Karpenter guide</a> for the verified per-provider status, and <a href="06-karpenter.html#disruption-in-depth">disruption in depth</a> for the disruption budgets, consolidation, and drift semantics that matter during upgrades.</p>
+<p>A word of caution on the "fully managed node layer" options for <em>your</em> use case. Auto Mode and Autopilot both restrict what you can do to nodes: privileged DaemonSets, custom kernel parameters, host networking, and node-level agents are constrained or forbidden. A cell running Temporal's data plane will almost certainly want node-level control (sysctls for connection-heavy services, custom eBPF observability, specific instance families for latency). Treat Auto Mode/Autopilot as strong candidates for <em>control-plane-adjacent</em> cells and support tooling, and expect Standard/managed-node-group for the cells that carry customer workflow traffic. Verify this against your actual DaemonSet inventory before committing.</p>
+<h4 id="base-images-and-why-the-choice-matters">Base images, and why the choice matters</h4>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>EKS</th>
+<th>GKE</th>
+<th>AKS</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Default Linux</td>
+<td><strong>AL2023</strong> (AL2 is gone — see below)</td>
+<td><strong>Container-Optimized OS (COS)</strong></td>
+<td><strong>Ubuntu</strong>; <strong>Azure Linux</strong> opt-in</td>
+</tr>
+<tr>
+<td>Container-hardened option</td>
+<td><strong>Bottlerocket</strong> — immutable, minimal, API-driven, separate OS/data volumes</td>
+<td>COS <em>is</em> the hardened option</td>
+<td><strong>Azure Linux</strong> (Microsoft's minimal distro)</td>
+</tr>
+<tr>
+<td>General-purpose option</td>
+<td>AL2023</td>
+<td><strong>Ubuntu</strong> node images</td>
+<td>Ubuntu</td>
+</tr>
+<tr>
+<td>Current defaults, verified</td>
+<td>AL2 EKS-optimized AMIs reached <strong>end of support 2025-11-26</strong>; 1.32 was the last minor with AL2 AMIs; no AL2 AMI for 1.34 (<a href="https://docs.aws.amazon.com/eks/latest/userguide/eks-ami-deprecation-faqs.html">AWS FAQ</a>, <a href="https://github.com/awslabs/amazon-eks-ami/issues/2545">eks-ami#2545</a>)</td>
+<td>COS default; verify per-minor in release notes</td>
+<td><strong>Ubuntu 24.04 becomes the default OS SKU at Kubernetes 1.35</strong>; <code>--os-sku AzureLinux</code> defaults to <strong>Azure Linux 3.0 at 1.32+</strong> (<a href="https://learn.microsoft.com/en-us/azure/aks/node-images">AKS node images</a>, <a href="https://learn.microsoft.com/en-us/azure/aks/upgrade-os-version">upgrade OS version</a>)</td>
+</tr>
+</tbody>
+</table>
+<p>Why the base image is a lifecycle decision, not a taste decision:</p>
+<ul>
+<li><strong>It sets your patch cadence.</strong> Node OS CVEs land far more often than Kubernetes minors. On AKS the <code>NodeImage</code> / <code>SecurityPatch</code> auto-upgrade channel is separate from the cluster channel precisely because of this (<a href="https://learn.microsoft.com/en-us/azure/aks/auto-upgrade-node-os-image">node OS auto-upgrade</a>). On EKS, node AMI updates are entirely your pipeline.</li>
+<li><strong>It determines whether you can SSH in.</strong> Bottlerocket and COS are immutable and have no package manager; debugging is via a separate admin/toolbox container. That is a security win and an incident-response tax. Decide once, fleet-wide, and build the debug path deliberately.</li>
+<li><strong>It silently changes underneath you at upgrade time.</strong> The AKS case is the sharpest: upgrading a cluster to 1.35 with the Ubuntu OS SKU <strong>automatically moves nodes from Ubuntu 22.04 to 24.04</strong> (<a href="https://learn.microsoft.com/en-us/azure/aks/upgrade-os-version">AKS upgrade OS version</a>). That is a distro major-version bump — new glibc, new systemd, new default kernel — riding along with a Kubernetes minor upgrade. If any DaemonSet compiles against host headers or depends on kernel modules, test it explicitly.</li>
+<li><strong>AL2 is a live migration for anyone with old cells.</strong> Kubernetes 1.33 onward is AL2023/Bottlerocket only. The AL2023 cutover changes bootstrap (the <code>nodeadm</code>/NodeConfig format replaces the old <code>bootstrap.sh</code> args), cgroup version, and IMDS defaults (IMDSv2-only) (<a href="https://docs.aws.amazon.com/eks/latest/userguide/al2023.html">AL2023 upgrade</a>).</li>
+</ul>
+<hr />
+<h3 id="networking-per-cloud">Networking per cloud<a class="anchor" href="#networking-per-cloud">#</a></h3>
+<p>Keep this section as a routing table; the deep material belongs in the <a href="05-cni-and-host-networking.html#cloud-cni-comparison">CNI and host networking guide</a>.</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>EKS</th>
+<th>GKE</th>
+<th>AKS</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Default pod networking</td>
+<td><strong>VPC CNI</strong> — every pod gets a real VPC IP from an ENI</td>
+<td><strong>VPC-native / alias IPs</strong> — pods get IPs from a <em>secondary</em> subnet range (<a href="https://docs.cloud.google.com/kubernetes-engine/docs/concepts/alias-ips">alias IPs</a>)</td>
+<td><strong>Azure CNI Overlay</strong> (recommended default), Azure CNI Pod Subnet, legacy Azure CNI node subnet, legacy kubenet (<a href="https://learn.microsoft.com/en-us/azure/aks/concepts-network-azure-cni-overlay">overlay</a>)</td>
+</tr>
+<tr>
+<td>Pod IPs routable in the VPC?</td>
+<td>Yes</td>
+<td>Yes (alias ranges are VPC routes)</td>
+<td>Overlay: <strong>no</strong>. Pod Subnet / node subnet: yes</td>
+</tr>
+<tr>
+<td>Primary IP-exhaustion failure</td>
+<td>ENI/IP limits per instance type cap pods per node; large clusters exhaust the subnet (<a href="https://aws.github.io/aws-eks-best-practices/networking/ip-optimization-strategies/">IP optimization</a>)</td>
+<td>The <strong>/24-per-node</strong> default burns the secondary range fast (<a href="https://cloud.google.com/kubernetes-engine/docs/how-to/flexible-pod-cidr">flexible pod CIDR</a>)</td>
+<td>Node-subnet modes exhaust the VNet; overlay largely removes the problem</td>
+</tr>
+<tr>
+<td>Main mitigation</td>
+<td><strong>Prefix delegation</strong> (/28 prefixes per ENI) plus custom networking on secondary CIDRs (<a href="https://aws.github.io/aws-eks-best-practices/networking/prefix-mode/index_linux/">prefix mode</a>)</td>
+<td>Lower <code>--max-pods-per-node</code> so GKE hands out a smaller per-node CIDR; size the secondary range from node count</td>
+<td>Use overlay</td>
+</tr>
+<tr>
+<td>Legacy mode with a deadline</td>
+<td>—</td>
+<td>—</td>
+<td><strong>kubenet retires 2028-03-31</strong> (<a href="https://learn.microsoft.com/en-us/azure/aks/concepts-network-legacy-cni">legacy CNI</a>)</td>
+</tr>
+</tbody>
+</table>
+<p>The GKE arithmetic is worth memorizing because it bites during cell sizing. GKE assigns each node an alias range sized from <code>max-pods-per-node</code>: the default 110 pods yields a <strong>/24 per node</strong>, so a secondary range of /21 supports only 2^(24-21) = <strong>8 nodes</strong>. Drop <code>max-pods-per-node</code> to 8 and each node takes a /28, so the same /21 supports <strong>128 nodes</strong> (<a href="https://cloud.google.com/kubernetes-engine/docs/how-to/flexible-pod-cidr">flexible pod CIDR</a>). And note it is not a clean power of two in usable pods: with a /24 you get 110 pods, not 256, because GKE reserves headroom so pods do not become unschedulable during IP churn.</p>
+<p>Standard GKE now supports up to <strong>256 pods per node</strong> on 1.23.5-gke.1300+; Autopilot sets the value dynamically between 8 and 256 (<a href="https://docs.cloud.google.com/kubernetes-engine/quotas">GKE quotas</a>). AKS allows a max of <strong>250 pods per node</strong> on either networking plugin, with defaults of 110 (CLI/ARM) or 30 (portal) (<a href="https://learn.microsoft.com/en-us/azure/aks/quotas-skus-regions">AKS quotas</a>) — that portal-vs-CLI default split is a real source of "why is this cluster different."</p>
+<h4 id="control-plane-endpoint-access">Control-plane endpoint access</h4>
+<table>
+<thead>
+<tr>
+<th>Model</th>
+<th>EKS</th>
+<th>GKE</th>
+<th>AKS</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Public + IP allowlist</td>
+<td>Public endpoint with CIDR restrictions</td>
+<td>Public endpoint + <strong>authorized networks</strong></td>
+<td><strong>Authorized IP ranges</strong></td>
+</tr>
+<tr>
+<td>Private only</td>
+<td>Private endpoint; all API traffic must originate in-VPC or a connected network</td>
+<td>Private cluster; control plane reachable via peering/PSC</td>
+<td><strong>Private cluster</strong> (Private Link) or <strong>API Server VNet Integration</strong> (endpoint projected into a delegated subnet, no tunnel) (<a href="https://learn.microsoft.com/en-us/azure/aks/api-server-vnet-integration">VNet integration</a>)</td>
+</tr>
+<tr>
+<td>Both simultaneously</td>
+<td>Yes</td>
+<td>Yes</td>
+<td>Yes (VNet integration supports hybrid)</td>
+</tr>
+<tr>
+<td>Fleet implication</td>
+<td>Your control-plane automation needs network reachability to N private endpoints</td>
+<td>Same</td>
+<td>Same</td>
+</tr>
+</tbody>
+</table>
+<p>For a cell fleet, private-only endpoints are the right default and immediately create a bootstrap problem: <strong>your provisioning automation has to be inside the network it is provisioning.</strong> The usual answers are a per-region bastion/runner subnet, a management cluster with peering to every cell VPC/VNet, or a pull-based agent in the cell (Flux/Argo/Arc/Connect Gateway) that reaches out. Pick one and standardize; mixing them across clouds is how you end up with three different break-glass paths.</p>
+<hr />
+<h3 id="identity">Identity<a class="anchor" href="#identity">#</a></h3>
+<h4 id="workload-identity-pods-to-cloud-apis">Workload identity (pods to cloud APIs)</h4>
+<p>The four mechanisms — IRSA, EKS Pod Identity, Workload Identity Federation for GKE, and Microsoft Entra Workload ID — all reduce to the same three steps: the cluster issues a signed JWT for a ServiceAccount, the cloud's STS verifies it against a registered issuer and a subject predicate, and the workload gets a short-lived cloud credential. Trust anchors, binding syntax, and delivery paths are compared in full in <a href="03-multicloud-aws-gcp-azure.html#workload-identity-how-a-pod-gets-a-cloud-credential">03-multicloud-aws-gcp-azure.md</a>. What follows is only the part that is a <em>managed-Kubernetes</em> decision: what each cluster costs you to enable, and where it stops scaling.</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>EKS</th>
+<th>GKE</th>
+<th>AKS</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Per-cluster setup</td>
+<td>IRSA: an IAM OIDC provider <strong>per cluster</strong>. Pod Identity: none (<a href="https://aws.amazon.com/blogs/containers/amazon-eks-pod-identity-a-new-way-for-applications-on-eks-to-obtain-iam-credentials/">AWS blog</a>)</td>
+<td>Enable WIF on cluster + node pools</td>
+<td>Enable OIDC issuer + workload identity on cluster</td>
+</tr>
+<tr>
+<td>Scaling pain</td>
+<td><strong>IRSA does not scale to hundreds of clusters.</strong> Each new cluster requires editing the trust policy of every shared IAM role, and trust policy length is capped at <strong>2,048 characters</strong> with <strong>100 OIDC providers per account</strong> (<a href="https://docs.aws.amazon.com/eks/latest/best-practices/known_limits_and_service_quotas.html">EKS limits</a>)</td>
+<td>Bindings are per Google SA, not per cluster — scales better</td>
+<td>Federated credentials are per managed identity + issuer + subject, and <strong>a maximum of 20 federated identity credentials can be added to an application or user-assigned managed identity</strong> (<a href="https://learn.microsoft.com/en-us/entra/workload-id/workload-identity-federation-considerations">FIC considerations</a>) — a one-FIC-per-cell design hits the wall at cell 21</td>
+</tr>
+<tr>
+<td>Fleet recommendation</td>
+<td><strong>Use Pod Identity for new cells.</strong> It replaces N trust-policy edits with N association API calls</td>
+<td>WIF, no alternative needed</td>
+<td>Workload ID (pod-managed identity is superseded)</td>
+</tr>
+</tbody>
+</table>
+<p>The IRSA scaling limits are the most important single fact in this section for a hundreds-of-cells fleet, and they are documented as hard AWS quotas: <strong>100 OIDC providers per account</strong> caps IRSA-enabled clusters per account at 100, and a <strong>2,048-character trust policy</strong> caps how many cluster issuers one role can trust. Both are why AWS built Pod Identity. If your cell model is one-AWS-account-per-cell you dodge the OIDC-provider cap but multiply account management; if you pack many cells into an account, you hit it. Know which trade you made.</p>
+<h4 id="human-and-ci-access-to-the-api">Human and CI access to the API</h4>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>EKS</th>
+<th>GKE</th>
+<th>AKS</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Mechanism</td>
+<td><strong>Access entries</strong> (API) — the modern path; <code>aws-auth</code> ConfigMap is deprecated (<a href="https://docs.aws.amazon.com/eks/latest/userguide/migrating-access-entries.html">migration</a>, <a href="https://docs.aws.amazon.com/eks/latest/userguide/auth-configmap.html">ConfigMap docs</a>)</td>
+<td>Google IAM roles map to cluster permissions, composed with Kubernetes RBAC</td>
+<td><strong>Entra ID</strong> integration; optionally <strong>Azure RBAC for Kubernetes authorization</strong></td>
+</tr>
+<tr>
+<td>Auth modes</td>
+<td><code>CONFIG_MAP</code>, <code>API_AND_CONFIG_MAP</code>, <code>API</code>. Access entries win when both define a principal</td>
+<td>IAM + RBAC always both evaluated (union of permissions)</td>
+<td>Entra groups → K8s groups → RBAC, or Azure RBAC role assignments</td>
+</tr>
+<tr>
+<td>Failure mode to fear</td>
+<td>Corrupting <code>aws-auth</code> locks <strong>everyone</strong> out of the cluster — historically the classic EKS self-inflicted outage</td>
+<td>Over-broad IAM project roles silently granting cluster-admin</td>
+<td>Local accounts left enabled alongside Entra, bypassing conditional access</td>
+</tr>
+<tr>
+<td>Fleet recommendation</td>
+<td>Set new cells to <code>API</code> mode only. Never ship a cell with a writable <code>aws-auth</code></td>
+<td>Grant cluster access through groups, never individuals</td>
+<td>Disable local accounts; use Entra + Azure RBAC</td>
+</tr>
+</tbody>
+</table>
+<p>For a cell platform the design goal is: <strong>no human ever needs a per-cluster credential.</strong> Access should be a group membership evaluated by the cloud IAM, so onboarding an engineer is one change, not 300.</p>
+<hr />
+<h3 id="storage">Storage<a class="anchor" href="#storage">#</a></h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>EKS</th>
+<th>GKE</th>
+<th>AKS</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Block CSI</td>
+<td>EBS CSI driver (an EKS add-on) (<a href="https://docs.aws.amazon.com/eks/latest/userguide/ebs-csi.html">docs</a>)</td>
+<td>Compute Engine PD CSI driver (managed)</td>
+<td>Azure Disk CSI driver (managed)</td>
+</tr>
+<tr>
+<td>Shared-file CSI</td>
+<td>EFS CSI, FSx CSI</td>
+<td>Filestore CSI</td>
+<td>Azure Files CSI, Azure NetApp Files</td>
+</tr>
+<tr>
+<td>Default StorageClass</td>
+<td><code>gp2</code> historically; <strong>from EKS 1.30 the EBS CSI add-on ships a gp3-backed default</strong> (<a href="https://github.com/awslabs/cdk-eks-blueprints/blob/main/docs/addons/ebs-csi-default-storage-class.md">AWS blueprints notes</a>)</td>
+<td><code>standard-rwo</code> (PD-balanced)</td>
+<td><code>managed-csi</code> / <code>managed-csi-premium</code></td>
+</tr>
+<tr>
+<td>Volume expansion</td>
+<td>Supported; <code>allowVolumeExpansion: true</code></td>
+<td>Supported</td>
+<td>Supported</td>
+</tr>
+<tr>
+<td>Regional/multi-zone volume</td>
+<td>No native multi-AZ EBS. Use replication at the app layer</td>
+<td><strong>Regional PD</strong> replicates across two zones in a region (<a href="https://cloud.google.com/kubernetes-engine/docs/concepts/persistent-volumes">GKE PVs</a>)</td>
+<td><strong>ZRS disks</strong> replicate across zones (SKU-dependent)</td>
+</tr>
+<tr>
+<td>Failover helper</td>
+<td>—</td>
+<td><strong>Stateful HA Operator</strong> automates StatefulSet failover with regional PD (<a href="https://docs.cloud.google.com/kubernetes-engine/docs/how-to/stateful-ha">docs</a>)</td>
+<td>—</td>
+</tr>
+<tr>
+<td>VolumeAttributesClass</td>
+<td>GA at 1.34; AWS patches beta-API sidecars only until <strong>EKS 1.33 standard support ended 2026-07-29</strong> (<a href="https://docs.aws.amazon.com/eks/latest/userguide/kubernetes-versions-standard.html">EKS 1.34 notes</a>)</td>
+<td>—</td>
+<td>—</td>
+</tr>
+</tbody>
+</table>
+<p><strong>The StatefulSet-across-AZ trap, stated precisely.</strong> A zonal block volume can only attach to a node in its own zone. If a StatefulSet pod is rescheduled to another zone — because its node was drained during an upgrade, or an autoscaler consolidated the zone away, or the zone had no capacity — the PVC cannot follow. The pod goes <code>Pending</code> with a volume node affinity conflict and stays there.</p>
+<p>There is exactly one correct default and two mitigations:</p>
+<ul>
+<li><strong>Default: <code>volumeBindingMode: WaitForFirstConsumer</code> on every block StorageClass.</strong> This delays PV provisioning until the pod is scheduled, so the disk is created in the zone the pod actually landed in. Both AWS's example EBS StorageClass and GKE's guidance use it (<a href="https://cloud.google.com/kubernetes-engine/docs/concepts/persistent-volumes">GKE PVs</a>). Verify it on every cell — an inherited <code>Immediate</code> StorageClass is a latent zone-pinning bug.</li>
+<li><strong>Mitigation A: regional volumes</strong> where available (GKE regional PD, Azure ZRS disks). Costs more, halves the failure class.</li>
+<li><strong>Mitigation B: per-zone node pools plus zone-aware anti-affinity</strong>, so each StatefulSet ordinal is pinned to a zone that always has capacity. This is what most people actually do on EKS, since EBS has no regional flavor.</li>
+</ul>
+<p>At upgrade time this trap is <em>systematically</em> triggered, because upgrades drain every node in the cluster by design. Any stateful workload with a zonal PV and no zone pinning will eventually get hit. This is not an edge case; it is a certainty at fleet scale.</p>
+<hr />
+<h3 id="add-on-management">Add-on management<a class="anchor" href="#add-on-management">#</a></h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>EKS</th>
+<th>GKE</th>
+<th>AKS</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Model</td>
+<td><strong>EKS add-ons</strong> — versioned, AWS-tested, installed/upgraded via the EKS API (<a href="https://docs.aws.amazon.com/eks/latest/userguide/eks-add-ons.html">add-ons</a>)</td>
+<td><strong>Managed add-ons</strong> — Google owns them; you toggle features, not versions</td>
+<td><strong>Add-ons</strong> (AKS-managed, e.g. monitoring, Key Vault CSI) and <strong>cluster extensions</strong> (Arc-based)</td>
+</tr>
+<tr>
+<td>CNI</td>
+<td>VPC CNI as an add-on. You choose the version</td>
+<td>Fully managed</td>
+<td>Fully managed</td>
+</tr>
+<tr>
+<td>CoreDNS</td>
+<td>Add-on. Version and replica count are yours</td>
+<td>Managed, autoscaled by GKE</td>
+<td>Managed</td>
+</tr>
+<tr>
+<td>kube-proxy</td>
+<td>Add-on; must track the control-plane minor</td>
+<td>Managed</td>
+<td>Managed</td>
+</tr>
+<tr>
+<td>metrics-server</td>
+<td><strong>You install it</strong></td>
+<td>Included</td>
+<td>Included</td>
+</tr>
+<tr>
+<td>CSI drivers</td>
+<td>EBS/EFS as add-ons (opt-in)</td>
+<td>Included</td>
+<td>Included</td>
+</tr>
+<tr>
+<td>Practical burden</td>
+<td>Highest — you own a version matrix per cluster</td>
+<td>Lowest</td>
+<td>Low</td>
+</tr>
+<tr>
+<td>Practical control</td>
+<td>Highest — you can pin, stage, canary</td>
+<td>Lowest — you get what Google ships</td>
+<td>Medium</td>
+</tr>
+</tbody>
+</table>
+<p>For a fleet the tension is exact: <strong>EKS add-ons give you the control you need to canary a CNI change across 5 cells before 300, and the burden of maintaining a compatibility matrix per minor version.</strong> GKE removes the burden and the control together. Neither is wrong; be deliberate.</p>
+<p>Two operational rules regardless of cloud:</p>
+<ul>
+<li><strong>CoreDNS is the most common cluster-wide brownout you will cause.</strong> AWS documents that Route 53 resolvers cap at 1,024 packets per second, and funnelling a large cluster's DNS through too few CoreDNS replicas causes lookup timeouts (<a href="https://docs.aws.amazon.com/eks/latest/best-practices/known_limits_and_service_quotas.html">EKS limits</a>). Size CoreDNS to node count, use NodeLocal DNSCache, and set <code>ndots</code> sensibly.</li>
+<li><strong>Add-on upgrades must be sequenced <em>between</em> control plane and nodes.</strong> kube-proxy in particular must not lag the apiserver across a minor boundary.</li>
+</ul>
+<hr />
+<h3 id="scale-limits-and-what-actually-breaks-first">Scale limits and what actually breaks first<a class="anchor" href="#scale-limits-and-what-actually-breaks-first">#</a></h3>
+<p>Documented per-cluster limits, verified:</p>
+<table>
+<thead>
+<tr>
+<th>Limit</th>
+<th>EKS</th>
+<th>GKE Standard</th>
+<th>GKE Autopilot</th>
+<th>AKS</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Nodes per cluster</td>
+<td>No published hard cap; bounded by EC2/VPC quotas</td>
+<td><strong>65,000</strong> (tiered — &gt;5,000 needs specific infra and Customer Care)</td>
+<td><strong>5,000</strong></td>
+<td><strong>5,000</strong> across all node pools (VMSS + Standard LB)</td>
+</tr>
+<tr>
+<td>Nodes per pool/group</td>
+<td>ASG-bounded</td>
+<td><strong>1,000 per zone</strong></td>
+<td>n/a</td>
+<td><strong>1,000</strong></td>
+</tr>
+<tr>
+<td>Pools per cluster</td>
+<td>—</td>
+<td>—</td>
+<td>—</td>
+<td><strong>100</strong></td>
+</tr>
+<tr>
+<td>Pods per node</td>
+<td>Instance-type/ENI bound; higher with prefix delegation</td>
+<td><strong>256</strong> (110 before 1.23.5-gke.1300)</td>
+<td>dynamic <strong>8–256</strong></td>
+<td><strong>250</strong> max; defaults 110 (CLI) / 30 (portal)</td>
+</tr>
+<tr>
+<td>Pods per cluster</td>
+<td>Not published</td>
+<td><strong>200,000</strong></td>
+<td><strong>200,000</strong></td>
+<td>Not published</td>
+</tr>
+<tr>
+<td>Containers per cluster</td>
+<td>Not published</td>
+<td><strong>400,000</strong></td>
+<td><strong>400,000</strong></td>
+<td>Not published</td>
+</tr>
+<tr>
+<td>etcd DB size</td>
+<td><strong>8 GiB</strong></td>
+<td><strong>6 GB</strong></td>
+<td><strong>6 GB</strong></td>
+<td>Not published; tier-dependent</td>
+</tr>
+<tr>
+<td>Concurrent cluster operations</td>
+<td>Not published</td>
+<td><strong>100</strong></td>
+<td><strong>100</strong></td>
+<td>RP throttling: <code>PUT ManagedCluster</code> bucket 20, refill 1/min</td>
+</tr>
+<tr>
+<td>Clusters per account/sub/region</td>
+<td>Soft quota</td>
+<td>Zonal/regional cluster quotas per project</td>
+<td>same</td>
+<td><strong>5,000 per subscription globally</strong>; per-region default <strong>100</strong> (EA) with self-service to <strong>1,000</strong></td>
+</tr>
+<tr>
+<td>LoadBalancer Services</td>
+<td>ELB quotas apply (50 NLBs/region default)</td>
+<td>—</td>
+<td>—</td>
+<td><strong>300 per cluster</strong> with Standard LB</td>
+</tr>
+</tbody>
+</table>
+<p>Sources: <a href="https://docs.aws.amazon.com/eks/latest/best-practices/known_limits_and_service_quotas.html">EKS known limits</a>, <a href="https://docs.cloud.google.com/kubernetes-engine/quotas">GKE quotas</a>, <a href="https://learn.microsoft.com/en-us/azure/aks/quotas-skus-regions">AKS quotas</a>.</p>
+<p><strong>What breaks first is almost never the documented cluster limit.</strong> Ranked by how often it actually bites, in a fleet:</p>
+<ol>
+<li><strong>Account/subscription/project quotas, not cluster quotas.</strong> The default <strong>100 AKS clusters per subscription per region</strong> for Enterprise Agreement subscriptions is the sharpest example — a 300-cell Azure footprint needs quota increases <em>by region</em>, and above 1,000 needs a support ticket (<a href="https://learn.microsoft.com/en-us/azure/aks/quotas-skus-regions">AKS quotas</a>). On AWS, <strong>5 VPCs per region</strong> and <strong>5,000 network interfaces per region</strong> by default will stop a cell rollout long before any EKS limit does.</li>
+<li><strong>Cloud API throttling during fleet operations.</strong> AKS publishes exact token-bucket limits: <code>PUT ManagedCluster</code> refills at <strong>1 request per minute</strong> per cluster, <code>LIST ManagedClusters</code> at 1/sec per subscription with a 500 burst, returning HTTP 429 with <code>Retry-After</code> (<a href="https://learn.microsoft.com/en-us/azure/aks/quotas-skus-regions">AKS quotas</a>). If your reconciler polls 300 clusters in a tight loop, you throttle yourself. On AWS the equivalent is EC2 ENI/IP API throttling (<code>CreateNetworkInterface</code>, <code>AssignPrivateIpAddresses</code>, <code>DescribeInstances</code>), which is exactly the API surface the VPC CNI hammers during scale-out (<a href="https://docs.aws.amazon.com/eks/latest/best-practices/known_limits_and_service_quotas.html">EKS limits</a>).</li>
+<li><strong>IAM object counts.</strong> 1,000 IAM roles per account and 100 OIDC providers per account cap how many IRSA-enabled clusters fit in an AWS account.</li>
+<li><strong>etcd size and object churn.</strong> Long before you reach 200,000 pods, a chatty operator writing status subresources every second will grow etcd and slow the apiserver. Watch the size metric.</li>
+<li><strong>CoreDNS and the DNS packet-per-second ceiling.</strong></li>
+<li><strong>Only then</strong>, nodes per cluster.</li>
+</ol>
+<p>For a cell architecture, this ranking is a gift: it says <strong>more small cells is operationally safer than fewer big ones</strong>, and the binding constraint is your cloud <em>account</em> topology, not Kubernetes.</p>
+<hr />
+<h3 id="multi-tenancy-and-isolation-for-a-cell-model">Multi-tenancy and isolation for a cell model<a class="anchor" href="#multi-tenancy-and-isolation-for-a-cell-model">#</a></h3>
+<p>The isolation ladder, weakest to strongest:</p>
+<table>
+<thead>
+<tr>
+<th>Boundary</th>
+<th>Blast radius contained</th>
+<th>Cost / overhead</th>
+<th>Leaks</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Namespace + RBAC + quota + NetworkPolicy</td>
+<td>Application bugs, RBAC mistakes</td>
+<td>Near zero</td>
+<td>Shared apiserver, shared etcd, shared CoreDNS, shared node kernel, shared cluster version</td>
+</tr>
+<tr>
+<td>Namespace + dedicated node pool + taints</td>
+<td>Adds kernel/noisy-neighbour isolation</td>
+<td>Idle node cost per tenant</td>
+<td>Still one control plane and one upgrade schedule</td>
+</tr>
+<tr>
+<td><strong>Cluster</strong></td>
+<td>Control-plane load, upgrade blast radius, CRD/version conflicts, admission-webhook failures</td>
+<td>Control-plane fee + per-cluster add-ons + per-cluster ops</td>
+<td>Shared account quotas, shared VPC, shared IAM</td>
+</tr>
+<tr>
+<td><strong>Cluster + dedicated account/project/subscription</strong></td>
+<td>Quota contention, IAM blast radius, billing, compromise containment</td>
+<td>Account management, networking complexity</td>
+<td>Region-level and provider-level failures</td>
+</tr>
+</tbody>
+</table>
+<p>Google's own multi-tenancy guidance walks the same ladder (<a href="https://docs.cloud.google.com/kubernetes-engine/docs/concepts/multitenancy-overview">GKE multi-tenancy</a>).</p>
+<p><strong>Why "cell = cluster (or a few)" wins for a platform like Temporal Cloud.</strong> The three things that a namespace boundary cannot contain are precisely the three things that hurt most at scale:</p>
+<ol>
+<li><strong>The upgrade is cluster-wide.</strong> One control-plane version, one maintenance window, one rollback. If a hundred tenants share a cluster, an upgrade regression hits all hundred. Cells let you canary version N+1 on cells 1–3 and hold 297 at N.</li>
+<li><strong>Cluster-scoped objects are shared.</strong> CRDs, admission webhooks, mutating policies, PriorityClasses, StorageClasses, and cluster RBAC are global. A tenant needing CRD <code>v1</code> while another needs <code>v2</code> is unsolvable in one cluster.</li>
+<li><strong>The apiserver and etcd are shared failure domains.</strong> One tenant's runaway controller degrades everyone's control plane. There is no per-namespace apiserver quota that fully prevents this (API Priority and Fairness helps, it does not solve it).</li>
+</ol>
+<p>The costs you accept in exchange: a control-plane fee per cell (~$0.10/cluster/hour on EKS/AKS Standard is ~$876/year — negligible next to node cost, meaningful times 300 only if cells are small), N× add-on footprint (CoreDNS, CNI, CSI, metrics-server, and observability agents on every cell — this is the <em>real</em> overhead, often 1-2 nodes' worth per cell), and N× upgrade work, which is why the automation in this guide exists.</p>
+<p>The practical shape most platforms land on: <strong>cell = one cluster + one account/project/subscription + one VPC/VNet</strong>, with tenants as namespaces <em>within</em> a cell, and cell assignment as a placement decision made at tenant onboarding. That gives you a two-level isolation model where the expensive boundary is used sparingly and the cheap boundary carries the tenant count.</p>
+<hr />
+<h3 id="fleet-management-how-teams-actually-run-hundreds-of-clusters">Fleet management: how teams actually run hundreds of clusters<a class="anchor" href="#fleet-management-how-teams-actually-run-hundreds-of-clusters">#</a></h3>
+<p>Three families, and most mature platforms use two of them together.</p>
+<p><strong>1. Infrastructure-as-code, imperatively driven (Terraform / Pulumi / CDK).</strong> One module per cell, invoked N times, state in a remote backend. Strengths: it is the only approach that natively models <em>everything around</em> the cluster (VPC, IAM, DNS, databases, KMS) in the same graph. Weaknesses: state files are a scaling and blast-radius problem at N=300, drift detection is a <code>plan</code> you have to run, and there is no continuous reconciliation — nothing fixes a cluster that drifts at 4am.</p>
+<p><strong>2. Cluster API (CAPI) — Kubernetes-native cluster lifecycle.</strong> A management cluster runs controllers that reconcile <code>Cluster</code>, <code>MachineDeployment</code>, and provider-specific resources into real clusters (<a href="https://cluster-api.sigs.k8s.io/">Cluster API book</a>).</p>
+<table>
+<thead>
+<tr>
+<th>Provider</th>
+<th>Repo/book</th>
+<th>Managed control plane support</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>CAPA</strong> (AWS)</td>
+<td><a href="https://cluster-api-aws.sigs.k8s.io/">cluster-api-aws</a></td>
+<td><code>AWSManagedControlPlane</code> represents an EKS cluster as a CAPI control plane</td>
+</tr>
+<tr>
+<td><strong>CAPZ</strong> (Azure)</td>
+<td><a href="https://capz.sigs.k8s.io/managed/managed">capz.sigs.k8s.io</a></td>
+<td>Manages both self-managed and AKS clusters from one management plane; <strong>supports ClusterClass for AKS</strong></td>
+</tr>
+<tr>
+<td><strong>CAPG</strong> (GCP)</td>
+<td><a href="https://github.com/kubernetes-sigs/cluster-api-provider-gcp">cluster-api-provider-gcp</a></td>
+<td>GKE support via managed control plane types</td>
+</tr>
+</tbody>
+</table>
+<p>The strength of CAPI is <strong>continuous reconciliation and a uniform API across clouds</strong> — one <code>Cluster</code> CRD shape, three infrastructure providers, and a controller that keeps converging. That is exactly the "cattle" property you want. The known rough edge, documented in the CAPI project's own <a href="https://github.com/kubernetes-sigs/cluster-api/blob/main/docs/proposals/20220725-managed-kubernetes.md">managed Kubernetes proposal</a>, is that CAPI's model assumes infrastructure and control plane are two separate resources, while managed offerings fuse them — CAPA modelled EKS as a control plane, which then collided with ClusterClass's expectations. Provider maturity for managed control planes is genuinely uneven; evaluate per-cloud rather than assuming parity.</p>
+<p><strong>3. Fleet/registry layers.</strong> These do not create clusters; they give you a fleet-wide view and multi-cluster placement.</p>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Scope</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="https://cloud.google.com/kubernetes-engine/fleet-management/docs">GKE fleet management</a></td>
+<td>GKE-first, with attached clusters</td>
+<td>Fleets, Config Sync, Policy Controller, multi-cluster Services/Ingress</td>
+</tr>
+<tr>
+<td><a href="https://learn.microsoft.com/en-us/azure/kubernetes-fleet/overview">Azure Kubernetes Fleet Manager</a></td>
+<td>AKS + Arc-attached</td>
+<td>Hub-spoke; joins up to <strong>1,000</strong> clusters; can include non-AKS via Arc</td>
+</tr>
+<tr>
+<td><a href="https://learn.microsoft.com/en-us/azure/azure-arc/kubernetes/overview">Azure Arc-enabled Kubernetes</a></td>
+<td>Any conformant cluster</td>
+<td>Projects any cluster into Azure RM for policy, GitOps, and inventory</td>
+</tr>
+<tr>
+<td>GitOps (Argo CD / Flux)</td>
+<td>Any</td>
+<td>The workhorse for cluster <em>contents</em> regardless of who created the cluster</td>
+</tr>
+</tbody>
+</table>
+<p><strong>The pattern that works, stated plainly.</strong> Cluster <em>creation</em> via IaC or CAPI; cluster <em>contents</em> via GitOps, always. The moment you have more than a dozen cells, hand-applied manifests and <code>helm install</code> from a laptop become the dominant source of drift. If you use Helm for templating only, with no release state (the setup <a href="09-helm.html">09</a> assumes), this maps cleanly: render charts to manifests, commit or serve them, and let a reconciler own actual state. That is arguably a <em>better</em> fit than Helm-with-Tiller-style state, because your source of truth is the rendered manifest in git, not a secret in a namespace.</p>
+<p><strong>The bootstrap ordering problem, in one sentence:</strong> the tooling that manages a cluster's contents has to be installed <em>into</em> the cluster, and it needs credentials, networking, and a functioning CNI before it can run — so something outside the cluster must do the first N steps. Which leads directly to the next section.</p>
+<p><em>See also: <a href="13-gitops-argocd-flux.html#applicationset-generators--the-heart-of-a-many-cells-fleet">ApplicationSet generators — the heart of a many-cells fleet</a> for how the "cluster contents via GitOps" half of that pattern is actually wired across N cells.</em></p>
+<hr />
+<h3 id="bootstrap-ordering-for-a-fresh-cell">Bootstrap ordering for a fresh cell<a class="anchor" href="#bootstrap-ordering-for-a-fresh-cell">#</a></h3>
+<p>This is the core of the job. The dependency graph is real, and getting it wrong produces a cluster that looks up but is subtly broken.</p>
+<div class="codehilite"><pre><span></span><code>   cloud account / project / subscription   (quotas, IAM baseline, logging sinks)
+                    │
+   network          │  VPC/VNet, subnets, NAT, routes, DNS, private endpoints
+                    ▼
+   control plane       cluster created; apiserver reachable from the runner
+                    │
+   ┌────────────────┴─────────────────────────────────────────────┐
+   │ 1. CNI                    nodes stay NotReady until this runs │
+   │ 2. kube-proxy             (managed on GKE/AKS)                │
+   │ 3. first nodes join       node pool / Karpenter&#39;s own nodes    │
+   │ 4. CoreDNS ready          nothing that resolves names works    │
+   │      ▼                      before this                        │
+   │ 5. cloud-controller        LoadBalancer + node lifecycle       │
+   │ 6. CSI drivers             PVCs bind                           │
+   │ 7. metrics-server          HPA + kubectl top                   │
+   │ 8. cert-manager            webhooks need certs                 │
+   │ 9. Karpenter / autoscaler  needs identity + a place to run     │
+   │10. policy (Kyverno/Gatekeeper/PSA)  must precede workloads     │
+   │11. observability agents    DaemonSets                          │
+   │12. GitOps agent            takes over from here                │
+   │13. platform workloads      Temporal services, ingress, etc.    │
+   └───────────────────────────────────────────────────────────────┘
+</code></pre></div>
+
+<p>The non-obvious constraints, which are where real bootstrap bugs live:</p>
+<ul>
+<li><strong>CNI before anything schedulable.</strong> Nodes report <code>NotReady</code> with <code>NetworkPluginNotReady</code> until the CNI DaemonSet lands. On EKS the VPC CNI is installed by default, but if you are replacing it (Cilium, custom config) you must do so before the first node group scales, or you get a race between the default CNI and yours.</li>
+<li><strong>CoreDNS before any component that resolves a Service name.</strong> cert-manager's webhook, Karpenter's apiserver client, and most operators will crash-loop confusingly if DNS is not up. They recover, but your bootstrap looks broken for minutes.</li>
+<li><strong>Karpenter has a chicken-and-egg problem.</strong> It provisions nodes, so it needs a node to run on. The standard answer is a small managed node group (or GKE/AKS system pool) that hosts only system components, with Karpenter's own NodePools excluded from managing it. On EKS Auto Mode and AKS NAP this disappears because the provisioner runs off-cluster or as a managed addon — a genuine operational simplification worth weighing.</li>
+<li><strong>cert-manager before any admission webhook that needs a CA.</strong> And note the reverse hazard: cert-manager itself installs a webhook, so if a policy engine with a <code>failurePolicy: Fail</code> webhook is installed first and cannot serve, cert-manager's own resources fail to admit. <strong>Order policy after cert-manager, and never install a <code>Fail</code>-policy webhook whose backend is not yet running.</strong></li>
+<li><strong>Policy before workloads, but with a bypass for system namespaces.</strong> A Kyverno/Gatekeeper policy that requires resource limits will block your own observability DaemonSet if applied first without exclusions.</li>
+<li><strong>Identity before anything that calls a cloud API.</strong> IRSA/Pod Identity/WIF/Workload ID must be wired before the CSI driver, external-dns, cert-manager's DNS solver, or the LB controller start, or they fail with permission errors that look like bugs.</li>
+<li><strong>Idempotency is mandatory, not nice-to-have.</strong> Bootstrap will be re-run — on retry, on drift correction, on version bump. Every step must converge, not just create.</li>
+</ul>
+<p>A practical structuring: <strong>phase 0 (out-of-cluster, IaC)</strong> = account, network, cluster, identity, first node group. <strong>Phase 1 (in-cluster, imperative one-shot)</strong> = CNI config, CSI, cert-manager, GitOps agent. <strong>Phase 2 (in-cluster, GitOps)</strong> = everything else. Keep phase 1 as thin as you can bear; every component there is a component your provisioning code must version, upgrade, and reconcile by hand.</p>
+<hr />
+<h3 id="teardown-how-to-actually-delete-a-cell">Teardown: how to actually delete a cell<a class="anchor" href="#teardown-how-to-actually-delete-a-cell">#</a></h3>
+<p>Deleting is harder than creating because Kubernetes owns cloud resources it did not tell your IaC about.</p>
+<p><strong>The finalizer problem.</strong> A namespace in <code>Terminating</code> is almost always blocked by a finalizer or an unreachable API (<a href="https://kubernetes.io/docs/concepts/overview/working-with-objects/finalizers/">finalizers</a>). The nastiest variant: if an <code>APIService</code> (an aggregated API like <code>v1beta1.custom.metrics.k8s.io</code>) is registered but its backing workload is gone, the namespace controller cannot enumerate resources to clean up — and <strong>no namespace anywhere in the cluster will finish terminating</strong> until that APIService is healthy or removed (<a href="https://docs.cloud.google.com/kubernetes-engine/docs/troubleshooting/terminating-namespaces">GKE troubleshooting</a>). One dead metrics adapter blocks every deletion in the cluster.</p>
+<p><strong>Do not reflexively strip finalizers.</strong> Force-removing the <code>kubernetes</code> finalizer from a namespace lets the object disappear and leaves the resources it contained orphaned — cloud load balancers, external DNS records, cloud-managed secrets, operator-managed database instances (<a href="https://docs.cloud.google.com/kubernetes-engine/docs/troubleshooting/terminating-namespaces">GKE troubleshooting</a>). At fleet scale, orphans are a slow-motion cost and security problem: you will eventually find load balancers with public IPs pointing at nothing, for cells you deleted a year ago.</p>
+<p><strong>Orphan classes to hunt, per cloud:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Orphan</th>
+<th>Created by</th>
+<th>EKS</th>
+<th>GKE</th>
+<th>AKS</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Load balancers</td>
+<td><code>Service type=LoadBalancer</code> / Ingress</td>
+<td>CLB/NLB/ALB + target groups + security groups</td>
+<td>Forwarding rules, backend services, health checks</td>
+<td>Load balancer rules, public IPs</td>
+</tr>
+<tr>
+<td>Persistent disks</td>
+<td>PVC with <code>Retain</code> reclaim policy</td>
+<td>EBS volumes</td>
+<td>Persistent disks</td>
+<td>Managed disks</td>
+</tr>
+<tr>
+<td>Network interfaces</td>
+<td>VPC CNI</td>
+<td>ENIs (count against a 5,000/region quota)</td>
+<td>—</td>
+<td>—</td>
+</tr>
+<tr>
+<td>Snapshots</td>
+<td>VolumeSnapshot</td>
+<td>EBS snapshots</td>
+<td>PD snapshots</td>
+<td>Disk snapshots</td>
+</tr>
+<tr>
+<td>DNS records</td>
+<td>external-dns</td>
+<td>Route 53 records</td>
+<td>Cloud DNS records</td>
+<td>Azure DNS records</td>
+</tr>
+<tr>
+<td>IAM objects</td>
+<td>IRSA setup</td>
+<td>OIDC provider + roles (100 provider cap)</td>
+<td>Service accounts, bindings</td>
+<td>Managed identities, federated credentials</td>
+</tr>
+<tr>
+<td>Node-created resources</td>
+<td>Karpenter</td>
+<td>Instances, launch templates</td>
+<td>—</td>
+<td>VMs, NICs, disks</td>
+</tr>
+</tbody>
+</table>
+<p><strong>A teardown order that works:</strong></p>
+<ol>
+<li><strong>Stop the reconcilers first.</strong> Suspend the GitOps agent and delete Karpenter/autoscaler <em>controllers</em>, otherwise they will fight the teardown by recreating things.</li>
+<li><strong>Delete workload namespaces and wait</strong>, so the cloud-controller-manager and CSI drivers get a chance to delete the cloud resources they created. This is the step people skip, and it is the step that prevents orphans.</li>
+<li><strong>Delete anything with a <code>Retain</code> reclaim policy explicitly</strong> — Kubernetes will not.</li>
+<li><strong>Verify zero remaining <code>Service type=LoadBalancer</code> and zero bound PVCs</strong> before touching the cluster object.</li>
+<li><strong>Then delete node pools, then the cluster.</strong></li>
+<li><strong>Then sweep the cloud account by tag.</strong> Every cell resource should carry a <code>cell-id</code> tag/label from birth so a sweep is a single tag query per resource type. Run the sweep as an assertion in CI, not as a manual cleanup.</li>
+<li><strong>Finally, reclaim identity objects</strong> (OIDC providers, roles, federated credentials) — the ones nobody remembers and that hit hard quotas.</li>
+</ol>
+<p>Give yourself a <strong>deletion dry-run</strong> that reports what step 6 would find. Run it on every teardown, alert if non-empty, and you will catch a whole class of bug that otherwise only surfaces on the invoice.</p>
+<p><em>See also: <a href="13-gitops-argocd-flux.html#argo-cd-resource-tracking-prune-and-deletion">Argo CD resource tracking, prune, and deletion</a> for step 1 and step 2 in practice — suspending the reconciler, prune propagation policies, and the namespace-stuck-in-Terminating failure that stalls this list at step 2.</em></p>
+<hr />
+<h3 id="cost-and-cross-az-traffic">Cost and cross-AZ traffic<a class="anchor" href="#cost-and-cross-az-traffic">#</a></h3>
+<table>
+<thead>
+<tr>
+<th>Cost driver</th>
+<th>Detail</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Control plane</td>
+<td>~$0.10/cluster/hour on EKS and AKS Standard; <strong>6x that</strong> in EKS extended support or AKS Premium (<a href="https://aws.amazon.com/blogs/containers/amazon-eks-extended-support-for-kubernetes-versions-pricing/">AWS</a>, <a href="https://learn.microsoft.com/en-us/azure/aks/free-standard-pricing-tiers">AKS</a>). At 300 cells, $0.10/hr is ~$263k/year, and extended support turns that into ~$1.6M/year</td>
+</tr>
+<tr>
+<td>Cross-AZ traffic</td>
+<td>AWS charges <strong>$0.01/GB in each direction</strong> between AZs in a region — $0.02/GB round trip. Same-AZ private-IP traffic is free (<a href="https://aws.amazon.com/ec2/pricing/on-demand/">AWS EC2 pricing</a>)</td>
+</tr>
+<tr>
+<td>Add-on footprint</td>
+<td>CoreDNS + CNI + CSI + metrics-server + logging + metrics agents on every cell. Often 1–2 nodes' worth per cell — the largest <em>hidden</em> cell overhead</td>
+</tr>
+<tr>
+<td>Idle headroom</td>
+<td>Surge/blue-green upgrades need spare capacity or quota; blue/green temporarily doubles a node pool (<a href="https://docs.cloud.google.com/kubernetes-engine/docs/concepts/node-pool-upgrade-strategies">GKE</a>)</td>
+</tr>
+<tr>
+<td>Spare IP space</td>
+<td>Sized for peak-during-upgrade, not steady state</td>
+</tr>
+</tbody>
+</table>
+<p>Cross-AZ cost drives real topology decisions for a cell:</p>
+<ul>
+<li><strong>A multi-AZ cell is the right default for availability and costs you AZ-crossing traffic on every internal hop.</strong> For a Temporal-shaped workload — frontend to history to matching to persistence — a single request can cross AZ boundaries several times. <code>trafficDistribution: PreferSameZone</code> (and <code>PreferSameNode</code>, stable in 1.35 per the <a href="https://docs.aws.amazon.com/eks/latest/userguide/kubernetes-versions-standard.html">EKS 1.35 notes</a>) reduces this materially for stateless hops.</li>
+<li><strong>A single-AZ cell is cheaper and simpler for stateful components</strong> (no cross-AZ replication traffic, no zonal-disk trap) but concentrates failure. Some platforms run zonal cells and rely on cell-level redundancy, which is a legitimate and often underrated design — it converts an availability problem into a placement problem.</li>
+<li><strong>Regional vs zonal control plane matters too.</strong> GKE regional clusters replicate the control plane across zones with a higher SLA than zonal (<a href="https://cloud.google.com/kubernetes-engine/sla">GKE SLA</a>); AKS availability zones move the API server SLA from 99.9% to 99.95% (<a href="https://learn.microsoft.com/en-us/azure/aks/free-standard-pricing-tiers">AKS tiers</a>).</li>
+</ul>
+<hr />
+<h2 id="hands-on">Hands-on<a class="anchor" href="#hands-on">#</a></h2>
+<h3 id="lab-0--prerequisites-free">Lab 0 — Prerequisites (free)<a class="anchor" href="#lab-0--prerequisites-free">#</a></h3>
+<div class="codehilite"><pre><span></span><code><span class="c1"># macOS</span>
+brew install kind kubectl helm kustomize
+brew install derailed/k9s/k9s          <span class="c1"># optional but excellent for drain-watching</span>
+
+<span class="c1"># kube-no-trouble, for the deprecated-API lab</span>
+brew install kube-no-trouble           <span class="c1"># or: go install github.com/doitintl/kube-no-trouble/cmd/kubent@latest</span>
+
+kind version <span class="o">&amp;&amp;</span> kubectl version --client
+</code></pre></div>
+
+<p>All <code>kind</code> labs below run entirely on your laptop and cost <strong>$0</strong>. They cover everything that is generic Kubernetes: version skew, drain/eviction, PDB deadlock, finalizer traps, deprecated APIs. The cloud-specific behavior (managed upgrade orchestration, node image swaps, IP exhaustion) needs a cloud lab, priced at the end.</p>
+<hr />
+<h3 id="lab-1--simulate-a-control-plane-then-node-upgrade-kind-free">Lab 1 — Simulate a control-plane-then-node upgrade (<code>kind</code>, free)<a class="anchor" href="#lab-1--simulate-a-control-plane-then-node-upgrade-kind-free">#</a></h3>
+<p><code>kind</code> lets you pin node images to specific Kubernetes versions, so you can reproduce the exact skew a managed upgrade produces.</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># kind-skew.yaml — control plane at 1.33, workers at 1.33 to start</span><span class="w"></span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Cluster</span><span class="w"></span>
+<span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">kind.x-k8s.io/v1alpha4</span><span class="w"></span>
+<span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">skewlab</span><span class="w"></span>
+<span class="nt">nodes</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">role</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">control-plane</span><span class="w"></span>
+<span class="w">    </span><span class="nt">image</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">kindest/node:v1.33.0</span><span class="w"></span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">role</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">worker</span><span class="w"></span>
+<span class="w">    </span><span class="nt">image</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">kindest/node:v1.33.0</span><span class="w"></span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">role</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">worker</span><span class="w"></span>
+<span class="w">    </span><span class="nt">image</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">kindest/node:v1.33.0</span><span class="w"></span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code>kind create cluster --config kind-skew.yaml
+kubectl get nodes -o custom-columns<span class="o">=</span>NAME:.metadata.name,VERSION:.status.nodeInfo.kubeletVersion
+</code></pre></div>
+
+<p>Now simulate the managed-upgrade order. <code>kind</code> cannot upgrade in place, so model it the way a real fleet does — <strong>replace nodes</strong>, do not mutate them:</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. &quot;Upgrade the control plane&quot;: recreate the cluster with a newer CP image but</span>
+<span class="c1">#    keep the old worker image, reproducing kubelet-behind-apiserver skew.</span>
+kind delete cluster --name skewlab
+cat &gt; kind-skew2.yaml <span class="s">&lt;&lt;&#39;EOF&#39;</span>
+<span class="s">kind: Cluster</span>
+<span class="s">apiVersion: kind.x-k8s.io/v1alpha4</span>
+<span class="s">name: skewlab</span>
+<span class="s">nodes:</span>
+<span class="s">  - role: control-plane</span>
+<span class="s">    image: kindest/node:v1.35.0</span>
+<span class="s">  - role: worker</span>
+<span class="s">    image: kindest/node:v1.33.0     # 2 minors behind: legal</span>
+<span class="s">  - role: worker</span>
+<span class="s">    image: kindest/node:v1.33.0</span>
+<span class="s">EOF</span>
+kind create cluster --config kind-skew2.yaml
+kubectl get nodes -o wide
+</code></pre></div>
+
+<p>What to observe and write down:</p>
+<ul>
+<li>The cluster works. Two-minor skew is legal (<a href="https://kubernetes.io/releases/version-skew-policy/">skew policy</a>) — this is <em>exactly</em> the state a real cluster sits in between step 2 and step 4 of an upgrade.</li>
+<li>Try a control plane at 1.33 with a worker at 1.35 (kubelet newer than apiserver). Note what breaks and how confusingly.</li>
+<li>Note that nothing in the API tells you the skew is dangerous. Fleet tooling has to compute it.</li>
+</ul>
+<p><strong>Exercise:</strong> write a script that, for every context in your kubeconfig, prints apiserver minor, min kubelet minor, and the skew, and flags anything at 3 or over. That is a real tool you will want.</p>
+<hr />
+<h3 id="lab-2--pdb-drain-and-eviction-semantics-kind-free">Lab 2 — PDB, drain, and eviction semantics (<code>kind</code>, free)<a class="anchor" href="#lab-2--pdb-drain-and-eviction-semantics-kind-free">#</a></h3>
+<p>This is the lab that teaches you why upgrades stall.</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># Workers are required: a bare `kind create cluster` gives you a single</span>
+<span class="c1"># control-plane node, and the `grep worker` below would come back empty.</span>
+cat &gt; kind-pdblab.yaml <span class="s">&lt;&lt;&#39;EOF&#39;</span>
+<span class="s">kind: Cluster</span>
+<span class="s">apiVersion: kind.x-k8s.io/v1alpha4</span>
+<span class="s">name: pdblab</span>
+<span class="s">nodes:</span>
+<span class="s">  - role: control-plane</span>
+<span class="s">  - role: worker</span>
+<span class="s">  - role: worker</span>
+<span class="s">EOF</span>
+kind create cluster --config kind-pdblab.yaml
+
+kubectl create deploy web --image<span class="o">=</span>registry.k8s.io/pause:3.9 --replicas<span class="o">=</span><span class="m">3</span>
+kubectl rollout status deploy/web
+</code></pre></div>
+
+<p>Create a PDB that is satisfiable, then one that is not:</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># pdb-ok.yaml — 3 replicas, allow 1 down</span><span class="w"></span>
+<span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">policy/v1</span><span class="w"></span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">PodDisruptionBudget</span><span class="w"></span>
+<span class="nt">metadata</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">web-ok</span><span class="w"></span>
+<span class="nt">spec</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">minAvailable</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">2</span><span class="w"></span>
+<span class="w">  </span><span class="nt">selector</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">matchLabels</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="nt">app</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">web</span><span class="w"></span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="c1"># pdb-deadlock.yaml — 3 replicas, require all 3: nothing can ever be evicted</span><span class="w"></span>
+<span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">policy/v1</span><span class="w"></span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">PodDisruptionBudget</span><span class="w"></span>
+<span class="nt">metadata</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">web-deadlock</span><span class="w"></span>
+<span class="nt">spec</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">minAvailable</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">3</span><span class="w"></span>
+<span class="w">  </span><span class="nt">selector</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">matchLabels</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="nt">app</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">web</span><span class="w"></span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code>kubectl apply -f pdb-ok.yaml
+kubectl get pdb
+<span class="nv">NODE</span><span class="o">=</span><span class="k">$(</span>kubectl get nodes -o name <span class="p">|</span> grep worker <span class="p">|</span> head -1 <span class="p">|</span> cut -d/ -f2<span class="k">)</span>
+
+<span class="c1"># Drain respects the PDB and completes</span>
+kubectl drain <span class="s2">&quot;</span><span class="nv">$NODE</span><span class="s2">&quot;</span> --ignore-daemonsets --delete-emptydir-data
+kubectl uncordon <span class="s2">&quot;</span><span class="nv">$NODE</span><span class="s2">&quot;</span>
+
+<span class="c1"># Now the deadlock</span>
+kubectl delete pdb web-ok
+kubectl apply -f pdb-deadlock.yaml
+kubectl drain <span class="s2">&quot;</span><span class="nv">$NODE</span><span class="s2">&quot;</span> --ignore-daemonsets --delete-emptydir-data --timeout<span class="o">=</span>60s
+<span class="c1"># -&gt; &quot;Cannot evict pod as it would violate the pod&#39;s disruption budget.&quot; Blocks forever.</span>
+</code></pre></div>
+
+<p>Then measure grace-period cost:</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># slow.yaml — a pod that takes its full grace period to exit</span><span class="w"></span>
+<span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">v1</span><span class="w"></span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Pod</span><span class="w"></span>
+<span class="nt">metadata</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">slow</span><span class="w"></span>
+<span class="w">  </span><span class="nt">labels</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt">app</span><span class="p">:</span><span class="w"> </span><span class="nv">slow</span><span class="p p-Indicator">}</span><span class="w"></span>
+<span class="nt">spec</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">terminationGracePeriodSeconds</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">120</span><span class="w"></span>
+<span class="w">  </span><span class="nt">containers</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">sleeper</span><span class="w"></span>
+<span class="w">      </span><span class="nt">image</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">registry.k8s.io/e2e-test-images/agnhost:2.47</span><span class="w"></span>
+<span class="w">      </span><span class="nt">command</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;/bin/sh&quot;</span><span class="p p-Indicator">,</span><span class="s">&quot;-c&quot;</span><span class="p p-Indicator">,</span><span class="s">&quot;trap</span><span class="nv"> </span><span class="s">&#39;sleep</span><span class="nv"> </span><span class="s">120&#39;</span><span class="nv"> </span><span class="s">TERM;</span><span class="nv"> </span><span class="s">sleep</span><span class="nv"> </span><span class="s">100000&quot;</span><span class="p p-Indicator">]</span><span class="w"></span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code>kubectl apply -f slow.yaml
+kubectl <span class="nb">wait</span> --for<span class="o">=</span><span class="nv">condition</span><span class="o">=</span>Ready pod/slow
+<span class="nb">time</span> kubectl delete pod slow          <span class="c1"># ~120s: the grace period is real wall-clock</span>
+</code></pre></div>
+
+<p>What to take away:</p>
+<ul>
+<li>A PDB does not fail fast; it blocks. That is why EKS caps node drain at 15 minutes and fails the node-group update (<a href="https://docs.aws.amazon.com/eks/latest/userguide/managed-node-update-behavior.html">EKS update behavior</a>) and why AKS defaults <code>drainTimeoutInMinutes</code> to 30 (<a href="https://learn.microsoft.com/en-us/azure/aks/upgrade-aks-node-pools-rolling">AKS rolling upgrades</a>).</li>
+<li>Grace period times pods-per-node times PDB serialization is your real per-node drain time. Compute it before choosing upgrade concurrency.</li>
+</ul>
+<p><strong>Exercise:</strong> write a fleet linter that flags any PDB where <code>minAvailable &gt;= replicas</code> or <code>maxUnavailable == 0</code>. Run it in admission, not just in CI.</p>
+<hr />
+<h3 id="lab-3--finalizer-and-namespace-deletion-traps-kind-free">Lab 3 — Finalizer and namespace-deletion traps (<code>kind</code>, free)<a class="anchor" href="#lab-3--finalizer-and-namespace-deletion-traps-kind-free">#</a></h3>
+<p>Reproduce the two failure modes that will eat your teardown automation.</p>
+<p><strong>3a. An object-level finalizer that never clears:</strong></p>
+<div class="codehilite"><pre><span></span><code>kubectl create ns finaltest
+kubectl -n finaltest create configmap stuck --from-literal<span class="o">=</span><span class="nv">k</span><span class="o">=</span>v
+kubectl -n finaltest patch configmap stuck --type<span class="o">=</span>merge <span class="se">\</span>
+  -p <span class="s1">&#39;{&quot;metadata&quot;:{&quot;finalizers&quot;:[&quot;example.com/never-removed&quot;]}}&#39;</span>
+
+kubectl -n finaltest delete configmap stuck --timeout<span class="o">=</span>20s   <span class="c1"># hangs</span>
+kubectl delete ns finaltest --timeout<span class="o">=</span>30s                    <span class="c1"># namespace stuck Terminating</span>
+kubectl get ns finaltest -o <span class="nv">jsonpath</span><span class="o">=</span><span class="s1">&#39;{.status.conditions}&#39;</span> <span class="p">|</span> jq .
+</code></pre></div>
+
+<p>The <code>status.conditions</code> on the namespace tell you exactly what is blocking. Learn to read them — that is your teardown debugger.</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># Correct fix: clear the finalizer on the OBJECT (a controller would normally do this)</span>
+kubectl -n finaltest patch configmap stuck --type<span class="o">=</span>merge -p <span class="s1">&#39;{&quot;metadata&quot;:{&quot;finalizers&quot;:null}}&#39;</span>
+kubectl get ns finaltest        <span class="c1"># now completes</span>
+</code></pre></div>
+
+<p><strong>3b. The dead APIService that blocks every namespace in the cluster:</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># ghost-apiservice.yaml — registers an aggregated API with no backend</span><span class="w"></span>
+<span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">apiregistration.k8s.io/v1</span><span class="w"></span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">APIService</span><span class="w"></span>
+<span class="nt">metadata</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">v1beta1.ghost.example.com</span><span class="w"></span>
+<span class="nt">spec</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">group</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">ghost.example.com</span><span class="w"></span>
+<span class="w">  </span><span class="nt">version</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">v1beta1</span><span class="w"></span>
+<span class="w">  </span><span class="nt">groupPriorityMinimum</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">100</span><span class="w"></span>
+<span class="w">  </span><span class="nt">versionPriority</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">10</span><span class="w"></span>
+<span class="w">  </span><span class="nt">service</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">does-not-exist</span><span class="w"></span>
+<span class="w">    </span><span class="nt">namespace</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">default</span><span class="w"></span>
+<span class="w">    </span><span class="nt">port</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">443</span><span class="w"></span>
+<span class="w">  </span><span class="nt">insecureSkipTLSVerify</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span><span class="w"></span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code>kubectl apply -f ghost-apiservice.yaml
+kubectl get apiservices <span class="p">|</span> grep ghost      <span class="c1"># False (ServiceNotFound)</span>
+
+kubectl create ns victim
+kubectl -n victim create configmap x --from-literal<span class="o">=</span><span class="nv">a</span><span class="o">=</span>b
+kubectl delete ns victim --timeout<span class="o">=</span>60s    <span class="c1"># hangs — and so will EVERY other namespace</span>
+
+kubectl delete apiservice v1beta1.ghost.example.com
+kubectl get ns victim                     <span class="c1"># completes immediately</span>
+</code></pre></div>
+
+<p>This is the exact mechanism GKE documents (<a href="https://docs.cloud.google.com/kubernetes-engine/docs/troubleshooting/terminating-namespaces">terminating namespaces</a>), and it is worth burning into memory: <strong>one broken aggregated API is a cluster-wide deletion outage.</strong> Add "all APIServices Available" to your pre-teardown assertion list.</p>
+<hr />
+<h3 id="lab-4--detect-removed-apis-before-an-upgrade-kind-free">Lab 4 — Detect removed APIs before an upgrade (<code>kind</code>, free)<a class="anchor" href="#lab-4--detect-removed-apis-before-an-upgrade-kind-free">#</a></h3>
+<div class="codehilite"><pre><span></span><code>kind create cluster --name kubentlab --image kindest/node:v1.33.0
+
+<span class="c1"># Install something with a chart, so kubent has a Helm release to scan</span>
+helm repo add metrics-server https://kubernetes-sigs.github.io/metrics-server/
+helm install ms metrics-server/metrics-server -n kube-system <span class="se">\</span>
+  --set <span class="s1">&#39;args={--kubelet-insecure-tls}&#39;</span>
+
+kubent                                   <span class="c1"># scan live objects + helm releases</span>
+kubent -t <span class="m">1</span>.36.0                          <span class="c1"># what breaks if I target 1.36?</span>
+kubent --helm3<span class="o">=</span><span class="nb">false</span> --cluster            <span class="c1"># cluster-objects only</span>
+</code></pre></div>
+
+<p>Then feed it a manifest with a known-removed API to see a real finding:</p>
+<div class="codehilite"><pre><span></span><code>cat &gt; old.yaml <span class="s">&lt;&lt;&#39;EOF&#39;</span>
+<span class="s">apiVersion: policy/v1beta1</span>
+<span class="s">kind: PodDisruptionBudget</span>
+<span class="s">metadata: {name: legacy-pdb}</span>
+<span class="s">spec:</span>
+<span class="s">  minAvailable: 1</span>
+<span class="s">  selector: {matchLabels: {app: nope}}</span>
+<span class="s">EOF</span>
+kubent -f old.yaml
+</code></pre></div>
+
+<p><strong>Exercise:</strong> wire <code>kubent -t &lt;next-minor&gt; -e</code> (exit non-zero on findings) into a cron that runs against every cell and opens a ticket per finding. That plus <a href="https://docs.aws.amazon.com/eks/latest/userguide/cluster-insights.html">EKS Cluster Insights</a> and <a href="https://docs.cloud.google.com/kubernetes-engine/docs/deprecations">GKE deprecation insights</a> is a complete detection story.</p>
+<hr />
+<h3 id="cloud-labs-real-money--read-the-costs-first">Cloud labs (real money — read the costs first)<a class="anchor" href="#cloud-labs-real-money--read-the-costs-first">#</a></h3>
+<p>These teach the things <code>kind</code> cannot: managed upgrade orchestration, node image replacement, IP exhaustion, identity federation. <strong>Delete everything the same day.</strong> All figures are rough, on-demand, us-east-1-ish, and should be re-checked against current pricing pages.</p>
+<table>
+<thead>
+<tr>
+<th>Lab</th>
+<th>What it teaches</th>
+<th>Rough cost</th>
+<th>Teardown gotcha</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>A. EKS: 2-node cluster, upgrade 1.34 to 1.35</strong></td>
+<td>Real control-plane-then-node ordering; managed node group <code>maxUnavailable</code>; add-on version matrix</td>
+<td>~$0.10/hr control plane + 2 × m5.large (~$0.19/hr) + NAT (~$0.045/hr + data) ≈ <strong>$0.35/hr</strong>; a 4-hour lab ≈ <strong>$1.50</strong></td>
+<td><code>eksctl delete cluster</code> leaves orphans if any <code>Service type=LoadBalancer</code> exists. Delete Services first</td>
+</tr>
+<tr>
+<td><strong>B. EKS: force IP exhaustion</strong></td>
+<td>VPC CNI ENI limits, prefix delegation</td>
+<td>Same as A, plus a small instance type (t3.small caps pods low)</td>
+<td>Same</td>
+</tr>
+<tr>
+<td><strong>C. GKE: Standard cluster, set <code>--max-pods-per-node 16</code>, observe alias range</strong></td>
+<td>The /24-per-node math, secondary range sizing</td>
+<td>Cluster management fee + 2 × e2-standard-2 (~$0.13/hr) ≈ <strong>$0.25/hr</strong>; 3-hour lab ≈ <strong>$0.80</strong></td>
+<td>Delete the cluster <em>and</em> check for leftover forwarding rules and disks</td>
+</tr>
+<tr>
+<td><strong>D. GKE: blue/green node pool upgrade</strong></td>
+<td>Batched drain + soak; watch pool size double</td>
+<td>As C, but node cost temporarily doubles</td>
+<td>Blue/green leaves the old pool until it completes — do not cancel midway</td>
+</tr>
+<tr>
+<td><strong>E. AKS: cluster with <code>maxSurge=33%</code>, <code>drainTimeout=5</code>, <code>nodeSoak=2</code></strong></td>
+<td>Surge sizing, drain timeout expiry behavior, forced eviction past a PDB</td>
+<td>Free tier control plane ($0) + 2 × Standard_D2s_v5 (~$0.19/hr) ≈ <strong>$0.19/hr</strong>; 3-hour lab ≈ <strong>$0.60</strong></td>
+<td>Delete the <strong>resource group</strong>, not just the cluster — AKS creates a second <code>MC_*</code> resource group that must go too</td>
+</tr>
+<tr>
+<td><strong>F. AKS: enable NAP, delete a node pool, watch Karpenter provision</strong></td>
+<td>Managed Karpenter behavior vs self-run</td>
+<td>As E</td>
+<td>Same <code>MC_*</code> gotcha</td>
+</tr>
+<tr>
+<td><strong>G. Identity: IRSA vs Pod Identity on EKS; WIF on GKE; Workload ID on AKS</strong></td>
+<td>Token exchange flows end-to-end</td>
+<td>Minimal beyond the cluster</td>
+<td>Delete OIDC providers and federated credentials — they count against quotas</td>
+</tr>
+</tbody>
+</table>
+<p>Run A, C, and E at minimum. Together they are under $5 and they are the only way to feel the difference in upgrade orchestration.</p>
+<p>A tiny discipline that will save you real money: tag or label every lab resource with <code>owner=&lt;you&gt;</code> and <code>ttl=&lt;date&gt;</code>, and run a nightly sweeper. That is the same pattern you need for cell teardown, so you may as well practise it.</p>
+<hr />
+<h2 id="production-gotchas">Production gotchas<a class="anchor" href="#production-gotchas">#</a></h2>
+<ol>
+<li>
+<p><strong>EKS force-upgrades your control plane after extended support ends, with no notification, and does not touch your nodes.</strong> AWS documents this explicitly: automatic updates can happen at any time after the end-of-extended-support date, you get no advance notice, and you must manually update add-ons and EC2 nodes afterwards (<a href="https://docs.aws.amazon.com/eks/latest/userguide/kubernetes-versions-extended.html">EKS extended support</a>). The failure shape is an apiserver two minors ahead of your kubelets. Alarm on days-until-EOL per cell and never let a cell approach the cliff.</p>
+</li>
+<li>
+<p><strong>EKS extended support costs 6x, and it is per cluster per hour.</strong> $0.60/hr vs $0.10/hr (<a href="https://aws.amazon.com/blogs/containers/amazon-eks-extended-support-for-kubernetes-versions-pricing/">AWS blog</a>). At 300 cells that is roughly $1.3M/year of pure procrastination tax. Model this as a line item in your upgrade business case; it is usually the single most persuasive number you have.</p>
+</li>
+<li>
+<p><strong>GKE "No channel" clusters are on a hard deadline of 2027-06-14</strong>, after which Google enrols them in Stable (<a href="https://docs.cloud.google.com/kubernetes-engine/docs/release-schedule">GKE release schedule</a>). Any GKE cell created channel-less to dodge auto-upgrades will start auto-upgrading. Inventory this now.</p>
+</li>
+<li>
+<p><strong>GKE maintenance exclusions cap at 30 days for channel-less clusters.</strong> You cannot indefinitely freeze a GKE cluster. Plan upgrades on Google's calendar, not yours, and scrape the release schedule into your roadmap.</p>
+</li>
+<li>
+<p><strong>AKS upgrades fail on quota, not on Kubernetes.</strong> Microsoft states plainly that upgrades temporarily consume extra IP addresses and vCPU quota, and that the upgrade process fails without headroom (<a href="https://learn.microsoft.com/en-us/azure/aks/quotas-skus-regions">AKS quotas</a>). Size cell subnets and vCPU quota for peak-during-upgrade — roughly steady state plus <code>maxSurge</code> — not for steady state.</p>
+</li>
+<li>
+<p><strong>The default AKS clusters-per-subscription-per-region quota is 100 for EA subscriptions</strong>, with self-service to 1,000 and support tickets beyond (<a href="https://learn.microsoft.com/en-us/azure/aks/quotas-skus-regions">AKS quotas</a>). A 300-cell Azure footprint hits this per region. Raise quotas as part of region onboarding, before the first cell.</p>
+</li>
+<li>
+<p><strong>IRSA does not scale past 100 clusters per AWS account</strong> — the IAM OIDC-providers-per-account quota is 100, and role trust policies cap at 2,048 characters (<a href="https://docs.aws.amazon.com/eks/latest/best-practices/known_limits_and_service_quotas.html">EKS known limits</a>). Use <a href="https://aws.amazon.com/blogs/containers/amazon-eks-pod-identity-a-new-way-for-applications-on-eks-to-obtain-iam-credentials/">EKS Pod Identity</a> for new cells; it replaces per-cluster trust-policy edits with an association API call.</p>
+</li>
+<li>
+<p><strong><code>aws-auth</code> is deprecated and is a single-object cluster lockout risk.</strong> Set new EKS cells to <code>API</code> authentication mode (access entries only) (<a href="https://docs.aws.amazon.com/eks/latest/userguide/migrating-access-entries.html">migration guide</a>). A malformed <code>aws-auth</code> edit has locked more teams out of production EKS clusters than any other single mistake.</p>
+</li>
+<li>
+<p><strong>One dead APIService blocks namespace deletion cluster-wide.</strong> If an aggregated API is registered without a healthy backend, the namespace controller cannot enumerate resources and <em>no</em> namespace finishes terminating (<a href="https://docs.cloud.google.com/kubernetes-engine/docs/troubleshooting/terminating-namespaces">GKE troubleshooting</a>). Make "all APIServices Available" a pre-teardown gate, and alert on it continuously.</p>
+</li>
+<li>
+<p><strong>Never force-remove the <code>kubernetes</code> finalizer from a namespace.</strong> It orphans cloud load balancers, disks, DNS records, and operator-managed external resources (<a href="https://docs.cloud.google.com/kubernetes-engine/docs/troubleshooting/terminating-namespaces">GKE troubleshooting</a>). Fix the blocking controller instead, and if you must force, run the cloud-resource sweep immediately afterwards.</p>
+</li>
+<li>
+<p><strong>Zonal block volumes plus node draining equals guaranteed stuck StatefulSets, eventually.</strong> Set <code>volumeBindingMode: WaitForFirstConsumer</code> on every block StorageClass, and either use regional volumes (GKE regional PD, Azure ZRS) or pin StatefulSet ordinals to zones (<a href="https://cloud.google.com/kubernetes-engine/docs/concepts/persistent-volumes">GKE PVs</a>). Audit inherited StorageClasses on every cell; <code>Immediate</code> binding is a latent outage.</p>
+</li>
+<li>
+<p><strong>cgroup v1 is gone as of Kubernetes 1.35 — kubelet refuses to start by default.</strong> AL2023 and Bottlerocket are fine, but Bottlerocket sets <code>failCgroupV1: false</code> for compatibility and EKS Fargate still uses cgroup v1 (<a href="https://docs.aws.amazon.com/eks/latest/userguide/kubernetes-versions-standard.html">EKS 1.35 notes</a>). If any cell runs a custom AMI with a manual cgroup v1 configuration, 1.35 will not boot it.</p>
+</li>
+<li>
+<p><strong>containerd 1.x support ends with Kubernetes 1.35.</strong> You must be on containerd 2.0+ before the next minor (<a href="https://docs.aws.amazon.com/eks/latest/userguide/kubernetes-versions-standard.html">EKS 1.35 notes</a>). This is a node-image concern, so it is your problem on EKS and mostly the provider's on GKE/AKS — but verify, do not assume.</p>
+</li>
+<li>
+<p><strong>Kubernetes 1.36 rejects non-canonical CIDRs and leading-zero IPs on create/update.</strong> <code>StrictIPCIDRValidation</code> is on by default; <code>192.168.0.5/24</code> and <code>010.0.0.5</code> are refused, with ratcheting only for already-stored objects (<a href="https://github.com/kubernetes/enhancements/issues/4858">KEP-4858</a>, <a href="https://docs.aws.amazon.com/eks/latest/userguide/kubernetes-versions-standard.html">EKS 1.36 notes</a>). Cell templates are full of CIDRs. Grep and fix them before 1.36 lands.</p>
+</li>
+<li>
+<p><strong>Amazon Linux 2 EKS AMIs are end-of-support since 2025-11-26 and 1.32 was the last minor to get them</strong> (<a href="https://docs.aws.amazon.com/eks/latest/userguide/eks-ami-deprecation-faqs.html">AWS FAQ</a>). The AL2023 move changes node bootstrap format, cgroup version, and defaults to IMDSv2-only (<a href="https://docs.aws.amazon.com/eks/latest/userguide/al2023.html">AL2023 upgrade</a>) — an SDK in a pod that still uses IMDSv1 will start failing.</p>
+</li>
+<li>
+<p><strong>Upgrading an AKS cluster to 1.35 with the Ubuntu OS SKU silently moves nodes from Ubuntu 22.04 to 24.04</strong> (<a href="https://learn.microsoft.com/en-us/azure/aks/upgrade-os-version">AKS upgrade OS version</a>). A distro major bump riding along with a Kubernetes minor upgrade is a genuine risk for anything touching the host kernel or glibc. Test DaemonSets explicitly on the new image before the fleet-wide rollout.</p>
+</li>
+<li>
+<p><strong>AKS kubenet retires 2028-03-31</strong> (<a href="https://learn.microsoft.com/en-us/azure/aks/concepts-network-legacy-cni">legacy CNI</a>). Migrating a live cluster's network plugin is generally a rebuild, not an in-place change, so this is a cell-recycle project with a fixed deadline. Start the inventory now.</p>
+</li>
+<li>
+<p><strong>GKE's default 110 pods per node consumes a /24 of your secondary range per node.</strong> A /21 secondary range supports 8 nodes at the default (<a href="https://cloud.google.com/kubernetes-engine/docs/how-to/flexible-pod-cidr">flexible pod CIDR</a>). If your GKE cell template copies the AWS subnet sizing, it will run out of nodes at a number that looks absurd. Set <code>--max-pods-per-node</code> deliberately per cell profile, and note it is fixed at node-pool creation.</p>
+</li>
+<li>
+<p><strong>Your own reconciler will throttle you.</strong> AKS publishes <code>PUT ManagedCluster</code> at 1 request per minute per cluster and returns HTTP 429 with <code>Retry-After</code> (<a href="https://learn.microsoft.com/en-us/azure/aks/quotas-skus-regions">AKS quotas</a>); AWS throttles the exact EC2 ENI/IP APIs the VPC CNI depends on during scale-out (<a href="https://docs.aws.amazon.com/eks/latest/best-practices/known_limits_and_service_quotas.html">EKS limits</a>). Fleet reconcilers need jittered backoff and per-cloud concurrency limits, or a cell rollout becomes a self-inflicted throttling incident.</p>
+</li>
+<li>
+<p><strong>Ingress NGINX was retired by upstream Kubernetes in March 2026</strong> — no more bug fixes or security patches, and no drop-in replacement (<a href="https://kubernetes.io/blog/2026/01/29/ingress-nginx-statement/">Kubernetes statement</a>). If any cell bootstraps it, that is unpatched internet-facing software in your dependency graph. Plan the Gateway API migration as a funded project, not a chore.</p>
+</li>
+<li>
+<p><strong>A control plane at N with add-ons pinned at N-2 is a silent time bomb.</strong> kube-proxy, CNI, and CSI all have compatibility matrices tied to the control-plane minor. On EKS you own that matrix. Encode it in your cell template and validate it in pre-flight, because the failure mode is subtle networking or volume-attach breakage weeks later, not a clean error at upgrade time.</p>
+</li>
+</ol>
+<hr />
+<h2 id="how-this-shows-up-in-cell-lifecycle">How this shows up in cell lifecycle<a class="anchor" href="#how-this-shows-up-in-cell-lifecycle">#</a></h2>
+<p>Mapping the above onto the four verbs of cell lifecycle.</p>
+<p><strong>Provision.</strong> A cell definition is a version-pinned, cloud-branching template. Concretely: minor version (chosen from the intersection of what all three clouds support), release channel or auto-upgrade policy (Extended/none/none — you want to control timing, not Google), node abstraction (managed node group + Karpenter on AWS, node pool + NAP on Azure, node pool + NAP on GKE), OS image, pod IP model and CIDR sizing, workload identity mechanism, StorageClass with <code>WaitForFirstConsumer</code>, and the bootstrap ordering from the section above. The branching points are exactly the rows of the tables in this guide; everything else is one code path. Helm-for-templating fits this well: render per-cloud values into manifests, let GitOps own applied state.</p>
+<p><strong>Upgrade.</strong> This is a <em>pipeline</em>, not an event. Pre-flight (deprecated APIs via <code>kubent</code> + provider insights, PDB lint, add-on matrix check, quota headroom check, APIService health). Then a wave schedule: canary cells, then a percentage, then the rest, with soak time between waves. Then per-cell: control plane, add-ons, nodes, verify. The per-cloud differences that matter are the node-replacement knobs (<code>maxUnavailable</code> and <code>updateStrategy</code> on EKS, <code>maxSurge</code>/blue-green on GKE, <code>maxSurge</code>/<code>drainTimeout</code>/<code>nodeSoak</code> on AKS) and the auto-upgrade policy you have to <em>suppress</em> so your pipeline stays in control. On GKE, that means Extended channel or aggressive maintenance exclusions; on AKS, channel <code>none</code> plus your own driver; on EKS, staying comfortably inside standard support.</p>
+<p><strong>Converge.</strong> Drift is the steady-state enemy. GitOps for cluster contents, plus a continuous conformance check per cell: correct add-on versions, correct StorageClass binding mode, no <code>Immediate</code> block classes, no deadlock PDBs, all APIServices healthy, node OS image within N days of latest, kubelet skew under 2, days-until-EOL above threshold. Emit these as fleet metrics with a per-cell label. Your dashboard should answer "how many cells are non-conformant and why" in one glance.</p>
+<p><strong>Tear down.</strong> The ordered sequence from the teardown section, wrapped in assertions: stop reconcilers, drain workload namespaces, verify zero LoadBalancer Services and zero bound PVCs, delete node pools, delete cluster, sweep by <code>cell-id</code> tag, reclaim identity objects. The sweep must be a first-class, tested code path with a dry-run mode that runs on every teardown — orphaned cloud resources are the failure mode that never pages you and always shows up on the invoice.</p>
+<p><strong>Cross-cutting.</strong> When networking is owned by a separate team, be precise about the seam. A typical split: you own pod CIDR sizing, CNI choice and version, node subnet allocation, and the control-plane endpoint model; they own ingress, load balancers, service mesh, and cross-cell routing. The IP-exhaustion class of failure sits exactly on that boundary — you size the ranges, they consume them with LoadBalancer Services and NAT. Write the contract down.</p>
+<hr />
+<h2 id="learning-path">Learning path<a class="anchor" href="#learning-path">#</a></h2>
+<h3 id="day-1-about-3-hours">Day 1 (about 3 hours)<a class="anchor" href="#day-1-about-3-hours">#</a></h3>
+<ul>
+<li>Read <a href="https://docs.cloud.google.com/kubernetes-engine/versioning">GKE versioning and support</a> and the <a href="https://docs.cloud.google.com/kubernetes-engine/docs/release-schedule">GKE release schedule</a> end to end. GKE has the clearest published model of the three; understanding it gives you the vocabulary for the other two.</li>
+<li>Read the <a href="https://docs.aws.amazon.com/eks/latest/userguide/kubernetes-versions-extended.html">EKS extended support page</a> and the <a href="https://learn.microsoft.com/en-us/azure/aks/supported-kubernetes-versions">AKS supported versions page</a>. Fill in a copy of the big comparison table from memory afterwards.</li>
+<li>Read the <a href="https://kubernetes.io/releases/version-skew-policy/">Kubernetes version skew policy</a>. It is short and it explains why every upgrade is ordered the way it is.</li>
+<li>Run <strong>Lab 2</strong> (PDB and drain). This is the highest-value hour in the guide.</li>
+</ul>
+<h3 id="week-1">Week 1<a class="anchor" href="#week-1">#</a></h3>
+<ul>
+<li>Run Labs 1, 3, and 4. Lab 3 in particular — the ghost APIService trick is something you will use in a real incident.</li>
+<li>Read the three quota pages side by side (<a href="https://docs.aws.amazon.com/eks/latest/best-practices/known_limits_and_service_quotas.html">EKS</a>, <a href="https://docs.cloud.google.com/kubernetes-engine/quotas">GKE</a>, <a href="https://learn.microsoft.com/en-us/azure/aks/quotas-skus-regions">AKS</a>) and write down, for each cloud, the first three quotas a 300-cell fleet would hit.</li>
+<li>Read the node upgrade docs for all three (<a href="https://docs.aws.amazon.com/eks/latest/userguide/managed-node-update-behavior.html">EKS</a>, <a href="https://docs.cloud.google.com/kubernetes-engine/docs/concepts/node-pool-upgrade-strategies">GKE</a>, <a href="https://learn.microsoft.com/en-us/azure/aks/upgrade-aks-node-pools-rolling">AKS</a>) and build a one-page cheat sheet of the knobs and defaults.</li>
+<li>Run cloud Labs A, C, and E (under $5 total). Watch a real upgrade on each cloud and time it.</li>
+<li>Read the identity docs for all three (<a href="https://aws.amazon.com/blogs/containers/amazon-eks-pod-identity-a-new-way-for-applications-on-eks-to-obtain-iam-credentials/">Pod Identity</a>, <a href="https://docs.cloud.google.com/kubernetes-engine/docs/concepts/workload-identity">GKE WIF</a>, <a href="https://learn.microsoft.com/en-us/azure/aks/workload-identity-overview">Entra Workload ID</a>) and draw the token-exchange flow for each from memory.</li>
+</ul>
+<h3 id="month-1">Month 1<a class="anchor" href="#month-1">#</a></h3>
+<ul>
+<li>Read your team's actual cell template top to bottom and annotate every place it branches per cloud. Compare against the branch list in this guide; anything extra is either a real difference you should learn or accidental divergence you should propose removing.</li>
+<li>Build the skew/EOL reporter from Lab 1's exercise against your real fleet. Ship it as a dashboard.</li>
+<li>Build the PDB linter from Lab 2's exercise and propose it as an admission policy.</li>
+<li>Trace one real cell teardown end to end, with cloud audit logs open, and enumerate every resource that survived the cluster deletion. Turn that list into the sweeper's test fixture.</li>
+<li>Read the <a href="https://cluster-api.sigs.k8s.io/">Cluster API book</a> and the <a href="https://github.com/kubernetes-sigs/cluster-api/blob/main/docs/proposals/20220725-managed-kubernetes.md">managed Kubernetes proposal</a> so you can hold an informed opinion on whether CAPI belongs in your stack. Then read your team's existing IaC and form a view on the trade you already made.</li>
+<li>Pick the nearest version cliff on each cloud and write the upgrade plan for it, including the wave schedule and the rollback story.</li>
+</ul>
+<hr />
+<h2 id="references">References<a class="anchor" href="#references">#</a></h2>
+<ol>
+<li><a href="https://docs.aws.amazon.com/eks/latest/userguide/kubernetes-versions-standard.html">Review release notes for Kubernetes versions on standard support — AWS</a> — authoritative per-minor breaking changes for EKS 1.34/1.35/1.36, including cgroup v1 removal and strict CIDR validation.</li>
+<li><a href="https://docs.aws.amazon.com/eks/latest/userguide/kubernetes-versions-extended.html">Review release notes for Kubernetes versions on extended support — AWS</a> — the 14+12 month model, forced-upgrade behavior, AL2 AMI deprecation notice.</li>
+<li><a href="https://aws.amazon.com/blogs/containers/amazon-eks-extended-support-for-kubernetes-versions-pricing/">Amazon EKS extended support pricing — AWS Containers Blog</a> — the $0.10 vs $0.60 per cluster-hour numbers.</li>
+<li><a href="https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-eks-cluster-upgradepolicy.html">AWS::EKS::Cluster UpgradePolicy — AWS</a> — the <code>STANDARD</code> vs <code>EXTENDED</code> cluster field that decides what happens at end of standard support.</li>
+<li><a href="https://docs.aws.amazon.com/eks/latest/best-practices/known_limits_and_service_quotas.html">Known limits and service quotas — Amazon EKS Best Practices</a> — the single best page on what actually breaks at EKS scale: IAM OIDC provider cap, trust policy length, ENI quotas, EC2 API throttling, 8 GiB etcd limit, Route 53 PPS.</li>
+<li><a href="https://docs.aws.amazon.com/eks/latest/userguide/service-quotas.html">View and manage Amazon EKS service quotas — AWS</a> — where to check and raise EKS-specific quotas.</li>
+<li><a href="https://docs.aws.amazon.com/eks/latest/userguide/managed-node-update-behavior.html">Managed node group update behavior — AWS</a> — the 15-minute drain timeout and PDB-respecting vs force update strategies.</li>
+<li><a href="https://docs.aws.amazon.com/eks/latest/APIReference/API_NodegroupUpdateConfig.html">NodegroupUpdateConfig API reference — AWS</a> — <code>maxUnavailable</code>, <code>maxUnavailablePercentage</code>, <code>updateStrategy</code>.</li>
+<li><a href="https://docs.aws.amazon.com/eks/latest/userguide/migrating-access-entries.html">Migrating from aws-auth to access entries — AWS</a> — the three authentication modes and precedence rules.</li>
+<li><a href="https://docs.aws.amazon.com/eks/latest/userguide/auth-configmap.html">Grant IAM users access with a ConfigMap — AWS</a> — the deprecated <code>aws-auth</code> path, for when you inherit one.</li>
+<li><a href="https://aws.amazon.com/blogs/containers/amazon-eks-pod-identity-a-new-way-for-applications-on-eks-to-obtain-iam-credentials/">Amazon EKS Pod Identity — AWS Containers Blog</a> — why Pod Identity exists and how it removes the per-cluster OIDC provider.</li>
+<li><a href="https://aws.amazon.com/blogs/aws/streamline-kubernetes-cluster-management-with-new-amazon-eks-auto-mode">Streamline cluster management with EKS Auto Mode — AWS News Blog</a> — what AWS takes over in Auto Mode.</li>
+<li><a href="https://docs.aws.amazon.com/eks/latest/userguide/eks-ami-deprecation-faqs.html">EKS AL2 and AL2-accelerated AMI transition FAQ — AWS</a> — the 2025-11-26 AL2 end-of-support date and what replaces it.</li>
+<li><a href="https://github.com/awslabs/amazon-eks-ami/issues/2545">NOTICE: Amazon Linux 2 AMI end of support — awslabs/amazon-eks-ami#2545</a> — the upstream issue with the concrete final-AMI timeline.</li>
+<li><a href="https://docs.aws.amazon.com/eks/latest/userguide/al2023.html">Upgrade from Amazon Linux 2 to Amazon Linux 2023 — AWS</a> — bootstrap format, cgroup, and IMDS changes in the AL2023 migration.</li>
+<li><a href="https://docs.aws.amazon.com/eks/latest/userguide/ebs-csi.html">Use Kubernetes volume storage with Amazon EBS — AWS</a> — EBS CSI driver as an EKS add-on.</li>
+<li><a href="https://docs.aws.amazon.com/eks/latest/userguide/eks-add-ons.html">Amazon EKS add-ons — AWS</a> — the add-on model, versioning, and which components it covers.</li>
+<li><a href="https://docs.aws.amazon.com/eks/latest/userguide/cluster-insights.html">Cluster insights — Amazon EKS</a> — AWS's built-in upgrade blocker detection.</li>
+<li><a href="https://aws.github.io/aws-eks-best-practices/networking/ip-optimization-strategies/">Optimizing IP address utilization — EKS Best Practices</a> — the practical playbook for VPC CNI IP exhaustion.</li>
+<li><a href="https://aws.github.io/aws-eks-best-practices/networking/prefix-mode/index_linux/">Prefix mode for Linux — EKS Best Practices</a> — prefix delegation, the main pods-per-node lever on EKS.</li>
+<li><a href="https://aws.github.io/aws-eks-best-practices/upgrades/">Best practices for cluster upgrades — EKS Best Practices</a> — AWS's own upgrade runbook, worth stealing structure from.</li>
+<li><a href="https://aws.amazon.com/ec2/pricing/on-demand/">Amazon EC2 on-demand pricing — AWS</a> — source for the $0.01/GB per direction cross-AZ data transfer charge.</li>
+<li><a href="https://docs.cloud.google.com/kubernetes-engine/versioning">GKE versioning and support — Google</a> — the minor version lifecycle, ~14 months standard and up to 24 months with Extended.</li>
+<li><a href="https://docs.cloud.google.com/kubernetes-engine/docs/release-schedule">GKE release schedule — Google</a> — the most useful single page in this guide: per-minor availability, auto-upgrade, and end-of-support dates per channel, plus the No-channel removal date.</li>
+<li><a href="https://docs.cloud.google.com/kubernetes-engine/docs/concepts/release-channels">About release channels — GKE</a> — Rapid/Regular/Stable/Extended semantics and what auto-upgrades in each.</li>
+<li><a href="https://docs.cloud.google.com/kubernetes-engine/docs/how-to/release-channels">Use release channels — GKE</a> — how to enrol and change channels on existing clusters.</li>
+<li><a href="https://cloud.google.com/blog/products/containers-kubernetes/announcing-gke-extended-support">Announcing GKE extended support — Google Cloud Blog</a> — vendor announcement; useful for the rationale, secondary to the versioning docs.</li>
+<li><a href="https://docs.cloud.google.com/kubernetes-engine/quotas">Quotas and limits — GKE</a> — 65,000 nodes Standard / 5,000 Autopilot, 256 pods per node, 200,000 pods, 400,000 containers, 6 GB etcd, 100 concurrent operations.</li>
+<li><a href="https://docs.cloud.google.com/kubernetes-engine/docs/concepts/planning-large-clusters">Best practices for planning large GKE clusters — Google</a> — the tiering requirements behind the 5k/15k/65k node thresholds.</li>
+<li><a href="https://docs.cloud.google.com/kubernetes-engine/docs/concepts/node-pool-upgrade-strategies">Node upgrade strategies — GKE</a> — surge defaults (<code>maxSurge=1</code>, <code>maxUnavailable=0</code>) and blue/green mechanics.</li>
+<li><a href="https://docs.cloud.google.com/kubernetes-engine/docs/how-to/node-pool-upgrade-strategies">Configure node upgrade strategies — GKE</a> — the actual flags, batch sizes, and soak configuration.</li>
+<li><a href="https://docs.cloud.google.com/kubernetes-engine/docs/concepts/maintenance-windows-and-exclusions">Maintenance windows and exclusions — GKE</a> — your only real brake on GKE auto-upgrades.</li>
+<li><a href="https://docs.cloud.google.com/kubernetes-engine/docs/concepts/alias-ips">VPC-native clusters and alias IPs — GKE</a> — how GKE pod IPs come from secondary subnet ranges.</li>
+<li><a href="https://cloud.google.com/kubernetes-engine/docs/how-to/flexible-pod-cidr">Configure maximum Pods per node — GKE</a> — the /24-per-node default and the arithmetic for sizing secondary ranges.</li>
+<li><a href="https://docs.cloud.google.com/kubernetes-engine/docs/concepts/workload-identity">About Workload Identity Federation for GKE — Google</a> — the metadata-server interception and STS token exchange flow.</li>
+<li><a href="https://cloud.google.com/kubernetes-engine/docs/concepts/persistent-volumes">Persistent volumes and dynamic provisioning — GKE</a> — regional PD, <code>WaitForFirstConsumer</code>, and <code>allowedTopologies</code> behavior.</li>
+<li><a href="https://docs.cloud.google.com/kubernetes-engine/docs/how-to/stateful-ha">Stateful HA Operator — GKE</a> — automated StatefulSet failover with regional PD.</li>
+<li><a href="https://docs.cloud.google.com/kubernetes-engine/docs/deprecations">Kubernetes deprecations in GKE — Google</a> — deprecation insights generated from observed apiserver calls.</li>
+<li><a href="https://docs.cloud.google.com/kubernetes-engine/docs/troubleshooting/terminating-namespaces">Troubleshoot namespace stuck in Terminating — GKE</a> — the definitive writeup of the dead-APIService trap and why not to strip finalizers.</li>
+<li><a href="https://docs.cloud.google.com/kubernetes-engine/docs/concepts/about-autopilot-mode-standard-clusters">About Autopilot mode workloads in GKE Standard — Google</a> — the <code>autopilot</code> and <code>autopilot-spot</code> ComputeClasses added to Standard clusters.</li>
+<li><a href="https://cloud.google.com/kubernetes-engine/docs/how-to/node-auto-provisioning">Node auto-provisioning — GKE</a> — GKE's pool-creating autoscaler, conceptually different from Karpenter.</li>
+<li><a href="https://docs.cloud.google.com/kubernetes-engine/docs/concepts/multitenancy-overview">Cluster multi-tenancy — GKE</a> — Google's isolation ladder, useful framing for cell sizing.</li>
+<li><a href="https://cloud.google.com/kubernetes-engine/fleet-management/docs">Fleet management — GKE</a> — fleets, Config Sync, Policy Controller, multi-cluster services.</li>
+<li><a href="https://cloud.google.com/blog/products/containers-kubernetes/container-optimized-compute-delivers-autoscaling-for-autopilot">Container-optimized compute for Autopilot — Google Cloud Blog</a> — vendor blog; context on the Autopilot scheduling changes. Secondary source.</li>
+<li><a href="https://learn.microsoft.com/en-us/azure/aks/supported-kubernetes-versions">Supported Kubernetes versions in AKS — Microsoft</a> — the N-2 policy, 12-month window, and the per-version GA/EOL table.</li>
+<li><a href="https://learn.microsoft.com/en-us/azure/aks/long-term-support">Long-term support for AKS versions — Microsoft</a> — 24-month total support, Premium tier requirement, two-patch limitation.</li>
+<li><a href="https://blog.aks.azure.com/2025/07/25/aks-lts-announcement">AKS Long Term Support announcement — AKS Engineering Blog</a> — vendor blog explaining LTS for every version. Secondary source.</li>
+<li><a href="https://learn.microsoft.com/en-us/azure/aks/quotas-skus-regions">Quotas, VM size restrictions, and region availability in AKS — Microsoft</a> — 5,000 nodes per cluster, 1,000 per pool, 100 pools, 250 pods per node, RP throttling buckets, cluster-per-subscription quotas, and the upgrade-consumes-extra-quota warning.</li>
+<li><a href="https://learn.microsoft.com/en-us/azure/aks/auto-upgrade-cluster">Automatically upgrade an AKS cluster — Microsoft</a> — the <code>patch</code>/<code>stable</code>/<code>rapid</code>/<code>none</code> channels and <code>aksManagedAutoUpgradeSchedule</code>.</li>
+<li><a href="https://learn.microsoft.com/en-us/azure/aks/auto-upgrade-node-os-image">Auto-upgrade node OS images — Microsoft</a> — the separate node-image channel and <code>aksManagedNodeOSUpgradeSchedule</code>.</li>
+<li><a href="https://learn.microsoft.com/en-us/azure/aks/upgrade-aks-node-pools-rolling">Configure rolling upgrades for AKS node pools — Microsoft</a> — <code>maxSurge</code>, <code>drainTimeoutInMinutes</code> (default 30, range 5 min to 24 h), <code>nodeSoakDurationInMinutes</code>.</li>
+<li><a href="https://learn.microsoft.com/en-us/azure/aks/upgrade-options">Upgrade options and recommendations for AKS — Microsoft</a> — the overall AKS upgrade decision tree.</li>
+<li><a href="https://learn.microsoft.com/en-us/azure/aks/node-auto-provisioning">Node auto-provisioning in AKS — Microsoft</a> — managed Karpenter as an AKS addon.</li>
+<li><a href="https://github.com/Azure/karpenter-provider-azure">Azure/karpenter-provider-azure — GitHub</a> — the provider behind AKS NAP; read this if you run Karpenter self-hosted on Azure.</li>
+<li><a href="https://learn.microsoft.com/en-us/azure/aks/concepts-network-azure-cni-overlay">Azure CNI Overlay overview — Microsoft</a> — the recommended AKS pod networking model and its IP characteristics.</li>
+<li><a href="https://learn.microsoft.com/en-us/azure/aks/concepts-network-legacy-cni">AKS legacy container networking interfaces — Microsoft</a> — kubenet's 2028-03-31 retirement and the node-subnet legacy mode.</li>
+<li><a href="https://learn.microsoft.com/en-us/azure/aks/api-server-vnet-integration">API Server VNet Integration — Microsoft</a> — projecting the AKS API server into a delegated subnet without a tunnel.</li>
+<li><a href="https://learn.microsoft.com/en-us/azure/aks/free-standard-pricing-tiers">AKS Free, Standard, and Premium pricing tiers — Microsoft</a> — tier costs, SLA differences, and control-plane scaling per tier.</li>
+<li><a href="https://learn.microsoft.com/en-us/azure/aks/workload-identity-overview">Microsoft Entra Workload ID on AKS — Microsoft</a> — OIDC issuer plus federated identity credentials.</li>
+<li><a href="https://learn.microsoft.com/en-us/azure/aks/node-images">Node images in AKS — Microsoft</a> — the OS SKU defaults per Kubernetes version.</li>
+<li><a href="https://learn.microsoft.com/en-us/azure/aks/upgrade-os-version">Upgrade OS version in AKS clusters — Microsoft</a> — the Ubuntu 22.04 to 24.04 auto-migration at Kubernetes 1.35.</li>
+<li><a href="https://learn.microsoft.com/en-us/azure/aks/best-practices-performance-scale-large">Best practices for large AKS clusters — Microsoft</a> — what to do before pushing past a few thousand nodes.</li>
+<li><a href="https://learn.microsoft.com/en-us/azure/kubernetes-fleet/overview">Azure Kubernetes Fleet Manager overview — Microsoft</a> — hub-spoke fleet management, up to 1,000 member clusters.</li>
+<li><a href="https://learn.microsoft.com/en-us/azure/azure-arc/kubernetes/overview">Azure Arc-enabled Kubernetes overview — Microsoft</a> — projecting any conformant cluster into Azure Resource Manager.</li>
+<li><a href="https://kubernetes.io/releases/version-skew-policy/">Version skew policy — Kubernetes</a> — kubelet may trail the apiserver by three minors from 1.25; the rule that makes control-plane-first upgrades safe.</li>
+<li><a href="https://kubernetes.io/releases/">Kubernetes releases — Kubernetes</a> — upstream release cadence and support windows.</li>
+<li><a href="https://kubernetes.io/docs/concepts/workloads/pods/disruptions/">Disruptions and PodDisruptionBudgets — Kubernetes</a> — the semantics that stall every managed node upgrade.</li>
+<li><a href="https://kubernetes.io/docs/tasks/administer-cluster/safely-drain-node/">Safely drain a node — Kubernetes</a> — the eviction API and what <code>kubectl drain</code> actually does.</li>
+<li><a href="https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination">Pod lifecycle: termination — Kubernetes</a> — where <code>terminationGracePeriodSeconds</code> fits into drain wall-clock time.</li>
+<li><a href="https://kubernetes.io/docs/concepts/overview/working-with-objects/finalizers/">Finalizers — Kubernetes</a> — the mechanism behind every stuck deletion.</li>
+<li><a href="https://kubernetes.io/docs/concepts/workloads/controllers/statefulset/">StatefulSets — Kubernetes</a> — ordinal update ordering and why stateful upgrades are slow.</li>
+<li><a href="https://kubernetes.io/docs/reference/using-api/deprecation-guide/">Deprecated API migration guide — Kubernetes</a> — the canonical list of what was removed in which minor.</li>
+<li><a href="https://github.com/doitintl/kube-no-trouble">kube-no-trouble (kubent) — GitHub</a> — scans live objects, Helm releases, and files for APIs removed in a target version.</li>
+<li><a href="https://kubernetes.io/blog/2026/01/29/ingress-nginx-statement/">Ingress NGINX retirement statement — Kubernetes Blog</a> — official notice of the March 2026 retirement.</li>
+<li><a href="https://github.com/kubernetes/enhancements/issues/4858">KEP-4858: Strict IP/CIDR validation — Kubernetes Enhancements</a> — the 1.36 change that rejects non-canonical CIDRs.</li>
+<li><a href="https://github.com/kubernetes/enhancements/issues/5040">KEP-5040: gitRepo volume removal — Kubernetes Enhancements</a> — permanently disabled in 1.36.</li>
+<li><a href="https://etcd.io/docs/v3.5/dev-guide/limit/">etcd storage size limit — etcd docs</a> — the 8 GiB default behind the EKS documented limit.</li>
+<li><a href="https://cluster-api.sigs.k8s.io/">The Cluster API Book — Kubernetes SIGs</a> — the canonical reference for declarative cluster lifecycle.</li>
+<li><a href="https://github.com/kubernetes-sigs/cluster-api/blob/main/docs/proposals/20220725-managed-kubernetes.md">Managed Kubernetes in CAPI proposal — kubernetes-sigs/cluster-api</a> — the honest writeup of why managed control planes are awkward in CAPI's model.</li>
+<li><a href="https://cluster-api-aws.sigs.k8s.io/">Cluster API Provider AWS book — Kubernetes SIGs</a> — CAPA, including <code>AWSManagedControlPlane</code> for EKS.</li>
+<li><a href="https://capz.sigs.k8s.io/managed/managed">Managed Clusters (AKS) — Cluster API Provider Azure book</a> — CAPZ's managed AKS support, including ClusterClass.</li>
+<li><a href="https://github.com/kubernetes-sigs/cluster-api-provider-gcp">cluster-api-provider-gcp — GitHub</a> — CAPG, for GKE and GCE-based clusters.</li>
+<li><a href="https://kind.sigs.k8s.io/">kind — Kubernetes SIGs</a> — the local cluster tool used for every free lab in this guide.</li>
+<li><a href="https://temporal.io/blog/building-durable-cloud-control-systems-with-temporal">How Temporal builds durable cloud control systems — Temporal Blog</a> — Temporal's own description of the cell architecture (account + VPC + EKS cluster per cell) and its extension to GCP.</li>
+<li><a href="https://docs.temporal.io/cloud/overview">Temporal Cloud overview — Temporal Docs</a> — Namespaces as the tenant isolation unit inside a cell.</li>
+<li><a href="https://docs.temporal.io/production-deployment/multi-tenant-patterns">Multi-tenant application patterns — Temporal Docs</a> — the namespace-per-tenant vs shared-namespace trade, directly relevant to cell packing.</li>
+</ol><p class="disclaimer"><strong>Disclaimer.</strong> I wrote this library before I joined Temporal, to ramp up on the areas my new role would likely touch. It contains no internal information &mdash; nothing here was sourced from Temporal&rsquo;s internal knowledge. Temporal is open source, so the programming model and server internals come from public code and documentation, and every statement about Temporal Cloud comes from Temporal&rsquo;s public docs and engineering blog, linked inline. Most of the library is general infrastructure technology &mdash; Go, gRPC, Kubernetes, Karpenter, Terraform, Helm, Vault, cert-manager, GitOps, observability &mdash; that has nothing to do with any one company. Where a guide goes beyond public sources, it says so and labels the claim as inference.</p></article><aside class="rail"><div class="rail-label">On this page</div><a href="#the-mental-model">The mental model</a><a href="#core-concepts">Core concepts</a><a class="h3" href="#the-control-plane-from-an-operators-point-of-view">The control plane, from an operator&#x27;s point of view</a><a class="h3" href="#version-and-support-windows-the-big-comparison">Version and support windows: the big comparison</a><a class="h3" href="#upgrade-mechanics">Upgrade mechanics</a><a class="h3" href="#node-management-the-compute-menu">Node management: the compute menu</a><a class="h3" href="#networking-per-cloud">Networking per cloud</a><a class="h3" href="#identity">Identity</a><a class="h3" href="#storage">Storage</a><a class="h3" href="#add-on-management">Add-on management</a><a class="h3" href="#scale-limits-and-what-actually-breaks-first">Scale limits and what actually breaks first</a><a class="h3" href="#multi-tenancy-and-isolation-for-a-cell-model">Multi-tenancy and isolation for a cell model</a><a class="h3" href="#fleet-management-how-teams-actually-run-hundreds-of-clusters">Fleet management: how teams actually run hundreds of clusters</a><a class="h3" href="#bootstrap-ordering-for-a-fresh-cell">Bootstrap ordering for a fresh cell</a><a class="h3" href="#teardown-how-to-actually-delete-a-cell">Teardown: how to actually delete a cell</a><a class="h3" href="#cost-and-cross-az-traffic">Cost and cross-AZ traffic</a><a href="#hands-on">Hands-on</a><a class="h3" href="#lab-0--prerequisites-free">Lab 0 — Prerequisites (free)</a><a class="h3" href="#lab-1--simulate-a-control-plane-then-node-upgrade-kind-free">Lab 1 — Simulate a control-plane-then-node upgrade (kind, free)</a><a class="h3" href="#lab-2--pdb-drain-and-eviction-semantics-kind-free">Lab 2 — PDB, drain, and eviction semantics (kind, free)</a><a class="h3" href="#lab-3--finalizer-and-namespace-deletion-traps-kind-free">Lab 3 — Finalizer and namespace-deletion traps (kind, free)</a><a class="h3" href="#lab-4--detect-removed-apis-before-an-upgrade-kind-free">Lab 4 — Detect removed APIs before an upgrade (kind, free)</a><a class="h3" href="#cloud-labs-real-money--read-the-costs-first">Cloud labs (real money — read the costs first)</a><a href="#production-gotchas">Production gotchas</a><a href="#how-this-shows-up-in-cell-lifecycle">How this shows up in cell lifecycle</a><a href="#learning-path">Learning path</a><a class="h3" href="#day-1-about-3-hours">Day 1 (about 3 hours)</a><a class="h3" href="#week-1">Week 1</a><a class="h3" href="#month-1">Month 1</a><a href="#references">References</a></aside></div></div><script>
+document.querySelectorAll('.codehilite').forEach(function(block){
+  var wrap=document.createElement('div'); wrap.className='codewrap';
+  block.parentNode.insertBefore(wrap,block); wrap.appendChild(block);
+  var b=document.createElement('button'); b.className='copybtn'; b.textContent='copy';
+  b.addEventListener('click',function(){
+    var txt=block.innerText;
+    if(navigator.clipboard&&navigator.clipboard.writeText){
+      navigator.clipboard.writeText(txt).then(function(){
+        b.textContent='copied'; setTimeout(function(){b.textContent='copy';},1200);
+      }).catch(function(){b.textContent='select manually';});
+    } else {
+      var ta=document.createElement('textarea'); ta.value=txt; document.body.appendChild(ta);
+      ta.select(); try{document.execCommand('copy'); b.textContent='copied';}catch(e){}
+      document.body.removeChild(ta); setTimeout(function(){b.textContent='copy';},1200);
+    }
+  });
+  wrap.appendChild(b);
+});
+
+document.querySelectorAll('.doc table').forEach(function(t){
+  if(t.parentNode.classList.contains('tablewrap'))return;
+  var w=document.createElement('div'); w.className='tablewrap';
+  t.parentNode.insertBefore(w,t); w.appendChild(t);
+});
+
+(function(){
+  var links=Array.prototype.slice.call(document.querySelectorAll('.rail a'));
+  if(!links.length)return;
+  var map={};
+  links.forEach(function(a){
+    var el=document.getElementById(a.getAttribute('href').slice(1));
+    if(el)map[a.getAttribute('href').slice(1)]=a;
+  });
+  var obs=new IntersectionObserver(function(entries){
+    entries.forEach(function(e){
+      var a=map[e.target.id]; if(!a)return;
+      if(e.isIntersecting){
+        links.forEach(function(x){x.classList.remove('here');});
+        a.classList.add('here');
+      }
+    });
+  },{rootMargin:'0px 0px -78% 0px',threshold:0});
+  Object.keys(map).forEach(function(id){
+    var el=document.getElementById(id); if(el)obs.observe(el);
+  });
+})();
+</script>
+<script>/* open external links in a new tab; links within the library stay in this tab */
+document.addEventListener('click',function(e){var a=e.target.closest&&e.target.closest('a[href]');if(!a)return;var h=a.getAttribute('href');if(!h||h.charAt(0)==='#'||h.indexOf('javascript:')===0||a.hasAttribute('download'))return;if(!/^https?:$/.test(a.protocol)||a.host===location.host)return;a.target='_blank';a.rel='noopener';},true);
+</script>
+</body>
+</html>

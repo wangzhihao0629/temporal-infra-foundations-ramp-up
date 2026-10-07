@@ -1,0 +1,1510 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>HashiCorp Vault for a Platform Team - Temporal Cloud Infrastructure Ramp-Up</title>
+<link rel="stylesheet" href="style.css">
+<script>
+(function(){
+  try{
+    var t=localStorage.getItem('rampup-theme');
+    if(t){document.documentElement.setAttribute('data-theme',t);}
+  }catch(e){}
+  window.__toggleTheme=function(){
+    var el=document.documentElement;
+    var cur=el.getAttribute('data-theme');
+    if(!cur){
+      cur=window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';
+    }
+    var next=cur==='dark'?'light':'dark';
+    el.setAttribute('data-theme',next);
+    try{localStorage.setItem('rampup-theme',next);}catch(e){}
+  };
+})();
+</script>
+
+</head>
+<body>
+<div class="shell"><aside class="sidebar">
+  <div class="brand"><a href="../index.html">
+    <div class="brand-title">Temporal Cloud Infrastructure Ramp-Up</div>
+    <div class="brand-sub">New-role ramp-up &middot; public sources only</div>
+  </a></div>
+  <div class="nav-label">Guides</div>
+  <nav class="nav"><a href="01-golang.html"><span class="num">01</span><span>Go</span></a><a href="02-grpc.html"><span class="num">02</span><span>gRPC &amp; Protobuf</span></a><a href="03-multicloud-aws-gcp-azure.html"><span class="num">03</span><span>Multi-Cloud</span></a><a href="04-managed-kubernetes-eks-gke-aks.html"><span class="num">04</span><span>Managed Kubernetes</span></a><a href="05-cni-and-host-networking.html"><span class="num">05</span><span>CNI &amp; Host Networking</span></a><a href="06-karpenter.html"><span class="num">06</span><span>Karpenter</span></a><a href="07-kyverno.html"><span class="num">07</span><span>Kyverno</span></a><a href="08-terraform.html"><span class="num">08</span><span>Terraform</span></a><a href="09-helm.html"><span class="num">09</span><span>Helm</span></a><a href="10-vault.html" class="active"><span class="num">10</span><span>Vault</span></a><a href="11-cert-manager-and-pki.html"><span class="num">11</span><span>cert-manager &amp; PKI</span></a><a href="12-cell-lifecycle-synthesis.html"><span class="num">12</span><span>Cell Lifecycle</span></a><a href="13-gitops-argocd-flux.html"><span class="num">13</span><span>GitOps</span></a><a href="14-observability-for-cells.html"><span class="num">14</span><span>Observability</span></a><a href="15-temporal-programming-model.html"><span class="num">15</span><span>Temporal: Programming Model</span></a><a href="16-temporal-server-internals.html"><span class="num">16</span><span>Temporal Server Internals</span></a><a href="17-cell-based-architecture.html"><span class="num">17</span><span>Cell-Based Architecture</span></a></nav>
+  <div class="nav-label" style="margin-top:1rem">Practice</div>
+  <nav class="nav"><a href="../drill.html"><span class="num">&#9670;</span><span>Drill deck</span></a></nav>
+</aside><div class="main"><article class="doc"><div class="topbar">
+  <div class="crumbs"><span class="pill">Guide 10</span><span class="pill">47 refs</span><span class="pill">13,029 words</span></div>
+  <div style="display:flex;gap:.5rem;align-items:center">
+    <span>~65 min read</span>
+    <button class="iconbtn" onclick="__toggleTheme()">theme</button>
+  </div>
+</div><h1>HashiCorp Vault for a Platform Team</h1>
+<div class="lede"><p><strong>Why this matters.</strong> Every cell you provision needs secrets before it can serve traffic: database credentials for the persistence layer, TLS material for the frontend, cloud credentials for the operators running inside it, and encryption keys for anything at rest. Cell lifecycle owns the moment those secrets come into existence and the moment they are destroyed, across AWS, GCP, and Azure. Vault is the piece of infrastructure that decides whether "provision a cell" is a 20-minute automated operation or a ticket to a security team. It is also the piece with the nastiest failure modes: a Vault that cannot unseal is a cell that cannot boot, and a Vault whose audit devices are all wedged is a Vault that refuses every write. You need the operational model, not the CLI surface.</p></div>
+<hr />
+<h2 id="the-mental-model">The mental model<a class="anchor" href="#the-mental-model">#</a></h2>
+<p>Vault is <strong>a small encrypted key-value store with an authorization layer and a plugin system bolted on top</strong>. Almost everything confusing about Vault falls out of that sentence.</p>
+<p>The store is called the <strong>barrier</strong>. Everything Vault persists goes through the barrier, encrypted with AES-256-GCM. The barrier is the entire security boundary: the storage backend (Raft, Consul, S3, DynamoDB) sees only ciphertext and is explicitly untrusted. Vault's <a href="https://developer.hashicorp.com/vault/docs/internals/security">security model</a> says this plainly — the storage backend is not part of the trusted computing base.</p>
+<p>Because the barrier is encrypted, Vault starts up <em>sealed</em>: it has the ciphertext but not the key. <strong>Unsealing</strong> is the process of reconstructing the key that decrypts the barrier. Once unsealed, Vault is a normal HTTP server. Sealed, it answers exactly three things: health, seal status, and unseal.</p>
+<p>The authorization layer is <strong>tokens + policies</strong>. Every request carries a token. Every token maps to a set of policies. Every policy is a list of <code>path</code> blocks with <code>capabilities</code>. There is no RBAC object model, no roles-that-contain-roles, no inheritance. Just paths and capabilities. This is why Vault multi-tenancy is fundamentally a <em>path namespacing</em> exercise.</p>
+<p>The plugin system is <strong>mounts</strong>. Auth methods mount under <code>auth/</code>, secrets engines mount under a path you choose. A mount is a self-contained plugin with its own storage prefix inside the barrier. <code>vault secrets enable -path=cell-usw2-db database</code> creates a new database engine whose data lives under a private prefix, isolated from every other mount. Mounts are how you get per-cell isolation without namespaces.</p>
+<p>Layered on top: <strong>leases</strong>. Anything Vault <em>generates</em> (as opposed to stores) gets a lease — an ID, a TTL, and a revocation hook. Dynamic database credentials, cloud credentials, and tokens are all leased. Vault tracks every live lease in its own storage and revokes them when they expire. This is the feature that makes Vault worth running, and also the single most common source of Vault performance incidents.</p>
+<p>Four things to hold in your head simultaneously:</p>
+<ol>
+<li><strong>Vault is stateful and its state is small but hot.</strong> The lease table and the token store dominate write traffic.</li>
+<li><strong>Vault is a single-writer system.</strong> One active node handles all writes; standbys forward. Adding nodes does not add write throughput.</li>
+<li><strong>Vault is a bootstrap dependency.</strong> Anything that needs Vault to start cannot be something Vault needs to start. Auto-unseal makes this circular in a subtle way (see below).</li>
+<li><strong>Vault fails closed.</strong> Sealed, quorum-lost, or audit-wedged, it stops serving rather than degrading.</li>
+</ol>
+<hr />
+<h2 id="core-concepts">Core concepts<a class="anchor" href="#core-concepts">#</a></h2>
+<h3 id="the-barrier-seal-and-unseal">The barrier, seal, and unseal<a class="anchor" href="#the-barrier-seal-and-unseal">#</a></h3>
+<p>There are three keys, and conflating them is the number one source of confusion.</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Also called</th>
+<th>What it does</th>
+<th>Where it lives</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Encryption key / barrier key</td>
+<td>"the keyring"</td>
+<td>Actually encrypts data in the barrier (AES-256-GCM)</td>
+<td>Stored <em>inside</em> the barrier, encrypted by the root key</td>
+</tr>
+<tr>
+<td>Root key</td>
+<td>"master key" (legacy name)</td>
+<td>Encrypts the encryption key</td>
+<td>Never persisted in plaintext; protected by the seal</td>
+</tr>
+<tr>
+<td>Unseal key shares</td>
+<td>"Shamir shares"</td>
+<td>Reconstruct the root key at startup</td>
+<td>Split across humans/HSMs; never stored by Vault</td>
+</tr>
+</tbody>
+</table>
+<p>The <a href="https://developer.hashicorp.com/vault/docs/concepts/seal">seal/unseal concept doc</a> is the primary source. The important consequence: <strong>rotating the encryption key (<code>vault operator rotate</code>) is cheap and online; rekeying the unseal shares (<code>vault operator rekey</code>) is a ceremony</strong>. They are different operations and people mix them up.</p>
+<p>With the default <strong>Shamir seal</strong>, <code>vault operator init</code> produces N key shares with threshold T (default 5 and 3). Startup requires T humans to each submit a share. This is fine for one Vault. It is unworkable for one Vault per cell across three clouds.</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># Shamir init — the ceremony you do NOT want in cell provisioning</span>
+vault operator init -key-shares<span class="o">=</span><span class="m">5</span> -key-threshold<span class="o">=</span><span class="m">3</span>
+<span class="c1"># Unseal key 1: &lt;base64&gt;</span>
+<span class="c1"># ...</span>
+<span class="c1"># Initial Root Token: hvs....</span>
+
+vault operator unseal &lt;share-1&gt;
+vault operator unseal &lt;share-2&gt;
+vault operator unseal &lt;share-3&gt;   <span class="c1"># now unsealed</span>
+</code></pre></div>
+
+<h3 id="auto-unseal-with-cloud-kms--and-the-bootstrap-dependency-it-creates">Auto-unseal with cloud KMS — and the bootstrap dependency it creates<a class="anchor" href="#auto-unseal-with-cloud-kms--and-the-bootstrap-dependency-it-creates">#</a></h3>
+<p>Auto-unseal replaces the Shamir step: Vault stores the root key wrapped by a <strong>cloud KMS key</strong>, and on startup calls <code>Decrypt</code> against KMS to recover it. This is what a cell actually uses, because provisioning must be unattended.</p>
+<div class="codehilite"><pre><span></span><code># AWS — https://developer.hashicorp.com/vault/docs/configuration/seal/awskms
+seal &quot;awskms&quot; {
+  region     = &quot;us-west-2&quot;
+  kms_key_id = &quot;arn:aws:kms:us-west-2:111122223333:key/1a2b3c4d-...&quot;
+  # Credentials come from the instance/IRSA role. Do NOT put static keys here.
+}
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code># GCP — https://developer.hashicorp.com/vault/docs/configuration/seal/gcpckms
+seal &quot;gcpckms&quot; {
+  project    = &quot;temporal-cell-prod&quot;
+  region     = &quot;global&quot;
+  key_ring   = &quot;vault-unseal&quot;
+  crypto_key = &quot;vault-cell-usc1&quot;
+}
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code># Azure — https://developer.hashicorp.com/vault/docs/configuration/seal/azurekeyvault
+seal &quot;azurekeyvault&quot; {
+  tenant_id  = &quot;...&quot;
+  vault_name = &quot;cell-kv-weu&quot;
+  key_name   = &quot;vault-unseal&quot;
+  # Prefer managed identity over client_id/client_secret.
+}
+</code></pre></div>
+
+<p><strong>The bootstrap dependency.</strong> Auto-unseal moves the secret-zero problem from "humans holding shares" to "this node's cloud identity can call KMS Decrypt." That is a much better trade, but it creates a hard dependency graph that you must design around explicitly:</p>
+<ul>
+<li>Vault cannot start until it can reach the KMS endpoint. In a private-networking cell, that means a VPC endpoint / Private Service Connect / Private Link must be provisioned <em>before</em> Vault. If your networking is torn down or misconfigured, Vault does not come back — and the networking team owns half of that path.</li>
+<li>Vault cannot start if the node's identity is not yet bound. On Kubernetes with IRSA or Workload Identity, the OIDC provider and role trust policy must exist before the pod starts.</li>
+<li><strong>KMS is a cross-region single point of failure.</strong> An AWS KMS regional outage seals every Vault in that region on restart. Existing unsealed Vaults keep running (the root key is in memory), which is why "everything was fine until we did a rolling restart" is the classic shape of this incident.</li>
+<li>With auto-unseal, <code>vault operator init</code> produces <strong>recovery keys</strong>, not unseal keys. Recovery keys cannot unseal Vault. They authorize a small set of privileged operations: generating a new root token, rekeying the recovery shares, and (with <code>seal-migration</code>) changing seals. <strong>Losing them does not brick Vault, but it does mean you can never generate a new root token.</strong> Store them like unseal keys anyway.</li>
+</ul>
+<p>Vault 2.0 also added <a href="https://developer.hashicorp.com/vault/docs/secrets/key-management/awskms#multi-region-keys">AWS KMS multi-region keys</a> as managed keys, which helps DR designs where a replica in a second region must unseal against a replicated key. OpenBao took a different path and made auto-unseal mechanisms <a href="https://openbao.org/community/release-notes/2-6-0/">external plugins as of 2.6.0</a>, deprecating the built-in <code>awskms</code>/<code>gcpckms</code>/<code>azurekeyvault</code>/<code>pkcs11</code> seals for removal in 2.7.0.</p>
+<p>Set <strong><code>seal_wrap = true</code></strong> on sensitive mounts if you have Enterprise/HSM: it wraps values with the seal in addition to barrier encryption, so a compromised barrier key alone is insufficient. See <a href="https://developer.hashicorp.com/vault/docs/enterprise/sealwrap">seal wrap</a>.</p>
+<p><em>See also: <a href="03-multicloud-aws-gcp-azure.html#kms-secrets-and-what-they-back">KMS, secrets, and what they back</a> for the per-cloud key-scoping and residency rules that decide where this dependency can even be satisfied, and <a href="03-multicloud-aws-gcp-azure.html#workload-identity-how-a-pod-gets-a-cloud-credential">workload identity</a> for how the pod gets the identity that calls Decrypt.</em></p>
+<h3 id="storage-backends-integrated-storage-raft-vs-consul">Storage backends: Integrated Storage (Raft) vs Consul<a class="anchor" href="#storage-backends-integrated-storage-raft-vs-consul">#</a></h3>
+<p>For anything new, the answer is Integrated Storage. Consul storage exists because Vault predates Raft-in-Vault, and it is now a liability: you are operating a second consensus system whose failure modes you must also understand.</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Integrated Storage (Raft)</th>
+<th>Consul</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Consensus</td>
+<td>Inside Vault, <code>raft</code> stanza</td>
+<td>External Consul cluster</td>
+</tr>
+<tr>
+<td>Operational surface</td>
+<td>One system</td>
+<td>Two systems, two upgrade cadences</td>
+</tr>
+<tr>
+<td>Snapshots</td>
+<td><code>vault operator raft snapshot save</code> — a real Vault-consistent backup</td>
+<td>Consul snapshots + separate Vault state reasoning</td>
+</tr>
+<tr>
+<td>Failure domain</td>
+<td>Vault node loss = Vault degradation</td>
+<td>Consul quorum loss = Vault outage, and you debug Consul</td>
+</tr>
+<tr>
+<td>Data size limit</td>
+<td>Practical ceiling from Raft log + snapshot size; HashiCorp guidance is to keep it modest</td>
+<td>Consul KV limits apply</td>
+</tr>
+<tr>
+<td>Recommended today</td>
+<td>Yes</td>
+<td>Legacy only</td>
+</tr>
+</tbody>
+</table>
+<p>The <a href="https://developer.hashicorp.com/vault/docs/internals/integrated-storage">Integrated Storage internals doc</a> is the reference. Configuration:</p>
+<div class="codehilite"><pre><span></span><code>storage &quot;raft&quot; {
+  path    = &quot;/vault/data&quot;
+  node_id = &quot;vault-usw2-a&quot;
+
+  retry_join {
+    leader_api_addr = &quot;https://vault-0.vault-internal:8200&quot;
+  }
+  retry_join {
+    leader_api_addr = &quot;https://vault-1.vault-internal:8200&quot;
+  }
+  retry_join {
+    leader_api_addr = &quot;https://vault-2.vault-internal:8200&quot;
+  }
+}
+
+cluster_addr = &quot;https://vault-usw2-a.vault-internal:8201&quot;
+api_addr     = &quot;https://vault.cell-usw2.internal:8200&quot;
+</code></pre></div>
+
+<p><code>api_addr</code> and <code>cluster_addr</code> are the two settings people get wrong. <code>api_addr</code> is what standbys advertise for client redirects; <code>cluster_addr</code> is the node-to-node request-forwarding and Raft port (8201). If <code>api_addr</code> points at a load balancer that round-robins, redirect loops happen.</p>
+<p>Note OpenBao 2.6.0 added <code>auto_join</code> via DNS SRV records, which is nicer than a static <code>retry_join</code> list for autoscaled cells.</p>
+<h3 id="ha-standbys-performance-standbys-replication-dr">HA, standbys, performance standbys, replication, DR<a class="anchor" href="#ha-standbys-performance-standbys-replication-dr">#</a></h3>
+<p>Vault HA is <strong>active/standby with request forwarding</strong>, not active/active. One node holds the lock; the rest are standbys. A standby either redirects the client to the active node (<code>api_addr</code>) or transparently forwards the request over the cluster port. Writes always land on one node.</p>
+<p><strong>Node counts.</strong> HashiCorp's <a href="https://developer.hashicorp.com/vault/tutorials/day-one-raft/raft-reference-architecture">Raft reference architecture</a> recommends <strong>3 or 5 nodes</strong>. Three tolerates one failure; five tolerates two. Do not run even numbers — you get the cost of the extra node with none of the fault tolerance. Do not run more than five without a reason; every voter adds Raft write latency.</p>
+<p><strong>Autopilot</strong> (<a href="https://developer.hashicorp.com/vault/docs/concepts/integrated-storage/autopilot">docs</a>) manages voter promotion: a joining node starts as a non-voter, syncs the Raft index, and is promoted only after a stability threshold. It has been on by default since Vault 1.7, but <strong>dead server cleanup is not enabled by default</strong> — which means a cell whose node was replaced by the autoscaler leaves a phantom voter in the quorum calculation until you clean it up.</p>
+<div class="codehilite"><pre><span></span><code>vault operator raft autopilot set-config <span class="se">\</span>
+  -cleanup-dead-servers<span class="o">=</span><span class="nb">true</span> <span class="se">\</span>
+  -dead-server-last-contact-threshold<span class="o">=</span>24h <span class="se">\</span>
+  -min-quorum<span class="o">=</span><span class="m">3</span>
+
+vault operator raft autopilot state
+vault operator raft list-peers
+</code></pre></div>
+
+<p>Note the threshold: <code>24h</code> is the default, and HashiCorp's docs warn explicitly against lowering it, because the value must exceed the time a joining node takes to load a Raft snapshot. Set it to <code>10m</code> and a new cell node restoring a large snapshot gets pruned mid-join — the exact scenario you turned cleanup on to fix. Lower it only after you have measured your own snapshot-load time.</p>
+<p><strong>Performance standbys</strong> (Enterprise) let standby nodes serve read-only requests locally instead of forwarding, and forward only writes. This is the only way to scale reads within a cluster. OpenBao shipped a community equivalent — standby nodes serving reads — in <a href="https://openbao.org/community/release-notes/2-5-0/">2.5.0</a>.</p>
+<p><strong>Replication</strong> (Enterprise) comes in two flavors and they are not interchangeable:</p>
+<ul>
+<li><strong>Performance replication</strong>: secondary clusters serve reads and handle their own local tokens/leases; writes forward to the primary. Used for latency and read scale across regions.</li>
+<li><strong>Disaster recovery replication</strong>: a warm standby cluster that mirrors <em>everything</em> including tokens and leases, but serves no client traffic until promoted. Used for RPO/RTO.</li>
+</ul>
+<p>Both are Enterprise-only, which is a real budget decision for a multi-cloud fleet.</p>
+<h3 id="cell-local-vault-vs-central-vault--an-honest-recommendation">Cell-local Vault vs central Vault — an honest recommendation<a class="anchor" href="#cell-local-vault-vs-central-vault--an-honest-recommendation">#</a></h3>
+<p>This is the architectural call, so treat it as one.</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Cell-local Vault (one Vault per cell)</th>
+<th>Central Vault (one regional/global Vault, cells are clients)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Blast radius of compromise</td>
+<td>One cell's secrets</td>
+<td>Everything, unless namespaces/policy are perfect</td>
+</tr>
+<tr>
+<td>Blast radius of outage</td>
+<td>One cell</td>
+<td>Every cell provision, renewal, and dynamic cred in scope</td>
+</tr>
+<tr>
+<td>Cell teardown</td>
+<td>Delete the Vault, done</td>
+<td>Must reliably garbage-collect mounts, roles, policies, leases</td>
+</tr>
+<tr>
+<td>Cross-cloud story</td>
+<td>Each cell uses its own cloud's KMS natively</td>
+<td>One Vault must hold credentials for three clouds</td>
+</tr>
+<tr>
+<td>Operational cost</td>
+<td>N Vaults to upgrade, snapshot, monitor, and rotate</td>
+<td>One Vault to operate well</td>
+</tr>
+<tr>
+<td>Enterprise license cost</td>
+<td>Scales with cluster count</td>
+<td>Cheaper</td>
+</tr>
+<tr>
+<td>Bootstrap complexity</td>
+<td>Each cell needs KMS key + identity provisioned first</td>
+<td>Cells need only a network path and an auth method</td>
+</tr>
+<tr>
+<td>Audit / compliance</td>
+<td>Per-cell audit stream, naturally scoped</td>
+<td>One stream, needs namespace/path tagging</td>
+</tr>
+<tr>
+<td>Failure correlation</td>
+<td>Independent; a bad Vault upgrade hits one cell</td>
+<td>Correlated; a bad upgrade hits the fleet</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Recommendation framing.</strong> For a Temporal Cloud–shaped system — many isolated cells, each a tenancy boundary, spread across three clouds — the <em>default should be cell-local Vault for cell-scoped secrets</em>, with a <em>small central Vault (or cloud KMS directly) only for the things that genuinely must be global</em>: the root PKI, the cell-provisioning identity, and the fleet-wide operator credentials.</p>
+<p>The reasoning is blast radius symmetry. A cell already is your isolation unit; if a cell's Vault can read another cell's database credentials, you have quietly made your isolation claim false. The counterargument — "N Vaults is N times the ops burden" — is real, but it is a burden that automation absorbs well (the same Terraform module runs N times) whereas a blast-radius failure is a burden automation cannot absorb at all.</p>
+<p>The honest cost: cell-local Vault means the <strong>cell provisioning pipeline</strong> now owns Vault initialization, recovery-key escrow, snapshot scheduling, upgrade rollout, and audit shipping — N times. If your team does not have the automation maturity to do that unattended, a central Vault with rigorously enforced per-cell namespaces is the pragmatic interim, and you should write down that you are trading isolation for operational simplicity, with a date to revisit.</p>
+<h3 id="auth-methods-and-the-secret-zero-problem">Auth methods and the secret-zero problem<a class="anchor" href="#auth-methods-and-the-secret-zero-problem">#</a></h3>
+<p><strong>Secret zero</strong> is the credential you need in order to get credentials. Every auth method is an answer to "what does this caller already possess that Vault can independently verify?" The good answers are ones where the caller possesses nothing durable — the platform vouches for it.</p>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Secret zero</th>
+<th>How Vault verifies</th>
+<th>Revocable early?</th>
+<th>Fit for cells</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Kubernetes</strong></td>
+<td>Projected SA token</td>
+<td>Calls <code>TokenReview</code> on the cluster API</td>
+<td>Yes (delete the SA/pod)</td>
+<td>Primary for in-cell workloads</td>
+</tr>
+<tr>
+<td><strong>JWT/OIDC</strong></td>
+<td>Same SA token, or any OIDC JWT</td>
+<td>Verifies signature against JWKS/OIDC discovery — no callback</td>
+<td>No, TTL only</td>
+<td>Good when Vault is outside the cluster</td>
+</tr>
+<tr>
+<td><strong>AWS IAM</strong></td>
+<td>The instance/pod's IAM role</td>
+<td>Verifies a signed <code>sts:GetCallerIdentity</code> request</td>
+<td>N/A</td>
+<td>AWS cells, non-K8s nodes</td>
+</tr>
+<tr>
+<td><strong>GCP</strong></td>
+<td>Instance identity JWT / SA JWT</td>
+<td>Verifies Google-signed JWT</td>
+<td>N/A</td>
+<td>GCP cells</td>
+</tr>
+<tr>
+<td><strong>Azure</strong></td>
+<td>Managed identity token (IMDS)</td>
+<td>Verifies against Azure AD</td>
+<td>N/A</td>
+<td>Azure cells</td>
+</tr>
+<tr>
+<td><strong>AppRole</strong></td>
+<td>RoleID + SecretID</td>
+<td>Compares stored values</td>
+<td>Yes</td>
+<td>Last resort; you now own secret zero</td>
+</tr>
+<tr>
+<td><strong>OIDC (human)</strong></td>
+<td>Browser SSO</td>
+<td>Standard OIDC flow to your IdP</td>
+<td>Yes</td>
+<td>All human access</td>
+</tr>
+<tr>
+<td><strong>TLS cert</strong></td>
+<td>Client certificate</td>
+<td>Verifies against a configured CA</td>
+<td>Via CRL only</td>
+<td>Useful for cell-to-Vault bootstrapping</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Kubernetes auth</strong> is the one to understand deeply, because Kubernetes 1.21 changed it and the change still bites people. The <a href="https://developer.hashicorp.com/vault/docs/auth/kubernetes">Vault Kubernetes auth docs</a> are the primary source.</p>
+<p>The flow: the pod reads its projected service account token from <code>/var/run/secrets/kubernetes.io/serviceaccount/token</code> and POSTs it to <code>auth/kubernetes/login</code> with a role name. Vault then calls the cluster's <strong><code>TokenReview</code> API</strong> with a <em>reviewer</em> credential to ask "is this token valid, and whose is it?" Kubernetes answers with the service account name, namespace, and UID. Vault matches those against <code>bound_service_account_names</code> / <code>bound_service_account_namespaces</code> on the role and issues a token.</p>
+<p>Since Kubernetes 1.21, <code>BoundServiceAccountTokenVolume</code> is on by default: mounted SA tokens now expire and are bound to the pod's lifetime, and the <code>iss</code> claim is cluster-specific. Two consequences:</p>
+<ol>
+<li><strong><code>disable_iss_validation</code> must be <code>true</code>.</strong> Vault made this the default for new mounts in 1.9.0, but mounts created before that keep the old default. The docs say <code>disable_iss_validation=true</code> is "the new recommended value for all versions of Vault" — the Kubernetes API already validates the issuer during <code>TokenReview</code>, so Vault doing it again is duplicated work that breaks on cluster-specific issuers. Note that in Vault 2.x both <code>disable_iss_validation</code> and <code>issuer</code> are formally <strong>deprecated and slated for removal</strong>; the check only still matters for auth mounts created before Vault 1.9, which retain the old default.</li>
+<li><strong>The reviewer JWT cannot be a long-lived static token anymore</strong> without extra work. There are four options, and the docs lay them out with tradeoffs:</li>
+</ol>
+<div class="codehilite"><pre><span></span><code><span class="c1"># BEST for Vault running inside the cell&#39;s cluster (requires Vault 1.9.3+).</span>
+<span class="c1"># Omit token_reviewer_jwt and kubernetes_ca_cert; Vault reads its own projected</span>
+<span class="c1"># token from disk and re-reads it as it rotates.</span>
+vault write auth/kubernetes/config <span class="se">\</span>
+    <span class="nv">kubernetes_host</span><span class="o">=</span><span class="s2">&quot;https://</span><span class="nv">$KUBERNETES_SERVICE_HOST</span><span class="s2">:</span><span class="nv">$KUBERNETES_SERVICE_PORT</span><span class="s2">&quot;</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="c1"># Vault&#39;s own ServiceAccount needs TokenReview permission.</span>
+kubectl create clusterrolebinding vault-auth-delegator <span class="se">\</span>
+  --clusterrole<span class="o">=</span>system:auth-delegator <span class="se">\</span>
+  --serviceaccount<span class="o">=</span>vault:vault
+</code></pre></div>
+
+<p>The other three: use the <em>client's</em> JWT as the reviewer (every client SA needs <code>system:auth-delegator</code> — high operational overhead), mint a long-lived <code>kubernetes.io/service-account-token</code> Secret (works, loses the short-lived-token benefit), or <strong>skip Kubernetes auth and use JWT auth</strong> with the cluster as an OIDC provider. JWT auth removes the reviewer credential entirely and works when Vault cannot reach the cluster API — the tradeoff is that client tokens <strong>cannot be revoked before their TTL expires</strong>, so keep TTLs short.</p>
+<p>For a central Vault serving cells across three clouds and dozens of clusters, JWT/OIDC auth is usually the right call: no network path from Vault back to each cluster's API server, no reviewer credential per cluster, just a JWKS URL per cluster.</p>
+<p>Also ensure <code>--service-account-lookup</code> is on (default since Kubernetes 1.7); without it, deleted tokens still validate. And note Kubernetes extends admission-injected token lifetimes to a year by default to smooth the migration — turn that off with <code>--service-account-extend-token-expiration=false</code> if you want real short-lived tokens.</p>
+<p><strong>AWS IAM auth</strong> is worth a sentence because its verification model is unusual: the client constructs a signed <code>sts:GetCallerIdentity</code> request but does not send it; it sends the <em>signed request</em> to Vault, and Vault replays it against STS. Vault learns the caller's ARN without the caller ever revealing a credential. See the <a href="https://developer.hashicorp.com/vault/docs/auth/aws">AWS auth docs</a>.</p>
+<p><strong>AppRole</strong> is the escape hatch, and it should feel like one. RoleID is not secret; SecretID is. The only safe pattern is <strong>response wrapping</strong>: a trusted orchestrator requests a wrapped SecretID and hands the single-use wrapping token to the workload, which unwraps it. If the token was already used, the workload knows it was intercepted.</p>
+<div class="codehilite"><pre><span></span><code>vault write -wrap-ttl<span class="o">=</span>120s -f auth/approle/role/cell-bootstrap/secret-id
+<span class="c1"># hand wrapping_token to the workload; it calls:</span>
+vault unwrap &lt;wrapping_token&gt;
+</code></pre></div>
+
+<h3 id="policies">Policies<a class="anchor" href="#policies">#</a></h3>
+<p>Policies are HCL, and the syntax is small enough to memorize.</p>
+<div class="codehilite"><pre><span></span><code># Read-only on one cell&#39;s KV data, with list on the metadata.
+path &quot;cells/data/usw2-042/*&quot; {
+  capabilities = [&quot;read&quot;]
+}
+path &quot;cells/metadata/usw2-042/*&quot; {
+  capabilities = [&quot;list&quot;, &quot;read&quot;]
+}
+
+# Generate dynamic Postgres creds for this cell only.
+path &quot;cell-usw2-042/creds/temporal-frontend&quot; {
+  capabilities = [&quot;read&quot;]
+}
+
+# Explicit deny wins over everything, including a broader allow.
+path &quot;cells/data/usw2-042/root-credentials&quot; {
+  capabilities = [&quot;deny&quot;]
+}
+
+# Renew and revoke your own leases.
+path &quot;sys/leases/renew&quot; { capabilities = [&quot;update&quot;] }
+path &quot;sys/leases/revoke&quot; { capabilities = [&quot;update&quot;] }
+</code></pre></div>
+
+<p>Capabilities map to HTTP verbs: <code>create</code> (POST on a new path), <code>read</code> (GET), <code>update</code> (POST/PUT), <code>delete</code> (DELETE), <code>list</code> (LIST), <code>patch</code> (PATCH — needed for KV v2 partial updates), plus <code>sudo</code> (root-protected endpoints), <code>subscribe</code> (event streams), and <code>deny</code>. <code>deny</code> short-circuits everything.</p>
+<p>Globbing has exactly two forms and people confuse them constantly:</p>
+<ul>
+<li><code>*</code> is a <strong>trailing wildcard only</strong>. <code>secret/foo*</code> matches <code>secret/foobar</code> and <code>secret/foo/bar</code>. <code>secret/*/bar</code> does <em>not</em> work.</li>
+<li><code>+</code> is a <strong>single path-segment wildcard</strong> and can appear anywhere. <code>secret/+/config</code> matches <code>secret/app1/config</code> but not <code>secret/app1/db/config</code>.</li>
+</ul>
+<p><strong>Templated policies</strong> are how you get per-cell isolation without generating N policies. The template renders identity metadata at evaluation time:</p>
+<div class="codehilite"><pre><span></span><code>path &quot;cells/data/{{identity.entity.aliases.auth_kubernetes_bcecb1e1.metadata.cell_id}}/*&quot; {
+  capabilities = [&quot;read&quot;, &quot;list&quot;]
+}
+</code></pre></div>
+
+<p>To populate that metadata from Kubernetes, set <code>use_annotations_as_alias_metadata=true</code> on the auth config and annotate the service account (this requires giving Vault permission to read ServiceAccounts):</p>
+<div class="codehilite"><pre><span></span><code><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">v1</span><span class="w"></span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">ServiceAccount</span><span class="w"></span>
+<span class="nt">metadata</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">temporal-frontend</span><span class="w"></span>
+<span class="w">  </span><span class="nt">namespace</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cell-usw2-042</span><span class="w"></span>
+<span class="w">  </span><span class="nt">annotations</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">vault.hashicorp.com/alias-metadata-cell_id</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">usw2-042</span><span class="w"></span>
+</code></pre></div>
+
+<p><strong>A breaking change you must know about:</strong> Vault 2.0.1 made it so that <strong>wildcards and globs in the rendered output of an identity template are rejected with "permission denied"</strong>. If your metadata value could ever contain <code>*</code> or <code>+</code>, a policy that previously granted broad access now fails closed. OpenBao shipped the same hardening as <a href="https://openbao.org/community/release-notes/2-6-0/">GHSA-59w7-v8rr-pr4p</a> with opt-out flags <code>allow_wildcards_in_identity_templates</code> and <code>allow_slashes_in_identity_templates</code>. This was a genuine privilege-escalation class of bug: attacker-controlled metadata could widen a policy.</p>
+<p>Always check policy behavior with <code>vault token capabilities</code> rather than reading HCL:</p>
+<div class="codehilite"><pre><span></span><code>vault token capabilities &lt;token&gt; cells/data/usw2-042/db
+<span class="c1"># read</span>
+</code></pre></div>
+
+<h3 id="namespaces-enterprise-vs-path-prefix-multi-tenancy">Namespaces (Enterprise) vs path-prefix multi-tenancy<a class="anchor" href="#namespaces-enterprise-vs-path-prefix-multi-tenancy">#</a></h3>
+<p><strong>Namespaces</strong> (Enterprise) give each tenant a fully isolated Vault-within-Vault: its own mounts, policies, identities, and tokens, addressed by the <code>X-Vault-Namespace</code> header or a path prefix. <code>admin/cell-usw2-042/</code>. A token from one namespace is meaningless in another.</p>
+<p><strong>Path-prefix multi-tenancy</strong> is what Community edition gives you: one namespace, and you enforce isolation entirely through mount paths and policy discipline. <code>vault secrets enable -path=cells/usw2-042 kv-v2</code> plus a policy that only grants <code>cells/usw2-042/*</code>.</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Namespaces (Enterprise)</th>
+<th>Path prefixes (Community)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Isolation strength</td>
+<td>Structural — enforced by Vault</td>
+<td>Policy-only — one bad glob leaks</td>
+</tr>
+<tr>
+<td>Delegated admin</td>
+<td>Tenant admins can manage their own mounts/policies</td>
+<td>Central team owns everything</td>
+</tr>
+<tr>
+<td>Audit</td>
+<td>Namespace appears in every audit entry</td>
+<td>You infer tenancy from the path</td>
+</tr>
+<tr>
+<td>Blast radius of a policy bug</td>
+<td>Bounded to the namespace</td>
+<td>Potentially fleet-wide</td>
+</tr>
+<tr>
+<td>Cost</td>
+<td>Enterprise license</td>
+<td>Free</td>
+</tr>
+<tr>
+<td>Mount count pressure</td>
+<td>Distributed across namespaces</td>
+<td>All mounts in one flat list; thousands of mounts is a real scaling concern</td>
+</tr>
+</tbody>
+</table>
+<p>OpenBao has namespaces in Community, and 2.6.0 added <strong>namespace sealing</strong> — per-namespace Shamir seal configuration with distinct key material, so a tenant can seal their own namespace without affecting others. That is a genuinely interesting property for a cell-per-tenant architecture and worth evaluating.</p>
+<h3 id="secrets-engines">Secrets engines<a class="anchor" href="#secrets-engines">#</a></h3>
+<h4 id="kv-v1-vs-kv-v2">KV v1 vs KV v2</h4>
+<p>KV v2 is versioned. The versioning changes the API path shape, and this is the single most common Vault papercut.</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>KV v1</th>
+<th>KV v2</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>API path</td>
+<td><code>secret/foo</code></td>
+<td><code>secret/data/foo</code> for the value, <code>secret/metadata/foo</code> for versions</td>
+</tr>
+<tr>
+<td>CLI path</td>
+<td><code>secret/foo</code></td>
+<td><code>secret/foo</code> — <strong>the CLI hides the <code>data/</code> segment; the API and policies do not</strong></td>
+</tr>
+<tr>
+<td>Versions</td>
+<td>None</td>
+<td>Configurable <code>max_versions</code> (default 10)</td>
+</tr>
+<tr>
+<td>Delete semantics</td>
+<td>Gone</td>
+<td>Soft delete, <code>undelete</code>, <code>destroy</code>, <code>delete_version_after</code></td>
+</tr>
+<tr>
+<td>Check-and-set</td>
+<td>No</td>
+<td><code>cas</code> param; <code>cas_required=true</code> on the mount forces it</td>
+</tr>
+<tr>
+<td>Policy gotcha</td>
+<td>—</td>
+<td>You must write <code>path "secret/data/foo"</code>, not <code>path "secret/foo"</code></td>
+</tr>
+</tbody>
+</table>
+<div class="codehilite"><pre><span></span><code>vault kv enable-versioning secret/    <span class="c1"># or: vault secrets enable -version=2 kv</span>
+vault kv put -cas<span class="o">=</span><span class="m">0</span> secret/cell-usw2/api-key <span class="nv">value</span><span class="o">=</span>s3cr3t   <span class="c1"># cas=0 = create only</span>
+vault kv put -cas<span class="o">=</span><span class="m">1</span> secret/cell-usw2/api-key <span class="nv">value</span><span class="o">=</span>rotated  <span class="c1"># only if current version is 1</span>
+vault kv metadata put -max-versions<span class="o">=</span><span class="m">5</span> -delete-version-after<span class="o">=</span>720h secret/cell-usw2/api-key
+</code></pre></div>
+
+<p>Enable <code>cas_required</code> on any mount that GitOps writes to. Without it, two concurrent reconcilers silently clobber each other.</p>
+<h4 id="transit--encryption-as-a-service">Transit — encryption as a service</h4>
+<p>Transit never stores your data. You send plaintext, Vault returns ciphertext with a key-version prefix (<code>vault:v3:...</code>). The application stores the ciphertext; Vault holds the key. This is how you get envelope encryption without every service holding a KEK.</p>
+<div class="codehilite"><pre><span></span><code>vault secrets <span class="nb">enable</span> transit
+vault write -f transit/keys/cell-metadata
+vault write transit/encrypt/cell-metadata <span class="nv">plaintext</span><span class="o">=</span><span class="k">$(</span>base64 <span class="o">&lt;&lt;&lt;</span> <span class="s2">&quot;cell config blob&quot;</span><span class="k">)</span>
+<span class="c1"># ciphertext: vault:v1:8SDd3W...</span>
+
+vault write -f transit/keys/cell-metadata/rotate     <span class="c1"># now v2; v1 still decrypts</span>
+vault write transit/rewrap/cell-metadata <span class="nv">ciphertext</span><span class="o">=</span><span class="s2">&quot;vault:v1:8SDd3W...&quot;</span>
+</code></pre></div>
+
+<p>Key properties to know:</p>
+<ul>
+<li><strong>Rotation is non-destructive.</strong> Old versions stay available for decrypt. <code>min_decryption_version</code> is how you actually retire an old key, and you must rewrap first.</li>
+<li><strong>Convergent encryption</strong> makes the same plaintext produce the same ciphertext (deterministic nonce derived from the plaintext), which enables equality search on encrypted columns. It leaks equality — that is the whole point and the whole risk. Only enable it deliberately.</li>
+<li><strong><code>derived=true</code></strong> derives a per-context key from the master key, so you can encrypt per-tenant with one key object.</li>
+<li>Transit is CPU-bound and every operation is a network round trip. It is not a substitute for local AES in a hot loop; Vault 2.0 added <a href="https://developer.hashicorp.com/vault/docs/secrets/transit/envelope-encryption">envelope encryption</a> precisely for that — Vault protects the DEK, the app encrypts locally.</li>
+</ul>
+<h4 id="database--dynamic-credentials">Database — dynamic credentials</h4>
+<p>This is the engine that matters most for Temporal's persistence layer. Instead of a static Postgres password in a Secret, each pod gets a <strong>unique, short-lived, revocable database user</strong>.</p>
+<div class="codehilite"><pre><span></span><code>vault secrets <span class="nb">enable</span> -path<span class="o">=</span>cell-usw2-042-db database
+
+vault write cell-usw2-042-db/config/temporal <span class="se">\</span>
+  <span class="nv">plugin_name</span><span class="o">=</span>postgresql-database-plugin <span class="se">\</span>
+  <span class="nv">allowed_roles</span><span class="o">=</span><span class="s2">&quot;frontend,history,matching,worker&quot;</span> <span class="se">\</span>
+  <span class="nv">connection_url</span><span class="o">=</span><span class="s2">&quot;postgresql://{{username}}:{{password}}@pg.cell-usw2-042:5432/temporal?sslmode=verify-full&quot;</span> <span class="se">\</span>
+  <span class="nv">username</span><span class="o">=</span><span class="s2">&quot;vault_root&quot;</span> <span class="se">\</span>
+  <span class="nv">password</span><span class="o">=</span><span class="s2">&quot;</span><span class="nv">$INITIAL_ROOT_PW</span><span class="s2">&quot;</span> <span class="se">\</span>
+  <span class="nv">password_authentication</span><span class="o">=</span><span class="s2">&quot;scram-sha-256&quot;</span>
+
+<span class="c1"># Immediately rotate the root password so no human knows it.</span>
+vault write -f cell-usw2-042-db/rotate-root/temporal
+
+vault write cell-usw2-042-db/roles/frontend <span class="se">\</span>
+  <span class="nv">db_name</span><span class="o">=</span>temporal <span class="se">\</span>
+  <span class="nv">creation_statements</span><span class="o">=</span><span class="s2">&quot;CREATE ROLE \&quot;{{name}}\&quot; WITH LOGIN PASSWORD &#39;{{password}}&#39; VALID UNTIL &#39;{{expiration}}&#39;; \</span>
+<span class="s2">                       GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO \&quot;{{name}}\&quot;;&quot;</span> <span class="se">\</span>
+  <span class="nv">revocation_statements</span><span class="o">=</span><span class="s2">&quot;REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM \&quot;{{name}}\&quot;; \</span>
+<span class="s2">                         DROP ROLE IF EXISTS \&quot;{{name}}\&quot;;&quot;</span> <span class="se">\</span>
+  <span class="nv">default_ttl</span><span class="o">=</span><span class="s2">&quot;1h&quot;</span> <span class="nv">max_ttl</span><span class="o">=</span><span class="s2">&quot;24h&quot;</span>
+
+vault <span class="nb">read</span> cell-usw2-042-db/creds/frontend
+</code></pre></div>
+
+<p>The <code>rotate-root</code> step is the important one and it is easy to skip. After it runs, the credential in your Terraform state is dead.</p>
+<p>Operational realities: <strong>dynamic creds mean your database has N live users at any moment</strong>, where N scales with pod count times (max_ttl / ttl). Postgres has a <code>max_connections</code> and a per-role overhead; a 5-minute TTL across 500 pods creates real churn. Also, <code>revocation_statements</code> must handle owned objects — a <code>DROP ROLE</code> fails if the role owns anything, and the lease then goes into a retry loop that shows up as <code>vault.expire.num_irrevocable_leases</code>.</p>
+<p><strong>Static roles</strong> are the middle ground: Vault owns and rotates a <em>fixed</em> username on a schedule, and everyone reads the same current password. Fewer database users, less revocation risk, weaker isolation.</p>
+<h4 id="pki">PKI</h4>
+<p>The PKI engine is a full CA: generate or import a root, create intermediates, define roles that constrain what can be issued, and issue leaf certs over the API. This is the natural issuing CA behind cert-manager and gets full treatment in <a href="11-cert-manager-and-pki.html#the-vault-issuer">11-cert-manager-and-pki.md</a>. The key Vault-side facts:</p>
+<ul>
+<li>Roles constrain <code>allowed_domains</code>, <code>allow_subdomains</code>, <code>allow_bare_domains</code>, <code>allowed_uri_sans</code>, <code>key_type</code>, <code>key_bits</code>, <code>ttl</code>, <code>max_ttl</code>, <code>ext_key_usage</code>.</li>
+<li><code>tidy</code> must be scheduled or the stored certificate list grows without bound.</li>
+<li>Vault 2.0 added a <a href="https://developer.hashicorp.com/vault/docs/secrets/pki-external-ca">Public CA integration</a> so Vault can front a public CA, and PKI role templating got the same wildcard hardening as policies.</li>
+</ul>
+<h4 id="cloud-dynamic-credentials">Cloud dynamic credentials</h4>
+<p><code>aws</code>, <code>gcp</code>, and <code>azure</code> secrets engines mint short-lived cloud credentials on demand. For a multi-cloud cell fleet, these are how you stop shipping long-lived cloud keys into cells.</p>
+<div class="codehilite"><pre><span></span><code>vault secrets <span class="nb">enable</span> -path<span class="o">=</span>aws-usw2 aws
+vault write aws-usw2/config/root <span class="nv">region</span><span class="o">=</span>us-west-2   <span class="c1"># or use IRSA and omit keys entirely</span>
+vault write aws-usw2/roles/cell-provisioner <span class="se">\</span>
+  <span class="nv">credential_type</span><span class="o">=</span>assumed_role <span class="se">\</span>
+  <span class="nv">role_arns</span><span class="o">=</span>arn:aws:iam::111122223333:role/CellProvisioner <span class="se">\</span>
+  <span class="nv">default_sts_ttl</span><span class="o">=</span>15m <span class="nv">max_sts_ttl</span><span class="o">=</span>1h
+vault <span class="nb">read</span> aws-usw2/creds/cell-provisioner
+</code></pre></div>
+
+<p><code>default_sts_ttl</code> and <code>max_sts_ttl</code> are valid <strong>only</strong> for <code>credential_type=assumed_role</code> or <code>federation_token</code>. Set them alongside <code>iam_user</code> and Vault silently ignores them, leaving you with a credential bounded by nothing but the lease — which is the opposite of what you were trying to buy.</p>
+<p><code>credential_type</code> matters: <code>iam_user</code> creates a real IAM user (subject to a per-account quota and to IAM's eventual consistency — the classic "credentials not yet valid" retry), <code>assumed_role</code> calls STS and is faster and quota-free, <code>federation_token</code> is a middle ground. Prefer <code>assumed_role</code>. Vault 2.0 also lets Secret Sync use <a href="https://developer.hashicorp.com/vault/docs/sync">workload identity federation</a> so Vault itself holds no static cloud credentials.</p>
+<h4 id="ssh-and-transform">SSH and Transform</h4>
+<p><strong>SSH</strong> signs user public keys with a CA that your hosts trust via <code>TrustedUserCAKeys</code>. It replaces <code>authorized_keys</code> distribution entirely and makes break-glass access auditable and time-bounded. For a cell fleet with SSH access to nodes, this is the right answer.</p>
+<p><strong>Transform</strong> (Enterprise) does format-preserving encryption, tokenization, and masking — encrypt a credit card number and get back something shaped like a credit card number. Relevant only if you have data-shape constraints in a legacy schema.</p>
+<h3 id="leases-renewal-revocation-and-the-lease-count-explosion">Leases, renewal, revocation, and the lease-count explosion<a class="anchor" href="#leases-renewal-revocation-and-the-lease-count-explosion">#</a></h3>
+<p>Every dynamically generated secret gets a lease: <code>{lease_id, lease_duration, renewable}</code>. Vault stores the lease, tracks its expiry, and calls the engine's revoke hook when it lapses. The default <code>default_lease_ttl</code> and <code>max_lease_ttl</code> are both <strong>768h (32 days)</strong> (<a href="https://developer.hashicorp.com/vault/docs/configuration">configuration reference</a>), which is far too long for anything a cell uses.</p>
+<div class="codehilite"><pre><span></span><code># Server-wide defaults — set these low and override upward per mount.
+default_lease_ttl = &quot;1h&quot;
+max_lease_ttl     = &quot;24h&quot;
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code>vault secrets tune -default-lease-ttl<span class="o">=</span>15m -max-lease-ttl<span class="o">=</span>2h cell-usw2-042-db/
+vault lease renew &lt;lease_id&gt;
+vault lease revoke &lt;lease_id&gt;
+vault lease revoke -prefix cell-usw2-042-db/creds/    <span class="c1"># revoke everything from a mount</span>
+</code></pre></div>
+
+<p><strong>TTL vs max-TTL</strong> is the part people get wrong. A lease renews up to <code>max_ttl</code> measured <em>from issuance</em>, not from the last renewal. When <code>max_ttl</code> is hit, renewal fails and the client must request a <em>new</em> credential. Applications that only implement renew, not re-fetch, break exactly once per <code>max_ttl</code> — often weeks after deploy.</p>
+<p><strong>The lease-count explosion.</strong> This is the number one Vault performance incident and it is entirely self-inflicted. Every lease is a write to the storage backend, and Vault's expiration manager holds them in memory. The failure shape:</p>
+<ul>
+<li>A misconfigured sidecar authenticates in a crash loop; each login creates a token with a lease.</li>
+<li>Or: a workload requests a fresh dynamic credential per <em>request</em> instead of per <em>process</em>.</li>
+<li>Or: <code>default_lease_ttl</code> is left at 768h, so nothing ever expires and the table grows monotonically.</li>
+</ul>
+<p>Symptoms: rising <code>vault.expire.num_leases</code>, growing Raft snapshot size, unseal times climbing into minutes (the expiration manager must load every lease on unseal), and eventually memory pressure on the active node. Recovery is painful because <code>vault lease revoke -prefix</code> on a million leases is itself a massive write burst.</p>
+<p>Defenses, in order of value:</p>
+<ol>
+<li><strong>Lease count quotas (Enterprise)</strong> — hard caps that fail closed instead of degrading the cluster. Rate-limit quotas are the Community-edition lever and are not a substitute; they bound request rate, not lease population:</li>
+</ol>
+<div class="codehilite"><pre><span></span><code><span class="c1"># Enterprise only:</span>
+vault write sys/quotas/lease-count/cell-usw2-042 <span class="se">\</span>
+  <span class="nv">path</span><span class="o">=</span><span class="s2">&quot;cell-usw2-042-db/&quot;</span> <span class="nv">max_leases</span><span class="o">=</span><span class="m">2000</span>
+
+<span class="c1"># Community and Enterprise:</span>
+vault write sys/quotas/rate-limit/cell-usw2-042 <span class="se">\</span>
+  <span class="nv">path</span><span class="o">=</span><span class="s2">&quot;cell-usw2-042-db/&quot;</span> <span class="nv">rate</span><span class="o">=</span><span class="m">200</span> <span class="nv">interval</span><span class="o">=</span>1s <span class="nv">block_interval</span><span class="o">=</span>60s
+</code></pre></div>
+
+<ol start="2">
+<li><strong>Short TTLs everywhere</strong>, set at the mount, not relying on server defaults.</li>
+<li><strong><code>token_num_uses</code></strong> on auth roles for one-shot workloads, so the token self-destructs.</li>
+<li><strong>Batch tokens</strong> for high-volume, short-lived auth. Batch tokens are not persisted and create no lease — they are signed blobs Vault validates cryptographically. The tradeoff: they cannot be renewed, cannot be revoked before expiry, and do not appear in the token store. Perfect for a request-scoped workload, wrong for a long-lived sidecar.</li>
+<li><strong>Alert on <code>vault.expire.num_leases</code></strong> with an absolute threshold, not just a derivative.</li>
+</ol>
+<h3 id="kubernetes-integration--four-options">Kubernetes integration — four options<a class="anchor" href="#kubernetes-integration--four-options">#</a></h3>
+<p>This is a real architectural decision and the options are genuinely different, not just stylistic.</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Vault Agent Injector</th>
+<th>Vault Secrets Operator (VSO)</th>
+<th>Secrets Store CSI Driver</th>
+<th>External Secrets Operator (ESO)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Mechanism</td>
+<td>Mutating webhook adds init + sidecar container</td>
+<td>Operator syncs Vault → native K8s <code>Secret</code></td>
+<td>CSI volume mounts secrets as files</td>
+<td>Operator syncs provider → native K8s <code>Secret</code></td>
+</tr>
+<tr>
+<td>Secret lands in etcd?</td>
+<td><strong>No</strong> — files in a shared <code>emptyDir</code></td>
+<td>Yes</td>
+<td>No (unless <code>secretObjects</code> sync enabled)</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td>Rendering/templating</td>
+<td>Yes, consul-template syntax</td>
+<td>Basic transformation</td>
+<td>No — raw files</td>
+<td>Yes, templates</td>
+</tr>
+<tr>
+<td>Live rotation</td>
+<td>Sidecar re-renders; app must reload</td>
+<td>Operator updates Secret; app must reload</td>
+<td>Requires driver rotation feature</td>
+<td>Operator updates Secret; app must reload</td>
+</tr>
+<tr>
+<td>Env var injection</td>
+<td>Only via sourcing a rendered file</td>
+<td>Yes (<code>envFrom</code> a Secret)</td>
+<td>Only via <code>secretObjects</code> → Secret</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td>Per-pod overhead</td>
+<td>+2 containers per pod</td>
+<td>Zero pod overhead</td>
+<td>+1 volume, node-level DaemonSet</td>
+<td>Zero pod overhead</td>
+</tr>
+<tr>
+<td>Multi-backend</td>
+<td>Vault only</td>
+<td>Vault only</td>
+<td>Vault, AWS, GCP, Azure providers</td>
+<td>Vault, AWS, GCP, Azure, ~20 more</td>
+</tr>
+<tr>
+<td>GitOps / rendered manifests</td>
+<td>Awkward — webhook mutates at admission, so rendered YAML ≠ running pod</td>
+<td><strong>Good</strong> — a CRD is a declarative object you commit</td>
+<td>OK — volume spec is declarative</td>
+<td><strong>Good</strong> — a CRD you commit</td>
+</tr>
+<tr>
+<td>Maintainer</td>
+<td>HashiCorp</td>
+<td>HashiCorp</td>
+<td>Kubernetes SIG-Auth</td>
+<td>CNCF</td>
+</tr>
+</tbody>
+</table>
+<p><strong>For a rendered-manifest/GitOps workflow, VSO or ESO.</strong> The reason is drift: the Agent Injector mutates pods at admission time, which means the manifest you rendered, diffed, and approved is not the manifest that runs. Anything doing server-side diff (Argo CD, Flux with drift detection) will fight the webhook or need explicit ignore rules. A <code>VaultStaticSecret</code> or <code>ExternalSecret</code> CRD is just an object — it renders, it diffs, it reconciles.</p>
+<p><strong>And the choice is narrower than it looks, because the rendered-manifest pattern rules out the encrypt-in-git alternatives entirely.</strong> Argo CD's Source Hydrator docs are explicit: <em>"Do not use the source hydrator with any tool that injects secrets into your manifests as part of the hydration process (for example, Helm with SOPS or the Argo CD Vault Plugin). These secrets would be committed to git"</em> (<a href="https://argo-cd.readthedocs.io/en/latest/user-guide/source-hydrator/">source hydrator</a>). If your delivery path renders manifests into git — which is your team's path — any scheme that resolves secrets <em>during</em> the render is off the table, and a <em>runtime</em> secrets operator is structurally forced rather than merely preferred. See <a href="13-gitops-argocd-flux.html#secrets-in-gitops">13-gitops-argocd-flux.md</a> for the full comparison of what remains.</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># Vault Secrets Operator — declarative, GitOps-friendly</span><span class="w"></span>
+<span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">secrets.hashicorp.com/v1beta1</span><span class="w"></span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">VaultAuth</span><span class="w"></span>
+<span class="nt">metadata</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cell-auth</span><span class="w"></span>
+<span class="w">  </span><span class="nt">namespace</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cell-usw2-042</span><span class="w"></span>
+<span class="nt">spec</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">method</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">kubernetes</span><span class="w"></span>
+<span class="w">  </span><span class="nt">mount</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">kubernetes</span><span class="w"></span>
+<span class="w">  </span><span class="nt">kubernetes</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">role</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cell-usw2-042-frontend</span><span class="w"></span>
+<span class="w">    </span><span class="nt">serviceAccount</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">temporal-frontend</span><span class="w"></span>
+<span class="w">    </span><span class="nt">audiences</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;vault&quot;</span><span class="p p-Indicator">]</span><span class="w"></span>
+<span class="nn">---</span><span class="w"></span>
+<span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">secrets.hashicorp.com/v1beta1</span><span class="w"></span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">VaultDynamicSecret</span><span class="w"></span>
+<span class="nt">metadata</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">temporal-db</span><span class="w"></span>
+<span class="w">  </span><span class="nt">namespace</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cell-usw2-042</span><span class="w"></span>
+<span class="nt">spec</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">vaultAuthRef</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cell-auth</span><span class="w"></span>
+<span class="w">  </span><span class="nt">mount</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cell-usw2-042-db</span><span class="w"></span>
+<span class="w">  </span><span class="nt">path</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">creds/frontend</span><span class="w"></span>
+<span class="w">  </span><span class="nt">destination</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">create</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span><span class="w"></span>
+<span class="w">    </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">temporal-db-creds</span><span class="w"></span>
+<span class="w">  </span><span class="nt">rolloutRestartTargets</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Deployment</span><span class="w"></span>
+<span class="w">      </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">temporal-frontend</span><span class="w"></span>
+</code></pre></div>
+
+<p><code>rolloutRestartTargets</code> is the killer feature: VSO restarts the Deployment when the credential rotates, which solves the "secret updated but the app never re-read it" problem without an extra Reloader.</p>
+<p><strong>Choose the Agent Injector</strong> only when the secret genuinely must not enter etcd and you cannot use CSI — for example, a compliance requirement that says "no secret material in the API server's datastore."</p>
+<p><strong>Choose CSI Driver</strong> when you want file-mounted secrets with no etcd storage and you are already using it for other providers.</p>
+<p><strong>Choose ESO</strong> when you need one operator to speak to Vault <em>and</em> AWS Secrets Manager <em>and</em> GCP Secret Manager — which, for a three-cloud footprint, is a genuinely strong argument.</p>
+<h3 id="operations">Operations<a class="anchor" href="#operations">#</a></h3>
+<p><strong>Initialization and recovery keys.</strong> With auto-unseal, capture the recovery keys at init and escrow them. In an automated cell pipeline this means the pipeline briefly holds them — encrypt them to a KMS key or an escrow service immediately and never write them to CI logs or Terraform state.</p>
+<div class="codehilite"><pre><span></span><code>vault operator init <span class="se">\</span>
+  -recovery-shares<span class="o">=</span><span class="m">5</span> -recovery-threshold<span class="o">=</span><span class="m">3</span> <span class="se">\</span>
+  -format<span class="o">=</span>json &gt; /dev/shm/init.json
+<span class="c1"># Then: encrypt to escrow, wipe, and revoke the initial root token.</span>
+vault token revoke -self
+</code></pre></div>
+
+<p><strong>Never keep a root token.</strong> Generate one on demand with recovery keys and revoke it when done:</p>
+<div class="codehilite"><pre><span></span><code>vault operator generate-root -init
+vault operator generate-root -nonce<span class="o">=</span>&lt;nonce&gt;   <span class="c1"># T times, one per recovery key holder</span>
+vault operator generate-root -decode<span class="o">=</span>&lt;encoded-token&gt; -otp<span class="o">=</span>&lt;otp&gt;
+</code></pre></div>
+
+<p><strong>Upgrades.</strong> Vault 2.x follows the same pattern: upgrade standbys first, then step down the active node. With Raft, upgrade one node at a time, waiting for it to rejoin and catch up before touching the next.</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># On each standby: replace binary, restart, confirm it rejoins</span>
+vault status
+vault operator raft list-peers
+
+<span class="c1"># Finally, on the active node:</span>
+vault operator step-down     <span class="c1"># a standby takes over</span>
+<span class="c1"># then upgrade the (now standby) former leader</span>
+</code></pre></div>
+
+<p>Always read <a href="https://developer.hashicorp.com/vault/docs/updates/important-changes">Important changes</a> before an upgrade. Recent examples that would bite a cell operator: Vault 2.0.2 <a href="https://developer.hashicorp.com/vault/docs/updates/important-changes#ipc_lock-removed">removed <code>IPC_LOCK</code></a> from the official container images (so <code>mlock</code> behavior changed), and Vault 2.0.0 added <code>max_token_header_size</code> on the TCP listener defaulting to <strong>8 KB</strong> — fine for opaque Vault tokens, potentially breaking for large OIDC tokens with big <code>authorization_details</code> claims.</p>
+<p>Vault Community support covers only the latest minor release — a version goes EOL the day its successor ships (<a href="https://endoflife.date/hashicorp-vault">1.21 went EOL on 2026-04-13</a> when 2.0 shipped). The overlapping two-release window is an Enterprise LTS feature, not a Community one. Plan cell fleet upgrades on a cadence that keeps you inside it.</p>
+<p><strong>Snapshots and restore.</strong></p>
+<div class="codehilite"><pre><span></span><code>vault operator raft snapshot save cell-usw2-042-<span class="k">$(</span>date -u +%FT%TZ<span class="k">)</span>.snap
+vault operator raft snapshot restore -force cell-usw2-042.snap
+</code></pre></div>
+
+<p>Two things people learn the hard way: (1) a snapshot is <strong>encrypted with the barrier key</strong>, so restoring it into a cluster with a different seal requires the original seal to be reachable — a snapshot is not a portable backup unless you plan for it. (2) <code>-force</code> is required when the restore target has a different cluster ID, which is exactly the disaster-recovery case, so <code>-force</code> is normal, not scary. Test restores. An untested restore is not a backup.</p>
+<p><strong>Audit devices.</strong> This is the classic outage, and it is documented behavior, not a bug. From the <a href="https://developer.hashicorp.com/vault/docs/audit">audit docs</a>: "if you have audit devices enabled and Vault cannot log information to at least one of the enabled devices, Vault refuses to service the corresponding API request. When all enabled audit devices become unavailable, Vault in effect becomes unavailable as well."</p>
+<p>The failure: one <code>file</code> audit device pointed at a disk that fills, or one <code>socket</code> device pointed at a log collector that dies. Vault stops serving. Mitigation is explicit in the docs — <strong>enable at least two audit devices</strong> with independent failure modes.</p>
+<div class="codehilite"><pre><span></span><code>vault audit <span class="nb">enable</span> -path<span class="o">=</span>file-local file <span class="nv">file_path</span><span class="o">=</span>/vault/logs/audit.log
+vault audit <span class="nb">enable</span> -path<span class="o">=</span>syslog-remote syslog <span class="nv">tag</span><span class="o">=</span><span class="s2">&quot;vault&quot;</span> <span class="nv">facility</span><span class="o">=</span><span class="s2">&quot;AUTH&quot;</span>
+</code></pre></div>
+
+<p>Note that <code>sys/seal-status</code>, <code>sys/unseal</code>, and <code>sys/health</code> are on the <a href="https://developer.hashicorp.com/vault/docs/audit#exempted-api-endpoints">audit-exempt list</a>, which is the only reason you can still unseal a Vault whose audit devices are wedged. Recovery: unseal, then disable the broken device — HashiCorp has a <a href="https://developer.hashicorp.com/vault/tutorials/monitoring/blocked-audit-devices">recover blocked audit devices</a> tutorial precisely because this happens often.</p>
+<p>Also: log rotation must be <code>copytruncate</code>-free. If logrotate moves the file, Vault keeps writing to the moved inode. Send <code>SIGHUP</code> or use the <code>file</code> device's reload behavior.</p>
+<p><strong>Telemetry.</strong> Configure Prometheus and alert on the handful of metrics that actually predict incidents:</p>
+<div class="codehilite"><pre><span></span><code>telemetry {
+  prometheus_retention_time = &quot;24h&quot;
+  disable_hostname          = true
+}
+</code></pre></div>
+
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>vault.core.unsealed</code></td>
+<td>0 means down. Page.</td>
+</tr>
+<tr>
+<td><code>vault.expire.num_leases</code></td>
+<td>Lease explosion early warning</td>
+</tr>
+<tr>
+<td><code>vault.expire.num_irrevocable_leases</code></td>
+<td>Revocation is failing; engine or DB problem</td>
+</tr>
+<tr>
+<td><code>vault.raft_storage.follower.applied_index_delta</code></td>
+<td>Follower falling behind</td>
+</tr>
+<tr>
+<td><code>vault.core.handle_request</code> (p99)</td>
+<td>Latency, usually storage-bound</td>
+</tr>
+<tr>
+<td><code>vault.token.count.by_auth</code></td>
+<td>Auth loop detection</td>
+</tr>
+<tr>
+<td><code>vault.audit.log_request_failure</code></td>
+<td>About to become an outage</td>
+</tr>
+<tr>
+<td><code>vault.runtime.alloc_bytes</code></td>
+<td>Memory, dominated by the lease table</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Rate limits and performance tuning.</strong> Beyond lease-count quotas, <code>sys/quotas/rate-limit</code> gives per-path or per-namespace request-rate caps. Enable <code>enable_rate_limit_audit_logging</code> selectively — it is loud. For performance: put <code>raft</code> storage on fast local NVMe (Raft is fsync-bound), keep <code>default_lease_ttl</code> low, and use <code>elide_list_responses=true</code> on audit devices so a <code>LIST</code> of a million leases does not produce a megabyte audit record.</p>
+<h3 id="disaster-scenarios">Disaster scenarios<a class="anchor" href="#disaster-scenarios">#</a></h3>
+<table>
+<thead>
+<tr>
+<th>Scenario</th>
+<th>Reality</th>
+<th>Recovery path</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Lost Shamir unseal keys</strong> (below threshold)</td>
+<td><strong>Unrecoverable.</strong> The barrier key is gone.</td>
+<td>None. Restore from a snapshot into a <em>new</em> Vault with a <em>new</em> seal is also impossible, because the snapshot is barrier-encrypted. Rebuild from source of truth.</td>
+</tr>
+<tr>
+<td><strong>Lost recovery keys</strong> (auto-unseal)</td>
+<td>Vault keeps running and keeps unsealing.</td>
+<td>Not fatal. You lose the ability to <code>generate-root</code> and to rekey. Fix by using an existing root/privileged token to... you cannot. Plan a migration to a new cluster. Escrow recovery keys.</td>
+</tr>
+<tr>
+<td><strong>KMS key deleted</strong></td>
+<td>Fatal on next restart. Running Vaults survive until restarted.</td>
+<td>AWS KMS has a 7–30 day pending-deletion window — <strong>cancel the deletion</strong>. If actually deleted, the root key is unrecoverable. Prevention: KMS key policies denying <code>ScheduleKeyDeletion</code>, plus deletion protection.</td>
+</tr>
+<tr>
+<td><strong>KMS regionally unavailable</strong></td>
+<td>Existing nodes fine; restarts seal.</td>
+<td>Wait. Or, if you planned for it, <code>seal</code> + <code>disabled_seal</code> migration to a secondary KMS key in another region. Design multi-region seal <em>before</em> the incident.</td>
+</tr>
+<tr>
+<td><strong>Raft quorum loss</strong> (2 of 3 nodes gone)</td>
+<td>Vault is read-only-ish and then unavailable; no leader elected.</td>
+<td>If nodes are recoverable, bring them back. If not, use <code>raft/peers.json</code> recovery on a surviving node to force a single-node cluster, then re-add peers. Documented under <a href="https://developer.hashicorp.com/vault/docs/concepts/integrated-storage">Integrated Storage</a>. Losing quorum with unrecoverable nodes means restoring the latest snapshot.</td>
+</tr>
+<tr>
+<td><strong>Expired / lost root token</strong></td>
+<td>Normal state — you should not have one.</td>
+<td><code>vault operator generate-root</code> with recovery/unseal key holders.</td>
+</tr>
+<tr>
+<td><strong>Lease table too large to unseal</strong></td>
+<td>Unseal hangs for minutes to hours.</td>
+<td>Increase memory, wait it out, then aggressively <code>lease revoke -prefix</code> and set quotas. In extreme cases, restore an older snapshot.</td>
+</tr>
+<tr>
+<td><strong>All audit devices failed</strong></td>
+<td>Every write is refused; reads too.</td>
+<td>Unseal endpoints are audit-exempt. Fix the sink or <code>vault audit disable</code> the broken path using a token you already hold.</td>
+</tr>
+</tbody>
+</table>
+<p>The pattern across all of these: <strong>Vault's failure modes are mostly unrecoverable-by-design</strong>. There is no "just reset the password." Your runbooks should therefore be heavily weighted toward <em>prevention and drills</em>, not toward heroic recovery.</p>
+<h3 id="the-busl-license-change-and-openbao">The BUSL license change and OpenBao<a class="anchor" href="#the-busl-license-change-and-openbao">#</a></h3>
+<p>In August 2023, HashiCorp moved Vault (and Terraform, Consul, Nomad, and others) from <strong>MPL 2.0 to the Business Source License 1.1</strong>. BUSL is not an OSI-approved open source license: it permits use except to provide a competing hosted service, converting to MPL 2.0 four years after each release. For a company whose product <em>is</em> a hosted service, that clause deserves an actual legal read rather than an assumption.</p>
+<p><strong>IBM completed its acquisition of HashiCorp in February 2025</strong> (<a href="https://newsroom.ibm.com/2025-02-27-ibm-completes-acquisition-of-hashicorp,-creates-comprehensive,-end-to-end-hybrid-cloud-platform">IBM newsroom</a>), a $6.4B deal. The visible effects in the docs today: support routes to <code>ibm.com/mysupport</code>, and Vault 2.0 added <a href="https://developer.hashicorp.com/vault/docs/configuration/license-entitlement">IBM Passport Advantage license support</a>. Licensing has moved toward workload/machine-identity-based pricing, which for a fleet of per-cell Vaults is a number worth modeling before you commit to the topology.</p>
+<p><strong>OpenBao</strong> is the fork. It is under <strong>Linux Foundation</strong> governance as an <strong>OpenSSF Sandbox</strong> project, licensed <strong>MPL 2.0</strong>, and it is real: <a href="https://openbao.org/community/release-notes/2-6-0/">2.6.0 shipped 2026-07-14</a>, with 2.6.2 on 2026-08-18. Its trajectory has diverged from Vault rather than just tracking it:</p>
+<ul>
+<li><strong>Namespaces in Community</strong> (Vault requires Enterprise), plus <strong>namespace sealing</strong> in 2.6.0 — per-namespace Shamir keys, so a tenant can seal their own partition.</li>
+<li><strong>Horizontal read scalability</strong> — standbys serve reads, shipped in 2.5.0. Vault charges for this as performance standbys.</li>
+<li><strong>Pluggable auto-unseal</strong> via a new <code>kms</code> plugin type; built-in cloud seals are deprecated for removal in 2.7.0.</li>
+<li><strong>Declarative self-initialization</strong> and <strong>Workflows</strong> (<code>sys/workflows</code>), which are genuinely interesting for unattended cell provisioning: a Vault that configures itself from its own config file removes a whole class of bootstrap orchestration.</li>
+<li><strong>Transactional storage</strong> and a CEL policy engine, neither of which Vault has.</li>
+<li>Deprecations to watch: the <strong>file storage backend is deprecated for removal in 2.7.0</strong>, and LDAP/Kerberos/RADIUS plugins are moving out of the main binary.</li>
+</ul>
+<p>The practical assessment for a platform team: OpenBao's API is Vault-compatible enough that migration is realistic, the namespace-in-community story materially changes the cell-local-vs-central calculus, and MPL 2.0 removes the "are we a competing service" question entirely. The counterweight is ecosystem maturity — VSO, the Agent Injector, and much third-party tooling target Vault. This is a decision worth an explicit evaluation rather than a default.</p>
+<h3 id="terraforms-vault-provider-and-the-state-problem">Terraform's Vault provider and the state problem<a class="anchor" href="#terraforms-vault-provider-and-the-state-problem">#</a></h3>
+<p>The <a href="https://registry.terraform.io/providers/hashicorp/vault/latest/docs">Vault provider</a> is the right way to manage Vault <em>configuration</em>: mounts, auth backends, roles, policies. It is the wrong way to manage Vault <em>secrets</em>.</p>
+<p>The reason is stated in the provider's own docs: <strong>Terraform stores every value it reads or writes in state, in plaintext.</strong> A <code>vault_generic_secret</code> data source, or a <code>vault_database_secret_backend_static_role</code> whose password Terraform reads, puts that secret in <code>terraform.tfstate</code> forever, including in every historical state version your backend retains.</p>
+<div class="codehilite"><pre><span></span><code># GOOD — configuration only. No secret values cross the boundary.
+resource &quot;vault_mount&quot; &quot;cell_db&quot; {
+  path = &quot;cell-${var.cell_id}-db&quot;
+  type = &quot;database&quot;
+}
+
+resource &quot;vault_database_secret_backend_role&quot; &quot;frontend&quot; {
+  backend             = vault_mount.cell_db.path
+  name                = &quot;frontend&quot;
+  db_name             = vault_database_secret_backend_connection.temporal.name
+  creation_statements = [file(&quot;${path.module}/sql/create_frontend.sql&quot;)]
+  default_ttl         = 900
+  max_ttl             = 7200
+}
+
+resource &quot;vault_policy&quot; &quot;cell_frontend&quot; {
+  name   = &quot;cell-${var.cell_id}-frontend&quot;
+  policy = templatefile(&quot;${path.module}/policy.hcl.tftpl&quot;, { cell_id = var.cell_id })
+}
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code># BAD — this password is now permanently in state.
+data &quot;vault_generic_secret&quot; &quot;db&quot; {
+  path = &quot;secret/cell-${var.cell_id}/db&quot;
+}
+resource &quot;kubernetes_secret&quot; &quot;db&quot; {
+  data = { password = data.vault_generic_secret.db.data[&quot;password&quot;] }
+}
+</code></pre></div>
+
+<p>Mitigations, roughly in order:</p>
+<ol>
+<li><strong>Do not read secrets in Terraform.</strong> Let the workload fetch them at runtime via VSO/ESO/Agent. This is the actual fix.</li>
+<li>If you must, the provider's <code>set_namespace</code>/short-lived token config with <code>max_lease_ttl_seconds</code> at least bounds the Terraform <em>client's</em> credential lifetime.</li>
+<li>Encrypt state at rest with a customer-managed KMS key, restrict who can read the backend, and <strong>enable versioning with a lifecycle policy</strong> — old state versions are the forgotten leak.</li>
+<li>Use ephemeral resources / write-only arguments where the provider supports them (Terraform 1.10+ / 1.11+), which keep values out of state by design.</li>
+</ol>
+<p>There is also a subtler Terraform-and-Vault problem specific to cell teardown: <code>terraform destroy</code> deletes the mount, which revokes leases <em>asynchronously</em>. If the database is torn down in the same apply, revocation fails, leases become irrevocable, and they accumulate in the surviving Vault. Order teardown explicitly: revoke leases, then delete mounts, then delete the database.</p>
+<hr />
+<h2 id="hands-on">Hands-on<a class="anchor" href="#hands-on">#</a></h2>
+<p>Everything below runs on a laptop with Docker and <code>kind</code>. Times are rough.</p>
+<h3 id="lab-0--dev-server-10-minutes">Lab 0 — Dev server, 10 minutes<a class="anchor" href="#lab-0--dev-server-10-minutes">#</a></h3>
+<div class="codehilite"><pre><span></span><code>brew install vault    <span class="c1"># or: https://developer.hashicorp.com/vault/install</span>
+vault server -dev -dev-root-token-id<span class="o">=</span>root
+</code></pre></div>
+
+<p>In a second terminal:</p>
+<div class="codehilite"><pre><span></span><code><span class="nb">export</span> <span class="nv">VAULT_ADDR</span><span class="o">=</span>http://127.0.0.1:8200
+<span class="nb">export</span> <span class="nv">VAULT_TOKEN</span><span class="o">=</span>root
+
+vault status
+vault secrets list -detailed
+
+<span class="c1"># KV v2 and the data/ path gotcha, made concrete</span>
+vault kv put secret/hello <span class="nv">foo</span><span class="o">=</span>world
+vault kv get secret/hello
+curl -s -H <span class="s2">&quot;X-Vault-Token: root&quot;</span> <span class="nv">$VAULT_ADDR</span>/v1/secret/hello <span class="p">|</span> jq       <span class="c1"># 404!</span>
+curl -s -H <span class="s2">&quot;X-Vault-Token: root&quot;</span> <span class="nv">$VAULT_ADDR</span>/v1/secret/data/hello <span class="p">|</span> jq  <span class="c1"># works</span>
+
+<span class="c1"># Policies</span>
+cat &gt; readonly.hcl <span class="s">&lt;&lt;&#39;EOF&#39;</span>
+<span class="s">path &quot;secret/data/hello&quot; { capabilities = [&quot;read&quot;] }</span>
+<span class="s">EOF</span>
+vault policy write <span class="nb">readonly</span> readonly.hcl
+<span class="nv">RO</span><span class="o">=</span><span class="k">$(</span>vault token create -policy<span class="o">=</span><span class="nb">readonly</span> -ttl<span class="o">=</span>5m -field<span class="o">=</span>token<span class="k">)</span>
+<span class="nv">VAULT_TOKEN</span><span class="o">=</span><span class="nv">$RO</span> vault kv get secret/hello        <span class="c1"># ok</span>
+<span class="nv">VAULT_TOKEN</span><span class="o">=</span><span class="nv">$RO</span> vault kv put secret/hello <span class="nv">a</span><span class="o">=</span>b    <span class="c1"># permission denied</span>
+
+<span class="c1"># Prove your policy reasoning with the API, not by reading HCL</span>
+vault token capabilities <span class="nv">$RO</span> secret/data/hello
+</code></pre></div>
+
+<p><strong>Exercise:</strong> write a policy using <code>+</code> and one using <code>*</code> and predict which paths each matches before running <code>vault token capabilities</code>. Get it wrong at least once — that is the point.</p>
+<h3 id="lab-1--a-real-3-node-raft-cluster-in-docker-45-minutes">Lab 1 — A real 3-node Raft cluster in Docker, 45 minutes<a class="anchor" href="#lab-1--a-real-3-node-raft-cluster-in-docker-45-minutes">#</a></h3>
+<div class="codehilite"><pre><span></span><code>mkdir -p ~/vault-lab <span class="o">&amp;&amp;</span> <span class="nb">cd</span> ~/vault-lab
+docker network create vaultnet
+
+<span class="k">for</span> i <span class="k">in</span> <span class="m">0</span> <span class="m">1</span> <span class="m">2</span><span class="p">;</span> <span class="k">do</span>
+  mkdir -p node<span class="nv">$i</span>/data node<span class="nv">$i</span>/config
+  cat &gt; node<span class="nv">$i</span>/config/vault.hcl <span class="s">&lt;&lt;EOF</span>
+<span class="s">ui = true</span>
+<span class="s">disable_mlock = true</span>
+
+<span class="s">listener &quot;tcp&quot; {</span>
+<span class="s">  address     = &quot;0.0.0.0:8200&quot;</span>
+<span class="s">  tls_disable = true</span>
+<span class="s">}</span>
+
+<span class="s">storage &quot;raft&quot; {</span>
+<span class="s">  path    = &quot;/vault/data&quot;</span>
+<span class="s">  node_id = &quot;node$i&quot;</span>
+<span class="s">  retry_join { leader_api_addr = &quot;http://vault0:8200&quot; }</span>
+<span class="s">  retry_join { leader_api_addr = &quot;http://vault1:8200&quot; }</span>
+<span class="s">  retry_join { leader_api_addr = &quot;http://vault2:8200&quot; }</span>
+<span class="s">}</span>
+
+<span class="s">cluster_addr = &quot;http://vault$i:8201&quot;</span>
+<span class="s">api_addr     = &quot;http://vault$i:8200&quot;</span>
+<span class="s">EOF</span>
+<span class="k">done</span>
+
+<span class="k">for</span> i <span class="k">in</span> <span class="m">0</span> <span class="m">1</span> <span class="m">2</span><span class="p">;</span> <span class="k">do</span>
+  docker run -d --name vault<span class="nv">$i</span> --network vaultnet <span class="se">\</span>
+    -p <span class="k">$((</span><span class="m">8200</span> <span class="o">+</span> i <span class="o">*</span> <span class="m">10</span><span class="k">))</span>:8200 <span class="se">\</span>
+    -v <span class="s2">&quot;</span><span class="nv">$PWD</span><span class="s2">/node</span><span class="nv">$i</span><span class="s2">/config:/vault/config&quot;</span> <span class="se">\</span>
+    -v <span class="s2">&quot;</span><span class="nv">$PWD</span><span class="s2">/node</span><span class="nv">$i</span><span class="s2">/data:/vault/data&quot;</span> <span class="se">\</span>
+    hashicorp/vault:latest server
+<span class="k">done</span>
+</code></pre></div>
+
+<p>Note the absence of <code>--cap-add=IPC_LOCK</code>: the official images dropped that capability in Vault 2.0.2 (gotcha 19 below), and the config above already sets <code>disable_mlock = true</code>, so it would be a no-op even if the images still carried it.</p>
+<p>Initialize on node 0 only:</p>
+<div class="codehilite"><pre><span></span><code><span class="nb">export</span> <span class="nv">VAULT_ADDR</span><span class="o">=</span>http://127.0.0.1:8200
+vault operator init -key-shares<span class="o">=</span><span class="m">3</span> -key-threshold<span class="o">=</span><span class="m">2</span> -format<span class="o">=</span>json &gt; init.json
+jq -r <span class="s1">&#39;.unseal_keys_b64[]&#39;</span> init.json
+<span class="nb">export</span> <span class="nv">VAULT_TOKEN</span><span class="o">=</span><span class="k">$(</span>jq -r .root_token init.json<span class="k">)</span>
+
+<span class="k">for</span> k <span class="k">in</span> <span class="k">$(</span>jq -r <span class="s1">&#39;.unseal_keys_b64[0,1]&#39;</span> init.json<span class="k">)</span><span class="p">;</span> <span class="k">do</span> vault operator unseal <span class="s2">&quot;</span><span class="nv">$k</span><span class="s2">&quot;</span><span class="p">;</span> <span class="k">done</span>
+vault status
+</code></pre></div>
+
+<p>Unseal the other two the same way (<code>VAULT_ADDR=http://127.0.0.1:8210</code> and <code>:8220</code>), then:</p>
+<div class="codehilite"><pre><span></span><code><span class="nb">export</span> <span class="nv">VAULT_ADDR</span><span class="o">=</span>http://127.0.0.1:8200
+vault operator raft list-peers
+vault operator raft autopilot state
+</code></pre></div>
+
+<p><strong>Now break it, deliberately.</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. Kill the leader. Watch failover.</span>
+docker stop vault0
+<span class="nv">VAULT_ADDR</span><span class="o">=</span>http://127.0.0.1:8210 vault status      <span class="c1"># a new leader exists</span>
+<span class="nv">VAULT_ADDR</span><span class="o">=</span>http://127.0.0.1:8210 vault operator raft list-peers
+
+<span class="c1"># 2. Kill a second node. Quorum is gone.</span>
+docker stop vault1
+<span class="nv">VAULT_ADDR</span><span class="o">=</span>http://127.0.0.1:8220 vault status      <span class="c1"># no leader; writes fail</span>
+<span class="nv">VAULT_ADDR</span><span class="o">=</span>http://127.0.0.1:8220 vault kv put secret/x <span class="nv">y</span><span class="o">=</span>z    <span class="c1"># observe the error</span>
+
+<span class="c1"># 3. Recover.</span>
+docker start vault0 vault1
+<span class="c1"># Each restarted node is SEALED — Shamir means manual unseal. This is exactly</span>
+<span class="c1"># why cells use auto-unseal.</span>
+</code></pre></div>
+
+<p><strong>Exercise:</strong> repeat step 3, but time how long the whole recovery takes with manual unseal. That number is your MTTR for a Shamir cell, and it is the argument for auto-unseal in one line.</p>
+<p>Snapshots:</p>
+<div class="codehilite"><pre><span></span><code><span class="nb">export</span> <span class="nv">VAULT_ADDR</span><span class="o">=</span>http://127.0.0.1:8200
+vault kv put secret/before-snapshot <span class="nv">value</span><span class="o">=</span>original
+vault operator raft snapshot save lab.snap
+vault kv put secret/before-snapshot <span class="nv">value</span><span class="o">=</span>changed
+vault operator raft snapshot restore -force lab.snap
+vault kv get secret/before-snapshot   <span class="c1"># value=original</span>
+</code></pre></div>
+
+<h3 id="lab-2--kubernetes-auth-on-kind-45-minutes">Lab 2 — Kubernetes auth on kind, 45 minutes<a class="anchor" href="#lab-2--kubernetes-auth-on-kind-45-minutes">#</a></h3>
+<div class="codehilite"><pre><span></span><code>kind create cluster --name vault-lab
+
+helm repo add hashicorp https://helm.releases.hashicorp.com
+helm repo update
+helm install vault hashicorp/vault <span class="se">\</span>
+  --namespace vault --create-namespace <span class="se">\</span>
+  --set <span class="s2">&quot;server.dev.enabled=true&quot;</span> <span class="se">\</span>
+  --set <span class="s2">&quot;server.dev.devRootToken=root&quot;</span> <span class="se">\</span>
+  --set <span class="s2">&quot;injector.enabled=false&quot;</span>
+
+kubectl -n vault <span class="nb">wait</span> --for<span class="o">=</span><span class="nv">condition</span><span class="o">=</span>Ready pod/vault-0 --timeout<span class="o">=</span>180s
+</code></pre></div>
+
+<p>Configure Kubernetes auth using the <em>local token</em> pattern (the recommended one):</p>
+<div class="codehilite"><pre><span></span><code>kubectl -n vault <span class="nb">exec</span> -it vault-0 -- sh -c <span class="s1">&#39;</span>
+<span class="s1">  export VAULT_TOKEN=root</span>
+<span class="s1">  vault auth enable kubernetes</span>
+<span class="s1">  vault write auth/kubernetes/config \</span>
+<span class="s1">      kubernetes_host=&quot;https://$KUBERNETES_SERVICE_HOST:$KUBERNETES_SERVICE_PORT&quot;</span>
+<span class="s1">  vault read auth/kubernetes/config</span>
+<span class="s1">&#39;</span>
+</code></pre></div>
+
+<p>Note there is no <code>token_reviewer_jwt</code> and no <code>kubernetes_ca_cert</code> — Vault reads its own projected token and CA from disk and re-reads them as they rotate. Confirm <code>disable_iss_validation</code> is <code>true</code>:</p>
+<div class="codehilite"><pre><span></span><code>kubectl -n vault <span class="nb">exec</span> vault-0 -- sh -c <span class="se">\</span>
+  <span class="s1">&#39;VAULT_TOKEN=root vault read -field=disable_iss_validation auth/kubernetes/config&#39;</span>
+</code></pre></div>
+
+<p>Vault's ServiceAccount needs <code>TokenReview</code>. The chart already grants it — <code>server.authDelegator.enabled</code> defaults to <code>true</code> — so verify rather than create a second, differently-named binding (which is what makes a re-run of this lab fail with <code>AlreadyExists</code>):</p>
+<div class="codehilite"><pre><span></span><code>kubectl get clusterrolebinding -o name <span class="p">|</span> grep -i vault
+<span class="c1"># If, and only if, nothing is bound:</span>
+<span class="c1"># kubectl create clusterrolebinding vault-auth-delegator \</span>
+<span class="c1">#   --clusterrole=system:auth-delegator --serviceaccount=vault:vault</span>
+</code></pre></div>
+
+<p>Create a workload identity and a policy:</p>
+<div class="codehilite"><pre><span></span><code>kubectl create namespace cell-usw2-042
+kubectl -n cell-usw2-042 create serviceaccount temporal-frontend
+
+kubectl -n vault <span class="nb">exec</span> -it vault-0 -- sh -c <span class="s1">&#39;</span>
+<span class="s1">  export VAULT_TOKEN=root</span>
+<span class="s1">  vault kv put secret/cells/usw2-042/config datacenter=usw2 shard_count=512</span>
+
+<span class="s1">  cat &lt;&lt;EOF | vault policy write cell-usw2-042 -</span>
+<span class="s1">path &quot;secret/data/cells/usw2-042/*&quot; { capabilities = [&quot;read&quot;] }</span>
+<span class="s1">EOF</span>
+
+<span class="s1">  vault write auth/kubernetes/role/cell-usw2-042 \</span>
+<span class="s1">    bound_service_account_names=temporal-frontend \</span>
+<span class="s1">    bound_service_account_namespaces=cell-usw2-042 \</span>
+<span class="s1">    token_policies=cell-usw2-042 \</span>
+<span class="s1">    audience=vault \</span>
+<span class="s1">    token_ttl=20m</span>
+<span class="s1">&#39;</span>
+</code></pre></div>
+
+<p>Log in from a pod:</p>
+<div class="codehilite"><pre><span></span><code>kubectl -n cell-usw2-042 run probe --rm -it --restart<span class="o">=</span>Never <span class="se">\</span>
+  --image<span class="o">=</span>hashicorp/vault:latest <span class="se">\</span>
+  --overrides<span class="o">=</span><span class="s1">&#39;{&quot;spec&quot;:{&quot;serviceAccountName&quot;:&quot;temporal-frontend&quot;}}&#39;</span> <span class="se">\</span>
+  -- sh -c <span class="s1">&#39;</span>
+<span class="s1">    export VAULT_ADDR=http://vault.vault.svc:8200</span>
+<span class="s1">    JWT=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)</span>
+<span class="s1">    vault write -field=token auth/kubernetes/login role=cell-usw2-042 jwt=$JWT &gt; /tmp/t</span>
+<span class="s1">    export VAULT_TOKEN=$(cat /tmp/t)</span>
+<span class="s1">    vault kv get secret/cells/usw2-042/config</span>
+<span class="s1">    vault kv get secret/cells/usw2-999/config   # expect: permission denied</span>
+<span class="s1">  &#39;</span>
+</code></pre></div>
+
+<p><strong>Exercises:</strong></p>
+<ol>
+<li>Change <code>bound_service_account_namespaces</code> to a different namespace and watch the login fail. Read the error carefully — it tells you exactly which bound field rejected you.</li>
+<li>Add <code>use_annotations_as_alias_metadata=true</code> to the auth config, annotate the SA with <code>vault.hashicorp.com/alias-metadata-cell_id: usw2-042</code>, and rewrite the policy as a template using <code>{{identity.entity.aliases.&lt;accessor&gt;.metadata.cell_id}}</code>. Get the mount accessor from <code>vault auth list -format=json | jq -r '.["kubernetes/"].accessor'</code>. This is the pattern that scales to N cells with one policy.</li>
+<li>Set the annotation value to something containing <code>*</code> and observe the Vault 2.0.1+ behavior: permission denied, because wildcards in rendered templates are now rejected.</li>
+</ol>
+<h3 id="lab-3--dynamic-postgres-credentials-45-minutes">Lab 3 — Dynamic Postgres credentials, 45 minutes<a class="anchor" href="#lab-3--dynamic-postgres-credentials-45-minutes">#</a></h3>
+<div class="codehilite"><pre><span></span><code>docker run -d --name pg --network vaultnet <span class="se">\</span>
+  -e <span class="nv">POSTGRES_PASSWORD</span><span class="o">=</span>rootpw -e <span class="nv">POSTGRES_DB</span><span class="o">=</span>temporal <span class="se">\</span>
+  -p <span class="m">5432</span>:5432 postgres:16
+
+docker <span class="nb">exec</span> -i pg psql -U postgres -d temporal <span class="s">&lt;&lt;&#39;SQL&#39;</span>
+<span class="s">CREATE TABLE executions (id bigserial primary key, payload text);</span>
+<span class="s">INSERT INTO executions (payload) VALUES (&#39;hello&#39;);</span>
+<span class="s">CREATE ROLE vault_root WITH LOGIN PASSWORD &#39;bootstrap&#39; CREATEROLE;</span>
+<span class="s">GRANT ALL PRIVILEGES ON DATABASE temporal TO vault_root;</span>
+<span class="s">GRANT ALL ON ALL TABLES IN SCHEMA public TO vault_root WITH GRANT OPTION;</span>
+<span class="s">SQL</span>
+</code></pre></div>
+
+<p>Against the dev server (Lab 0) or your Raft cluster. Mind which one: <code>host.docker.internal</code> only resolves <em>inside</em> a container, so it is right when you configure from a Vault container on <code>vaultnet</code> — but the Lab 0 dev server runs natively on the host, where the address to use is <code>127.0.0.1</code>. From a Vault container on <code>vaultnet</code>, <code>pg:5432</code> is simpler still, since Postgres is on the same docker network.</p>
+<div class="codehilite"><pre><span></span><code><span class="nb">export</span> <span class="nv">VAULT_ADDR</span><span class="o">=</span>http://127.0.0.1:8200
+vault secrets <span class="nb">enable</span> -path<span class="o">=</span>cell-db database
+
+vault write cell-db/config/temporal <span class="se">\</span>
+  <span class="nv">plugin_name</span><span class="o">=</span>postgresql-database-plugin <span class="se">\</span>
+  <span class="nv">allowed_roles</span><span class="o">=</span><span class="s2">&quot;frontend&quot;</span> <span class="se">\</span>
+  <span class="nv">connection_url</span><span class="o">=</span><span class="s2">&quot;postgresql://{{username}}:{{password}}@127.0.0.1:5432/temporal?sslmode=disable&quot;</span> <span class="se">\</span>
+  <span class="nv">username</span><span class="o">=</span><span class="s2">&quot;vault_root&quot;</span> <span class="se">\</span>
+  <span class="nv">password</span><span class="o">=</span><span class="s2">&quot;bootstrap&quot;</span>
+
+<span class="c1"># The step everyone skips. After this, &#39;bootstrap&#39; is dead.</span>
+vault write -f cell-db/rotate-root/temporal
+
+vault write cell-db/roles/frontend <span class="se">\</span>
+  <span class="nv">db_name</span><span class="o">=</span>temporal <span class="se">\</span>
+  <span class="nv">creation_statements</span><span class="o">=</span><span class="s2">&quot;CREATE ROLE \&quot;{{name}}\&quot; WITH LOGIN PASSWORD &#39;{{password}}&#39; VALID UNTIL &#39;{{expiration}}&#39;; \</span>
+<span class="s2">                       GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO \&quot;{{name}}\&quot;;&quot;</span> <span class="se">\</span>
+  <span class="nv">revocation_statements</span><span class="o">=</span><span class="s2">&quot;REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM \&quot;{{name}}\&quot;; \</span>
+<span class="s2">                         DROP ROLE IF EXISTS \&quot;{{name}}\&quot;;&quot;</span> <span class="se">\</span>
+  <span class="nv">default_ttl</span><span class="o">=</span><span class="s2">&quot;2m&quot;</span> <span class="nv">max_ttl</span><span class="o">=</span><span class="s2">&quot;6m&quot;</span>
+
+vault <span class="nb">read</span> cell-db/creds/frontend
+</code></pre></div>
+
+<p>Now watch the whole lifecycle:</p>
+<div class="codehilite"><pre><span></span><code><span class="nv">CREDS</span><span class="o">=</span><span class="k">$(</span>vault <span class="nb">read</span> -format<span class="o">=</span>json cell-db/creds/frontend<span class="k">)</span>
+<span class="nv">USER</span><span class="o">=</span><span class="k">$(</span>jq -r .data.username <span class="o">&lt;&lt;&lt;</span> <span class="s2">&quot;</span><span class="nv">$CREDS</span><span class="s2">&quot;</span><span class="k">)</span>
+<span class="nv">PASS</span><span class="o">=</span><span class="k">$(</span>jq -r .data.password <span class="o">&lt;&lt;&lt;</span> <span class="s2">&quot;</span><span class="nv">$CREDS</span><span class="s2">&quot;</span><span class="k">)</span>
+<span class="nv">LEASE</span><span class="o">=</span><span class="k">$(</span>jq -r .lease_id <span class="o">&lt;&lt;&lt;</span> <span class="s2">&quot;</span><span class="nv">$CREDS</span><span class="s2">&quot;</span><span class="k">)</span>
+
+docker <span class="nb">exec</span> -i pg psql -U postgres -c <span class="s2">&quot;\du&quot;</span> <span class="p">|</span> grep <span class="s2">&quot;</span><span class="nv">$USER</span><span class="s2">&quot;</span>
+<span class="nv">PGPASSWORD</span><span class="o">=</span><span class="nv">$PASS</span> psql -h localhost -U <span class="s2">&quot;</span><span class="nv">$USER</span><span class="s2">&quot;</span> -d temporal -c <span class="s2">&quot;SELECT count(*) FROM executions;&quot;</span>
+
+vault lease lookup <span class="s2">&quot;</span><span class="nv">$LEASE</span><span class="s2">&quot;</span>
+vault lease renew <span class="s2">&quot;</span><span class="nv">$LEASE</span><span class="s2">&quot;</span>          <span class="c1"># extends, up to max_ttl from ISSUANCE</span>
+sleep <span class="m">130</span>
+docker <span class="nb">exec</span> -i pg psql -U postgres -c <span class="s2">&quot;\du&quot;</span> <span class="p">|</span> grep <span class="s2">&quot;</span><span class="nv">$USER</span><span class="s2">&quot;</span>   <span class="c1"># gone</span>
+</code></pre></div>
+
+<p><strong>Exercises:</strong></p>
+<ol>
+<li>Renew the lease in a loop until it refuses. Note the total elapsed time equals <code>max_ttl</code> from issuance, <em>not</em> from the last renew. This is the bug that breaks apps weeks after deploy.</li>
+<li>Set a <strong>rate-limit</strong> quota and blow through it. (Lease-count quotas are Enterprise-only, so they will not work against a Community dev server — this is the Community equivalent.)</li>
+</ol>
+<div class="codehilite"><pre><span></span><code>vault write sys/quotas/rate-limit/cell-db <span class="nv">path</span><span class="o">=</span><span class="s2">&quot;cell-db/&quot;</span> <span class="nv">rate</span><span class="o">=</span><span class="m">2</span> <span class="nv">interval</span><span class="o">=</span>1s <span class="nv">block_interval</span><span class="o">=</span>60s
+<span class="k">for</span> i <span class="k">in</span> <span class="k">$(</span>seq <span class="m">1</span> <span class="m">8</span><span class="k">)</span><span class="p">;</span> <span class="k">do</span> vault <span class="nb">read</span> cell-db/creds/frontend &gt; /dev/null <span class="o">||</span> <span class="nb">echo</span> <span class="s2">&quot;blocked at </span><span class="nv">$i</span><span class="s2">&quot;</span><span class="p">;</span> <span class="k">done</span>
+</code></pre></div>
+
+<ol start="3">
+<li>Make revocation fail: create a table <em>owned by</em> a dynamic role, then let the lease expire. <code>DROP ROLE</code> fails, the lease goes irrevocable, and <code>vault list sys/leases/lookup/cell-db/creds/frontend</code> shows the corpse. Then fix it with <code>vault lease revoke -force -prefix cell-db/creds/frontend</code> and understand why <code>-force</code> is dangerous (it drops Vault's record without the database actually cleaning up).</li>
+</ol>
+<h3 id="lab-4--transit-20-minutes">Lab 4 — Transit, 20 minutes<a class="anchor" href="#lab-4--transit-20-minutes">#</a></h3>
+<div class="codehilite"><pre><span></span><code>vault secrets <span class="nb">enable</span> transit
+vault write -f transit/keys/cell-meta
+
+<span class="nv">CT</span><span class="o">=</span><span class="k">$(</span>vault write -field<span class="o">=</span>ciphertext transit/encrypt/cell-meta <span class="se">\</span>
+       <span class="nv">plaintext</span><span class="o">=</span><span class="k">$(</span><span class="nb">printf</span> <span class="s1">&#39;shard_count=512&#39;</span> <span class="p">|</span> base64<span class="k">))</span>
+<span class="nb">echo</span> <span class="s2">&quot;</span><span class="nv">$CT</span><span class="s2">&quot;</span>    <span class="c1"># vault:v1:...</span>
+
+vault write -f transit/keys/cell-meta/rotate
+vault <span class="nb">read</span> transit/keys/cell-meta      <span class="c1"># latest_version: 2</span>
+
+<span class="c1"># v1 ciphertext still decrypts</span>
+vault write -field<span class="o">=</span>plaintext transit/decrypt/cell-meta <span class="nv">ciphertext</span><span class="o">=</span><span class="s2">&quot;</span><span class="nv">$CT</span><span class="s2">&quot;</span> <span class="p">|</span> base64 -d
+
+<span class="c1"># Rewrap to v2 without ever seeing plaintext</span>
+<span class="nv">CT2</span><span class="o">=</span><span class="k">$(</span>vault write -field<span class="o">=</span>ciphertext transit/rewrap/cell-meta <span class="nv">ciphertext</span><span class="o">=</span><span class="s2">&quot;</span><span class="nv">$CT</span><span class="s2">&quot;</span><span class="k">)</span>
+<span class="nb">echo</span> <span class="s2">&quot;</span><span class="nv">$CT2</span><span class="s2">&quot;</span>   <span class="c1"># vault:v2:...</span>
+
+<span class="c1"># Now actually retire v1</span>
+vault write transit/keys/cell-meta/config <span class="nv">min_decryption_version</span><span class="o">=</span><span class="m">2</span>
+vault write transit/decrypt/cell-meta <span class="nv">ciphertext</span><span class="o">=</span><span class="s2">&quot;</span><span class="nv">$CT</span><span class="s2">&quot;</span>   <span class="c1"># fails — as intended</span>
+</code></pre></div>
+
+<p><strong>Exercise:</strong> enable a second key with <code>convergent_encryption=true derived=true</code>, encrypt the same plaintext twice with the same context, and confirm the ciphertexts are identical. Then encrypt with a different context and confirm they differ. Write down in one sentence what an attacker with read access to your database learns.</p>
+<h3 id="lab-5--wedge-the-audit-device-10-minutes">Lab 5 — Wedge the audit device, 10 minutes<a class="anchor" href="#lab-5--wedge-the-audit-device-10-minutes">#</a></h3>
+<p>The most valuable 10 minutes in this guide.</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># On the Raft cluster</span>
+docker <span class="nb">exec</span> vault0 sh -c <span class="s1">&#39;mkdir -p /vault/logs&#39;</span>
+vault audit <span class="nb">enable</span> file <span class="nv">file_path</span><span class="o">=</span>/vault/logs/audit.log
+vault kv put secret/works <span class="nv">fine</span><span class="o">=</span>yes    <span class="c1"># ok</span>
+
+<span class="c1"># Break the only audit device</span>
+docker <span class="nb">exec</span> vault0 sh -c <span class="s1">&#39;rm -rf /vault/logs&#39;</span>
+vault kv put secret/breaks <span class="nv">now</span><span class="o">=</span><span class="nb">true</span>
+<span class="c1"># =&gt; 500. Vault refuses the write because it cannot audit it.</span>
+
+<span class="c1"># Reads too:</span>
+vault kv get secret/works
+
+<span class="c1"># But these still work — they are audit-exempt:</span>
+vault status
+curl -s <span class="nv">$VAULT_ADDR</span>/v1/sys/health <span class="p">|</span> jq
+
+<span class="c1"># Recover</span>
+docker <span class="nb">exec</span> vault0 sh -c <span class="s1">&#39;mkdir -p /vault/logs&#39;</span>
+vault kv put secret/works <span class="nv">fine</span><span class="o">=</span>yes
+</code></pre></div>
+
+<p>Then do it right:</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># The parent directory must exist first -- Vault creates the log file, not the</span>
+<span class="c1"># directory, and `audit enable` fails outright if the path is not writable.</span>
+docker <span class="nb">exec</span> vault0 sh -c <span class="s1">&#39;mkdir -p /vault/logs2&#39;</span>
+vault audit <span class="nb">enable</span> -path<span class="o">=</span>file2 file <span class="nv">file_path</span><span class="o">=</span>/vault/logs2/audit.log
+vault audit list -detailed
+<span class="c1"># Break one; Vault keeps serving because one device still succeeds.</span>
+docker <span class="nb">exec</span> vault0 sh -c <span class="s1">&#39;rm -rf /vault/logs&#39;</span>
+vault kv put secret/still-works <span class="nv">yes</span><span class="o">=</span>please
+</code></pre></div>
+
+<p>Two directories in one container are not <em>independent</em> failure modes — they share a disk. The point here is only the mechanism. In a real cell, put the second device on a different backend entirely (socket or syslog), so a full disk cannot take both out at once.</p>
+<hr />
+<h2 id="production-gotchas">Production gotchas<a class="anchor" href="#production-gotchas">#</a></h2>
+<ol>
+<li>
+<p><strong>All audit devices failing makes Vault unavailable — this is documented behavior, not a bug.</strong> Vault "refuses to service the corresponding API request" if it cannot write to at least one enabled device, and "when all enabled audit devices become unavailable, Vault in effect becomes unavailable as well." Always run at least two with independent failure modes. Source: <a href="https://developer.hashicorp.com/vault/docs/audit#availability-of-audit-devices">Audit devices — Availability</a> and the <a href="https://developer.hashicorp.com/vault/tutorials/monitoring/blocked-audit-devices">recover blocked audit devices</a> tutorial.</p>
+</li>
+<li>
+<p><strong><code>default_lease_ttl</code> and <code>max_lease_ttl</code> default to 768h (32 days).</strong> Leave them alone and your lease table grows for a month before anything expires. Set them to hours at the server level and tune upward per mount. Source: <a href="https://developer.hashicorp.com/vault/docs/configuration">Vault configuration parameters</a>.</p>
+</li>
+<li>
+<p><strong><code>max_ttl</code> is measured from issuance, not from the last renewal.</strong> An application that only implements renew will fail exactly once per <code>max_ttl</code> window, usually long after deploy, usually at 3am. Implement re-fetch. Source: <a href="https://developer.hashicorp.com/vault/docs/troubleshoot/tune-lease-ttl">Tune the lease TTL</a>.</p>
+</li>
+<li>
+<p><strong>KV v2 policy paths need <code>data/</code> but the CLI hides it.</strong> <code>vault kv get secret/foo</code> works while <code>path "secret/foo"</code> in a policy does not — you need <code>path "secret/data/foo"</code>. Metadata operations need <code>secret/metadata/foo</code> separately. Source: <a href="https://developer.hashicorp.com/vault/docs/secrets/kv/kv-v2">KV v2 docs</a>.</p>
+</li>
+<li>
+<p><strong>Since Vault 2.0.1, wildcards and globs in <em>rendered</em> identity-template output are rejected with permission denied.</strong> If a service account annotation or entity metadata value can contain <code>*</code> or <code>+</code>, policies that used to work now fail closed. OpenBao shipped the same fix as <a href="https://openbao.org/community/release-notes/2-6-0/">GHSA-59w7-v8rr-pr4p</a> with explicit opt-out flags. Source: <a href="https://developer.hashicorp.com/vault/docs/updates/release-notes#vault-2-0-1">Vault 2.0.1 release notes</a>.</p>
+</li>
+<li>
+<p><strong>Kubernetes 1.21+ requires <code>disable_iss_validation=true</code>, and mounts created before Vault 1.9 keep the old default.</strong> The Kubernetes API already validates the issuer during <code>TokenReview</code>; Vault doing it again breaks on cluster-specific issuers. Check with <code>vault read -field=disable_iss_validation auth/kubernetes/config</code> on every existing mount, not just new ones. Source: <a href="https://developer.hashicorp.com/vault/docs/auth/kubernetes#kubernetes-1-21">Kubernetes auth — Kubernetes 1.21</a>.</p>
+</li>
+<li>
+<p><strong>A short-lived <code>token_reviewer_jwt</code> silently expires and takes down all Kubernetes auth.</strong> If Vault runs in the cluster, omit <code>token_reviewer_jwt</code> and <code>kubernetes_ca_cert</code> entirely so Vault re-reads its own projected token from disk — but this requires <strong>Vault 1.9.3+</strong>; earlier versions read it once and cache it. Source: <a href="https://developer.hashicorp.com/vault/docs/auth/kubernetes#how-to-work-with-short-lived-kubernetes-tokens">How to work with short-lived Kubernetes tokens</a>.</p>
+</li>
+<li>
+<p><strong>Kubernetes extends admission-injected service account token lifetimes to one year by default.</strong> You think you have short-lived tokens; you do not. Set <code>--service-account-extend-token-expiration=false</code> on kube-apiserver or mount your own <code>serviceAccountToken</code> projected volume with an explicit expiry. Source: same as above.</p>
+</li>
+<li>
+<p><strong>Autopilot dead-server cleanup is off by default.</strong> An autoscaler that replaces a node leaves a phantom voter counted in quorum math, so a "3-node" cluster silently becomes a 4-peer cluster that still only tolerates one failure. Enable it explicitly with <code>vault operator raft autopilot set-config -cleanup-dead-servers=true -min-quorum=3</code> — <code>min-quorum</code> has no default and cleanup stays inert without it. Source: <a href="https://developer.hashicorp.com/vault/docs/concepts/integrated-storage/autopilot">Integrated Storage autopilot</a>.</p>
+</li>
+<li>
+<p><strong>Raft snapshots are barrier-encrypted, so they are not portable across seals.</strong> Restoring a snapshot into a new cluster requires the original seal to be reachable. Plan seal migration <em>before</em> you need the restore, and test it. Source: <a href="https://developer.hashicorp.com/vault/docs/internals/integrated-storage">Integrated Storage internals</a>.</p>
+</li>
+<li>
+<p><strong>Auto-unseal turns your cloud KMS into a hard startup dependency, including its network path.</strong> No VPC endpoint / Private Service Connect / Private Link means no unseal. A running Vault survives a KMS outage (the root key is in memory); a restarted one does not. This is why the failure always presents as "everything was fine until the rolling restart."</p>
+</li>
+<li>
+<p><strong>Deleting the KMS key is fatal, but there is a grace window.</strong> AWS KMS enforces a 7–30 day pending-deletion period — cancel it. Add a key policy that denies <code>kms:ScheduleKeyDeletion</code> to everyone except a break-glass principal. Source: <a href="https://developer.hashicorp.com/vault/docs/configuration/seal/awskms">AWS KMS seal</a>.</p>
+</li>
+<li>
+<p><strong>Recovery keys are not unseal keys.</strong> With auto-unseal, <code>vault operator init</code> emits recovery keys. They cannot unseal Vault. They authorize <code>generate-root</code>, rekey, and seal migration. Losing them is not fatal but is permanent: you can never mint another root token on that cluster. Source: <a href="https://developer.hashicorp.com/vault/docs/concepts/seal">Seal/unseal concepts</a>.</p>
+</li>
+<li>
+<p><strong><code>vault operator rotate</code> and <code>vault operator rekey</code> are different operations.</strong> Rotate changes the encryption key (online, cheap, do it regularly). Rekey changes the unseal/recovery shares (a ceremony requiring the current threshold). People say "rotate the unseal keys" and then run the wrong command.</p>
+</li>
+<li>
+<p><strong>Dynamic database credentials create real database users, subject to real database limits.</strong> A 5-minute TTL across hundreds of pods means constant <code>CREATE ROLE</code>/<code>DROP ROLE</code> churn and a live user count of roughly <code>pods × (max_ttl / ttl)</code>. Watch <code>max_connections</code> and role-table bloat.</p>
+</li>
+<li>
+<p><strong><code>DROP ROLE</code> fails if the role owns objects, and the lease becomes irrevocable.</strong> Watch <code>vault.expire.num_irrevocable_leases</code>. Write <code>revocation_statements</code> that <code>REASSIGN OWNED BY</code> and <code>DROP OWNED BY</code> before dropping, or ensure dynamic roles never own anything.</p>
+</li>
+<li>
+<p><strong>AWS <code>iam_user</code> credential type hits IAM eventual consistency and a per-account user quota.</strong> Newly created access keys are frequently rejected for a few seconds. Prefer <code>credential_type=assumed_role</code>, which uses STS and avoids both problems. Source: <a href="https://developer.hashicorp.com/vault/docs/secrets/aws">AWS secrets engine</a>.</p>
+</li>
+<li>
+<p><strong>Vault 2.0.0 added <code>max_token_header_size</code> on the TCP listener, defaulting to 8 KB.</strong> Opaque Vault tokens are fine; Enterprise JWT/OIDC tokens with large <code>authorization_details</code> claims can exceed it and get rejected at the listener with a confusing error. Raise it proactively if you use them. Source: <a href="https://developer.hashicorp.com/vault/docs/updates/release-notes#vault-2-0-0">Vault 2.0.0 release notes</a>.</p>
+</li>
+<li>
+<p><strong>Vault 2.0.2 removed <code>IPC_LOCK</code> from the official container images.</strong> If your deployment relied on <code>mlock</code> being available in-container, behavior changed. Most Kubernetes deployments set <code>disable_mlock = true</code> anyway, but check. Source: <a href="https://developer.hashicorp.com/vault/docs/updates/important-changes#ipc_lock-removed">Important changes</a>.</p>
+</li>
+<li>
+<p><strong>Terraform's Vault provider writes every secret it touches into state in plaintext, forever, including in old state versions.</strong> Use the provider for configuration only. If you must read a secret, encrypt state with a CMK, lock down the backend, and apply a lifecycle policy to historical versions. Source: <a href="https://registry.terraform.io/providers/hashicorp/vault/latest/docs">Vault provider docs</a>.</p>
+</li>
+<li>
+<p><strong><code>terraform destroy</code> on a Vault mount revokes leases asynchronously.</strong> If the backing database is destroyed in the same apply, revocation fails and irrevocable leases accumulate. Order cell teardown explicitly: revoke → delete mount → delete database.</p>
+</li>
+<li>
+<p><strong>The Vault Agent Injector fights GitOps drift detection.</strong> It mutates pods at admission, so the rendered manifest never matches the running pod. Argo CD and Flux will show permanent drift or need explicit ignore rules. Prefer Vault Secrets Operator or External Secrets Operator for rendered-manifest workflows.</p>
+</li>
+<li>
+<p><strong>Vault Community's support window is exactly one minor release — the latest.</strong> A version goes EOL the day its successor ships; the two-release overlap applies only to Enterprise LTS. <a href="https://endoflife.date/hashicorp-vault">Vault 1.21 went EOL on 2026-04-13</a> when 2.0 shipped. A fleet of per-cell Vaults on different versions will silently accumulate unsupported clusters unless upgrade rollout is part of the cell lifecycle, not a side project.</p>
+</li>
+<li>
+<p><strong>Logrotate with <code>copytruncate</code> breaks the file audit device.</strong> Vault holds the file descriptor; moving or truncating the file underneath it means audit records go into a hole. Use the device's reload path or <code>SIGHUP</code>, and verify by tailing after a rotation.</p>
+</li>
+<li>
+<p><strong>BUSL 1.1 is not open source and the "competing hosted service" clause is not decorative</strong> for a company that sells hosted Temporal. Vault has shipped under BUSL since August 2023, and HashiCorp is now part of IBM. Get an actual legal read rather than inheriting an assumption. Source: <a href="https://newsroom.ibm.com/2025-02-27-ibm-completes-acquisition-of-hashicorp,-creates-comprehensive,-end-to-end-hybrid-cloud-platform">IBM completes acquisition of HashiCorp</a>.</p>
+</li>
+</ol>
+<hr />
+<h2 id="how-this-shows-up-in-cell-lifecycle">How this shows up in cell lifecycle<a class="anchor" href="#how-this-shows-up-in-cell-lifecycle">#</a></h2>
+<p><strong>Provisioning.</strong> The dependency order is rigid and the whole cell blocks on it:</p>
+<ol>
+<li>Create the cloud KMS key (and its deletion protections) and the network path to the KMS endpoint. If the networking team owns the endpoint, this is a cross-team handoff on the critical path.</li>
+<li>Create the Vault node identity — IRSA role / GCP Workload Identity binding / Azure managed identity — with <code>Decrypt</code> and <code>Encrypt</code> on that key and nothing else.</li>
+<li>Start Vault with the <code>seal</code> stanza. Confirm it auto-unseals. If it does not, you have a networking or IAM problem, not a Vault problem — check in that order.</li>
+<li><code>vault operator init</code> with recovery shares. <strong>Immediately</strong> encrypt the recovery keys to escrow and revoke the initial root token. Never let them touch CI logs or Terraform state.</li>
+<li>Apply the cell's Vault configuration with Terraform: mounts, auth methods, roles, policies. Configuration only — no secret values cross the Terraform boundary.</li>
+<li>Configure the database engine and <code>rotate-root</code> so the bootstrap password in your pipeline is dead before the pipeline exits.</li>
+<li>Enable <strong>two</strong> audit devices before any workload authenticates.</li>
+<li>Register the cluster with monitoring; verify <code>vault.core.unsealed</code> is reporting before declaring the cell ready.</li>
+</ol>
+<p><strong>Steady state.</strong> Dynamic credentials mean the cell has no long-lived secrets to rotate — which is the point, and the thing to protect. The recurring work is lease hygiene (quotas, TTL audits, watching <code>num_irrevocable_leases</code>), snapshot verification (a restore drill per quarter, not just a backup job), and upgrade rollout across N cells on a cadence that stays inside the support window.</p>
+<p><strong>Upgrading a cell.</strong> Vault upgrade is part of the cell upgrade, and it is the piece that can strand the cell. Standbys first, <code>step-down</code> last, one node at a time, waiting for Raft catch-up. Read <a href="https://developer.hashicorp.com/vault/docs/updates/important-changes">Important changes</a> first — the last three releases alone changed container capabilities, added a token header size limit, and hardened identity templates. Any of those can break a cell that was working.</p>
+<p><strong>Scaling.</strong> Vault does not scale writes by adding nodes. If a cell's Vault is write-bound, the cause is almost always lease churn or an auth loop, not capacity. Fix the workload before adding hardware. Reads scale via performance standbys (Enterprise) or OpenBao's read-serving standbys.</p>
+<p><strong>Teardown.</strong> The step people skip, and it leaves debris in three places. Revoke leases first (<code>vault lease revoke -prefix</code> per mount) so external systems — databases, cloud IAM — actually clean up. Then delete mounts, auth roles, and policies. Then destroy the Vault. Then, and only then, schedule deletion of the KMS key, and remember it has a pending-deletion window during which the cell could still be resurrected. A cell whose Vault was destroyed before its leases were revoked leaves orphaned IAM users and database roles that nobody will ever find.</p>
+<p><strong>Cross-cloud.</strong> The seal stanza is the only genuinely cloud-specific part of a cell's Vault config; everything above it is portable. That is an argument for keeping the rest of your Vault configuration cloud-agnostic and templating only the seal — one Terraform module, three seal variants.</p>
+<hr />
+<h2 id="learning-path">Learning path<a class="anchor" href="#learning-path">#</a></h2>
+<h3 id="day-1-34-hours">Day 1 (3–4 hours)<a class="anchor" href="#day-1-34-hours">#</a></h3>
+<ul>
+<li>Read <a href="https://developer.hashicorp.com/vault/docs/what-is-vault">What is Vault</a>, <a href="https://developer.hashicorp.com/vault/docs/concepts/seal">Seal/Unseal</a>, <a href="https://developer.hashicorp.com/vault/docs/concepts/policies">Policies</a>, and <a href="https://developer.hashicorp.com/vault/docs/concepts/lease">Leases</a>. That is the whole conceptual core.</li>
+<li>Run <strong>Lab 0</strong>. Specifically, hit the KV v2 <code>data/</code> path gotcha with <code>curl</code> so it lands physically rather than as trivia.</li>
+<li>Run <strong>Lab 5</strong> (audit wedge). Ten minutes, and it inoculates you against the most embarrassing Vault outage.</li>
+<li>Be able to explain, out loud: barrier vs root key vs encryption key vs unseal share; why Vault fails closed; why adding nodes does not add write throughput.</li>
+</ul>
+<h3 id="week-1-1015-hours">Week 1 (10–15 hours)<a class="anchor" href="#week-1-1015-hours">#</a></h3>
+<ul>
+<li>Run <strong>Labs 1–4</strong> end to end. Do the "break it" exercises; they are where the learning is.</li>
+<li>Read the <a href="https://developer.hashicorp.com/vault/docs/auth/kubernetes">Kubernetes auth docs</a> in full, including the short-lived-token comparison table. Then read the <a href="https://developer.hashicorp.com/vault/docs/auth/jwt/oidc-providers/kubernetes">JWT/OIDC with Kubernetes</a> page and form an opinion about which one a central Vault should use.</li>
+<li>Read the <a href="https://developer.hashicorp.com/vault/tutorials/day-one-raft/raft-reference-architecture">Raft reference architecture</a> and the <a href="https://developer.hashicorp.com/vault/docs/concepts/integrated-storage/autopilot">autopilot docs</a>.</li>
+<li>Write a Terraform module that configures one cell's Vault: mount, database engine, role, policy, Kubernetes auth role. Apply it twice with different <code>cell_id</code> values. Confirm nothing secret is in state (<code>terraform show -json | jq</code> and grep).</li>
+<li>Read the <a href="https://developer.hashicorp.com/vault/docs/updates/release-notes">Vault 2.x release notes</a> and <a href="https://developer.hashicorp.com/vault/docs/updates/important-changes">Important changes</a> cover to cover. This is the single highest-value hour for someone joining a team that already runs Vault.</li>
+</ul>
+<h3 id="month-1-ongoing">Month 1 (ongoing)<a class="anchor" href="#month-1-ongoing">#</a></h3>
+<ul>
+<li><strong>Write the runbooks and then drill them.</strong> Quorum loss. Lost recovery keys. KMS unavailable. Audit wedge. Lease explosion. Each one should be a page with commands, and each should be executed against a scratch cell at least once.</li>
+<li>Build the <strong>cell teardown</strong> path and verify it leaves nothing behind: query the database for orphaned roles and IAM for orphaned users after a teardown.</li>
+<li>Instrument the metrics table above and set thresholds. Alert on <code>vault.expire.num_leases</code> with an absolute number derived from your own lab measurements, not a guess.</li>
+<li>Do a <strong>seal migration</strong> in the lab: Shamir → auto-unseal, and auto-unseal → a different KMS key. You will need this eventually and you do not want the first attempt to be an incident.</li>
+<li>Evaluate <strong>OpenBao</strong> seriously against your topology. The specific questions: does Community namespaces change your cell-local-vs-central decision? Does namespace sealing map onto per-tenant isolation? Does declarative self-initialization simplify unattended cell bootstrap? Does MPL 2.0 remove a legal question you currently have?</li>
+<li>Read the <a href="https://developer.hashicorp.com/vault/docs/internals/security">security model</a> and <a href="https://developer.hashicorp.com/vault/docs/internals/security#threat-model">threat model</a> and write down, for your architecture, what Vault does <em>not</em> protect against. Most teams cannot answer this and should be able to.</li>
+</ul>
+<hr />
+<h2 id="references">References<a class="anchor" href="#references">#</a></h2>
+<ol>
+<li><a href="https://developer.hashicorp.com/vault/docs/what-is-vault">What is Vault? — HashiCorp Developer</a> — the orientation page; read it once and never again.</li>
+<li><a href="https://developer.hashicorp.com/vault/docs/internals/security">Vault security model — HashiCorp Developer</a> — states explicitly that the storage backend is untrusted; the basis for every architectural argument in this guide.</li>
+<li><a href="https://developer.hashicorp.com/vault/docs/concepts/seal">Seal/Unseal concepts — HashiCorp Developer</a> — barrier, root key, encryption key, unseal shares, recovery keys.</li>
+<li><a href="https://developer.hashicorp.com/vault/docs/configuration/seal/awskms">AWS KMS seal configuration — HashiCorp Developer</a> — the auto-unseal stanza and its IAM requirements.</li>
+<li><a href="https://developer.hashicorp.com/vault/docs/configuration/seal/gcpckms">GCP Cloud KMS seal configuration — HashiCorp Developer</a> — GCP equivalent.</li>
+<li><a href="https://developer.hashicorp.com/vault/docs/configuration/seal/azurekeyvault">Azure Key Vault seal configuration — HashiCorp Developer</a> — Azure equivalent; prefer managed identity.</li>
+<li><a href="https://developer.hashicorp.com/vault/docs/enterprise/sealwrap">Seal wrap — HashiCorp Developer</a> — extra wrapping for sensitive mounts (Enterprise/HSM).</li>
+<li><a href="https://developer.hashicorp.com/vault/docs/internals/integrated-storage">Integrated Storage internals — HashiCorp Developer</a> — Raft inside Vault, snapshots, peer recovery.</li>
+<li><a href="https://developer.hashicorp.com/vault/tutorials/day-one-raft/raft-reference-architecture">Vault with Integrated Storage reference architecture — HashiCorp Developer</a> — the 3-or-5-node recommendation and network layout.</li>
+<li><a href="https://developer.hashicorp.com/vault/docs/concepts/integrated-storage/autopilot">Integrated Storage autopilot — HashiCorp Developer</a> — voter promotion, stability thresholds, and the dead-server-cleanup default.</li>
+<li><a href="https://developer.hashicorp.com/vault/docs/configuration">Vault configuration parameters — HashiCorp Developer</a> — where <code>default_lease_ttl = 768h</code> and the listener options live.</li>
+<li><a href="https://developer.hashicorp.com/vault/docs/troubleshoot/tune-lease-ttl">Tune the lease TTL — HashiCorp Developer</a> — TTL vs max-TTL semantics and mount tuning.</li>
+<li><a href="https://developer.hashicorp.com/vault/docs/concepts/lease">Lease, renew, and revoke — HashiCorp Developer</a> — the lease lifecycle that drives Vault's write load.</li>
+<li><a href="https://developer.hashicorp.com/vault/docs/concepts/policies">Policies — HashiCorp Developer</a> — HCL syntax, capabilities, <code>*</code> vs <code>+</code>, templated policies.</li>
+<li><a href="https://developer.hashicorp.com/vault/docs/auth/kubernetes">Kubernetes auth method — HashiCorp Developer</a> — <code>TokenReview</code> flow, the 1.21 changes, and the short-lived reviewer JWT comparison table. The most important auth page for cell infrastructure.</li>
+<li><a href="https://developer.hashicorp.com/vault/docs/auth/jwt/oidc-providers/kubernetes">JWT/OIDC with Kubernetes as OIDC provider — HashiCorp Developer</a> — the reviewer-free alternative for a Vault outside the cluster.</li>
+<li><a href="https://developer.hashicorp.com/vault/docs/auth/aws">AWS auth method — HashiCorp Developer</a> — the signed-<code>GetCallerIdentity</code> verification trick.</li>
+<li><a href="https://developer.hashicorp.com/vault/docs/auth/approle">AppRole auth method — HashiCorp Developer</a> — RoleID/SecretID and why response wrapping is mandatory.</li>
+<li><a href="https://developer.hashicorp.com/vault/docs/concepts/response-wrapping">Response wrapping — HashiCorp Developer</a> — single-use tokens for handing off secret zero.</li>
+<li><a href="https://developer.hashicorp.com/vault/docs/secrets/kv/kv-v2">KV v2 secrets engine — HashiCorp Developer</a> — the <code>data/</code> path, versioning, CAS.</li>
+<li><a href="https://developer.hashicorp.com/vault/docs/secrets/transit">Transit secrets engine — HashiCorp Developer</a> — encryption as a service, rotation, convergent encryption.</li>
+<li><a href="https://developer.hashicorp.com/vault/docs/secrets/transit/envelope-encryption">Transit envelope encryption — HashiCorp Developer</a> — new in Vault 2.0; local encryption with Vault-protected DEKs.</li>
+<li><a href="https://developer.hashicorp.com/vault/docs/secrets/databases">Database secrets engine — HashiCorp Developer</a> — dynamic credentials, <code>rotate-root</code>, static roles.</li>
+<li><a href="https://developer.hashicorp.com/vault/docs/secrets/databases/postgresql">PostgreSQL database plugin — HashiCorp Developer</a> — creation/revocation statement templating.</li>
+<li><a href="https://developer.hashicorp.com/vault/docs/secrets/aws">AWS secrets engine — HashiCorp Developer</a> — <code>iam_user</code> vs <code>assumed_role</code> and the eventual-consistency trap.</li>
+<li><a href="https://developer.hashicorp.com/vault/docs/secrets/pki">PKI secrets engine — HashiCorp Developer</a> — the issuing CA behind cert-manager; see <a href="11-cert-manager-and-pki.html">11-cert-manager-and-pki.md</a>.</li>
+<li><a href="https://developer.hashicorp.com/vault/docs/secrets/pki-external-ca">Public CA integration — HashiCorp Developer</a> — Vault 2.0 feature for fronting a public CA.</li>
+<li><a href="https://developer.hashicorp.com/vault/docs/secrets/ssh">SSH secrets engine — HashiCorp Developer</a> — CA-signed SSH certs; replaces <code>authorized_keys</code> distribution.</li>
+<li><a href="https://developer.hashicorp.com/vault/docs/audit">Audit devices — HashiCorp Developer</a> — the "Vault refuses to service the request" behavior and the audit-exempt endpoint list. Read the availability section twice.</li>
+<li><a href="https://developer.hashicorp.com/vault/tutorials/monitoring/blocked-audit-devices">Recover blocked audit devices — HashiCorp Developer</a> — the runbook for the outage in gotcha #1.</li>
+<li><a href="https://developer.hashicorp.com/vault/docs/audit/best-practices">Audit best practices — HashiCorp Developer</a> — two-device recommendation and sizing guidance.</li>
+<li><a href="https://developer.hashicorp.com/vault/docs/enterprise/lease-count-quotas">Resource quotas — HashiCorp Developer</a> — lease-count and rate-limit quotas, the defense against lease explosion.</li>
+<li><a href="https://developer.hashicorp.com/vault/docs/internals/telemetry">Telemetry — HashiCorp Developer</a> — the full metric catalog behind the alerting table.</li>
+<li><a href="https://developer.hashicorp.com/vault/docs/updates/release-notes">Vault 2.x release notes — HashiCorp Developer</a> — 2.0.0 GA 2026-04-14 through 2.0.4 on 2026-08-04; source for the templated-policy wildcard change and <code>max_token_header_size</code>.</li>
+<li><a href="https://developer.hashicorp.com/vault/docs/updates/important-changes">Vault important changes — HashiCorp Developer</a> — read before every upgrade; source for the <code>IPC_LOCK</code> removal.</li>
+<li><a href="https://endoflife.date/hashicorp-vault">HashiCorp Vault end-of-life dates — endoflife.date</a> — machine-readable support windows; 1.21 EOL 2026-04-13.</li>
+<li><a href="https://developer.hashicorp.com/vault/docs/upgrading">Vault upgrade procedure — HashiCorp Developer</a> — standbys first, <code>step-down</code> last.</li>
+<li><a href="https://newsroom.ibm.com/2025-02-27-ibm-completes-acquisition-of-hashicorp,-creates-comprehensive,-end-to-end-hybrid-cloud-platform">IBM completes acquisition of HashiCorp — IBM Newsroom</a> — primary source for the February 2025 close.</li>
+<li><a href="https://openbao.org/community/release-notes/2-6-0/">OpenBao 2.6.x release notes — OpenBao</a> — namespace sealing, pluggable auto-unseal, workflows, and the 2.7.0 deprecations. Primary source for the fork's current state.</li>
+<li><a href="https://openbao.org/community/release-notes/2-5-0/">OpenBao 2.5.x release notes — OpenBao</a> — horizontal read scalability on standby nodes.</li>
+<li><a href="https://openbao.org/">OpenBao project home — OpenBao</a> — MPL 2.0, Linux Foundation, OpenSSF Sandbox governance.</li>
+<li><a href="https://registry.terraform.io/providers/hashicorp/vault/latest/docs">Vault Terraform provider — Terraform Registry</a> — the provider's own warning about secrets in state.</li>
+<li><a href="https://developer.hashicorp.com/vault/docs/deploy/kubernetes/vso">Vault Secrets Operator — HashiCorp Developer</a> — CRD-driven sync with <code>rolloutRestartTargets</code>; the GitOps-friendly option.</li>
+<li><a href="https://developer.hashicorp.com/vault/docs/deploy/kubernetes/injector">Vault Agent Injector — HashiCorp Developer</a> — sidecar model; keeps secrets out of etcd at the cost of admission-time mutation.</li>
+<li><a href="https://secrets-store-csi-driver.sigs.k8s.io/">Secrets Store CSI Driver — Kubernetes SIG-Auth</a> — file-mounted secrets, multi-provider.</li>
+<li><a href="https://external-secrets.io/latest/">External Secrets Operator</a> — CNCF operator speaking to Vault plus every major cloud secret store; the strongest fit for a three-cloud footprint.</li>
+<li><a href="https://github.com/hashicorp/vault-helm">Vault Helm chart — GitHub</a> — used in Lab 2; read <code>values.yaml</code> before trusting any blog post about it.</li>
+</ol><p class="disclaimer"><strong>Disclaimer.</strong> I wrote this library before I joined Temporal, to ramp up on the areas my new role would likely touch. It contains no internal information &mdash; nothing here was sourced from Temporal&rsquo;s internal knowledge. Temporal is open source, so the programming model and server internals come from public code and documentation, and every statement about Temporal Cloud comes from Temporal&rsquo;s public docs and engineering blog, linked inline. Most of the library is general infrastructure technology &mdash; Go, gRPC, Kubernetes, Karpenter, Terraform, Helm, Vault, cert-manager, GitOps, observability &mdash; that has nothing to do with any one company. Where a guide goes beyond public sources, it says so and labels the claim as inference.</p></article><aside class="rail"><div class="rail-label">On this page</div><a href="#the-mental-model">The mental model</a><a href="#core-concepts">Core concepts</a><a class="h3" href="#the-barrier-seal-and-unseal">The barrier, seal, and unseal</a><a class="h3" href="#auto-unseal-with-cloud-kms--and-the-bootstrap-dependency-it-creates">Auto-unseal with cloud KMS — and the bootstrap dependency it creates</a><a class="h3" href="#storage-backends-integrated-storage-raft-vs-consul">Storage backends: Integrated Storage (Raft) vs Consul</a><a class="h3" href="#ha-standbys-performance-standbys-replication-dr">HA, standbys, performance standbys, replication, DR</a><a class="h3" href="#cell-local-vault-vs-central-vault--an-honest-recommendation">Cell-local Vault vs central Vault — an honest recommendation</a><a class="h3" href="#auth-methods-and-the-secret-zero-problem">Auth methods and the secret-zero problem</a><a class="h3" href="#policies">Policies</a><a class="h3" href="#namespaces-enterprise-vs-path-prefix-multi-tenancy">Namespaces (Enterprise) vs path-prefix multi-tenancy</a><a class="h3" href="#secrets-engines">Secrets engines</a><a class="h3" href="#leases-renewal-revocation-and-the-lease-count-explosion">Leases, renewal, revocation, and the lease-count explosion</a><a class="h3" href="#kubernetes-integration--four-options">Kubernetes integration — four options</a><a class="h3" href="#operations">Operations</a><a class="h3" href="#disaster-scenarios">Disaster scenarios</a><a class="h3" href="#the-busl-license-change-and-openbao">The BUSL license change and OpenBao</a><a class="h3" href="#terraforms-vault-provider-and-the-state-problem">Terraform&#x27;s Vault provider and the state problem</a><a href="#hands-on">Hands-on</a><a class="h3" href="#lab-0--dev-server-10-minutes">Lab 0 — Dev server, 10 minutes</a><a class="h3" href="#lab-1--a-real-3-node-raft-cluster-in-docker-45-minutes">Lab 1 — A real 3-node Raft cluster in Docker, 45 minutes</a><a class="h3" href="#lab-2--kubernetes-auth-on-kind-45-minutes">Lab 2 — Kubernetes auth on kind, 45 minutes</a><a class="h3" href="#lab-3--dynamic-postgres-credentials-45-minutes">Lab 3 — Dynamic Postgres credentials, 45 minutes</a><a class="h3" href="#lab-4--transit-20-minutes">Lab 4 — Transit, 20 minutes</a><a class="h3" href="#lab-5--wedge-the-audit-device-10-minutes">Lab 5 — Wedge the audit device, 10 minutes</a><a href="#production-gotchas">Production gotchas</a><a href="#how-this-shows-up-in-cell-lifecycle">How this shows up in cell lifecycle</a><a href="#learning-path">Learning path</a><a class="h3" href="#day-1-34-hours">Day 1 (3–4 hours)</a><a class="h3" href="#week-1-1015-hours">Week 1 (10–15 hours)</a><a class="h3" href="#month-1-ongoing">Month 1 (ongoing)</a><a href="#references">References</a></aside></div></div><script>
+document.querySelectorAll('.codehilite').forEach(function(block){
+  var wrap=document.createElement('div'); wrap.className='codewrap';
+  block.parentNode.insertBefore(wrap,block); wrap.appendChild(block);
+  var b=document.createElement('button'); b.className='copybtn'; b.textContent='copy';
+  b.addEventListener('click',function(){
+    var txt=block.innerText;
+    if(navigator.clipboard&&navigator.clipboard.writeText){
+      navigator.clipboard.writeText(txt).then(function(){
+        b.textContent='copied'; setTimeout(function(){b.textContent='copy';},1200);
+      }).catch(function(){b.textContent='select manually';});
+    } else {
+      var ta=document.createElement('textarea'); ta.value=txt; document.body.appendChild(ta);
+      ta.select(); try{document.execCommand('copy'); b.textContent='copied';}catch(e){}
+      document.body.removeChild(ta); setTimeout(function(){b.textContent='copy';},1200);
+    }
+  });
+  wrap.appendChild(b);
+});
+
+document.querySelectorAll('.doc table').forEach(function(t){
+  if(t.parentNode.classList.contains('tablewrap'))return;
+  var w=document.createElement('div'); w.className='tablewrap';
+  t.parentNode.insertBefore(w,t); w.appendChild(t);
+});
+
+(function(){
+  var links=Array.prototype.slice.call(document.querySelectorAll('.rail a'));
+  if(!links.length)return;
+  var map={};
+  links.forEach(function(a){
+    var el=document.getElementById(a.getAttribute('href').slice(1));
+    if(el)map[a.getAttribute('href').slice(1)]=a;
+  });
+  var obs=new IntersectionObserver(function(entries){
+    entries.forEach(function(e){
+      var a=map[e.target.id]; if(!a)return;
+      if(e.isIntersecting){
+        links.forEach(function(x){x.classList.remove('here');});
+        a.classList.add('here');
+      }
+    });
+  },{rootMargin:'0px 0px -78% 0px',threshold:0});
+  Object.keys(map).forEach(function(id){
+    var el=document.getElementById(id); if(el)obs.observe(el);
+  });
+})();
+</script>
+<script>/* open external links in a new tab; links within the library stay in this tab */
+document.addEventListener('click',function(e){var a=e.target.closest&&e.target.closest('a[href]');if(!a)return;var h=a.getAttribute('href');if(!h||h.charAt(0)==='#'||h.indexOf('javascript:')===0||a.hasAttribute('download'))return;if(!/^https?:$/.test(a.protocol)||a.host===location.host)return;a.target='_blank';a.rel='noopener';},true);
+</script>
+</body>
+</html>

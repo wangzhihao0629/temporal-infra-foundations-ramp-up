@@ -1,0 +1,912 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Cell-Based Architecture — The Pattern Temporal Cloud Is Built On - Temporal Cloud Infrastructure Ramp-Up</title>
+<link rel="stylesheet" href="style.css">
+<script>
+(function(){
+  try{
+    var t=localStorage.getItem('rampup-theme');
+    if(t){document.documentElement.setAttribute('data-theme',t);}
+  }catch(e){}
+  window.__toggleTheme=function(){
+    var el=document.documentElement;
+    var cur=el.getAttribute('data-theme');
+    if(!cur){
+      cur=window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';
+    }
+    var next=cur==='dark'?'light':'dark';
+    el.setAttribute('data-theme',next);
+    try{localStorage.setItem('rampup-theme',next);}catch(e){}
+  };
+})();
+</script>
+
+</head>
+<body>
+<div class="shell"><aside class="sidebar">
+  <div class="brand"><a href="../index.html">
+    <div class="brand-title">Temporal Cloud Infrastructure Ramp-Up</div>
+    <div class="brand-sub">New-role ramp-up &middot; public sources only</div>
+  </a></div>
+  <div class="nav-label">Guides</div>
+  <nav class="nav"><a href="01-golang.html"><span class="num">01</span><span>Go</span></a><a href="02-grpc.html"><span class="num">02</span><span>gRPC &amp; Protobuf</span></a><a href="03-multicloud-aws-gcp-azure.html"><span class="num">03</span><span>Multi-Cloud</span></a><a href="04-managed-kubernetes-eks-gke-aks.html"><span class="num">04</span><span>Managed Kubernetes</span></a><a href="05-cni-and-host-networking.html"><span class="num">05</span><span>CNI &amp; Host Networking</span></a><a href="06-karpenter.html"><span class="num">06</span><span>Karpenter</span></a><a href="07-kyverno.html"><span class="num">07</span><span>Kyverno</span></a><a href="08-terraform.html"><span class="num">08</span><span>Terraform</span></a><a href="09-helm.html"><span class="num">09</span><span>Helm</span></a><a href="10-vault.html"><span class="num">10</span><span>Vault</span></a><a href="11-cert-manager-and-pki.html"><span class="num">11</span><span>cert-manager &amp; PKI</span></a><a href="12-cell-lifecycle-synthesis.html"><span class="num">12</span><span>Cell Lifecycle</span></a><a href="13-gitops-argocd-flux.html"><span class="num">13</span><span>GitOps</span></a><a href="14-observability-for-cells.html"><span class="num">14</span><span>Observability</span></a><a href="15-temporal-programming-model.html"><span class="num">15</span><span>Temporal: Programming Model</span></a><a href="16-temporal-server-internals.html"><span class="num">16</span><span>Temporal Server Internals</span></a><a href="17-cell-based-architecture.html" class="active"><span class="num">17</span><span>Cell-Based Architecture</span></a></nav>
+  <div class="nav-label" style="margin-top:1rem">Practice</div>
+  <nav class="nav"><a href="../drill.html"><span class="num">&#9670;</span><span>Drill deck</span></a></nav>
+</aside><div class="main"><article class="doc"><div class="topbar">
+  <div class="crumbs"><span class="pill">Guide 17</span><span class="pill">28 refs</span><span class="pill">9,590 words</span></div>
+  <div style="display:flex;gap:.5rem;align-items:center">
+    <span>~48 min read</span>
+    <button class="iconbtn" onclick="__toggleTheme()">theme</button>
+  </div>
+</div><h1>Cell-Based Architecture — The Pattern Temporal Cloud Is Built On</h1>
+<div class="lede"><p><strong>Why this matters.</strong> Temporal Cloud is not one big Temporal cluster. It is many complete, independent copies of Temporal — <em>cells</em> — with a thin layer in front that sends each Namespace to exactly one of them, and a control plane beside them that creates, fills, moves, and deletes them. Temporal says so in its own docs: "Temporal Cloud uses a cell-based architecture to achieve isolation and scalability," and "Cells are failure domains. When infrastructure inside a cell degrades, only the Namespaces in that cell are affected, and cells scale independently of each other" (<a href="https://docs.temporal.io/cloud/overview">Temporal Cloud overview</a>). If you work on cell infrastructure, this pattern is not background reading — it is the shape of everything you will build. Guide <a href="12-cell-lifecycle-synthesis.html">12</a> is about the <em>lifecycle</em> of one cell: the dependency DAG, the bootstrap paradoxes, upgrade, teardown. This guide steps back to the <em>architecture</em>: why cells, how traffic finds the right one, how tenants are placed and moved, how you deploy to N of them, what you are allowed to share between them, and the specific ways cell-based systems fail. It is also the vocabulary for any design review about routing, placement, or failover.</p></div>
+<p><strong>On sourcing.</strong> Every quote about Temporal Cloud comes from Temporal's public docs and engineering blog, linked inline. Where I go beyond what Temporal has published, I label the claim <em>inference</em> or <em>industry pattern</em>. I have no internal Temporal information. Verified against primary sources on <strong>2026-10-04</strong>.</p>
+<hr />
+<h2 id="the-mental-model">The mental model<a class="anchor" href="#the-mental-model">#</a></h2>
+<p>Six ideas. Every section below unpacks one of them.</p>
+<p><strong>1. A cell is a complete copy of the product, not a slice of it.</strong> A shard splits <em>data</em> inside one system. A cell copies the <em>whole system</em> — compute, database, search index, load balancers, certificates, observability — and gives each copy a subset of the tenants. Microsoft's name for the same pattern says it well: "Deploy multiple independent copies of application components, including data stores, as a single group of resources. Each copy is called a <em>stamp</em>, or sometimes a <em>service unit</em>, <em>scale unit</em>, or <em>cell</em>" (<a href="https://learn.microsoft.com/en-us/azure/architecture/patterns/deployment-stamp">Azure Deployment Stamps</a>). The test is simple: if you deleted every other cell, would this one still serve its tenants? If yes, it is a cell.</p>
+<p><strong>2. You buy blast-radius reduction and pay for it in operational multiplication.</strong> With N equally loaded cells, a failure that takes out one cell hits about 1/N of tenants. The price is that every task — deploy, patch, rotate a cert, upgrade Kubernetes — now happens N times. A cell architecture is only a good deal if the per-cell cost of those tasks goes toward zero. That is what a cell-infrastructure team actually ships: <strong>automation that makes N cells cost about as much attention as one.</strong></p>
+<p><strong>3. The router is the one part you could not make cellular, so it has to be boring.</strong> Something has to see every request to send it to the right cell. That component's blast radius is global. AWS's rule is to keep it "as simple and horizontally scalable as possible, which necessitates avoiding complex business logic within this layer" (<a href="https://docs.aws.amazon.com/wellarchitected/latest/reducing-scope-of-impact-with-cell-based-architecture/cell-routing.html">AWS — Cell routing</a>). Rule of thumb: <strong>anything that spans cells must be much simpler than anything inside a cell.</strong></p>
+<p><strong>4. The data plane must keep working when the control plane is down.</strong> The control plane makes changes: create a cell, place a Namespace, move it, delete it. The data plane runs Workflows. AWS calls the required property <em>static stability</em>: "In a statically stable design, the overall system keeps working even when a dependency becomes impaired" (<a href="https://aws.amazon.com/builders-library/static-stability-using-availability-zones/">Amazon Builders' Library — Static stability</a>). If your control plane has an outage, nobody should be able to tell — except that new Namespaces wait.</p>
+<p><strong>5. Placement and migration are the real product.</strong> Splitting tenants across cells is easy on day one. The hard part is everything after: deciding where a new tenant goes, noticing a cell is getting full, moving a tenant that outgrew its cell, emptying a cell you need to retire — all while that tenant's Workflows keep running. AWS: "Stateful cell-based architectures will almost certainly require online cell migration" (<a href="https://docs.aws.amazon.com/wellarchitected/latest/reducing-scope-of-impact-with-cell-based-architecture/cell-migration.html">AWS — Cell migration</a>).</p>
+<p><strong>6. Every shared thing quietly undoes the pattern.</strong> A shared database, a shared CA, a shared container registry, a shared DNS zone, a shared deploy pipeline that pushes to every cell at once — each is a failure domain wider than a cell. Some are unavoidable. The discipline is to list them, decide for each whether it sits on the <em>request path</em> or only the <em>control path</em>, and make sure cells keep serving when it is down.</p>
+<hr />
+<h2 id="core-concepts">Core concepts<a class="anchor" href="#core-concepts">#</a></h2>
+<h3 id="the-three-parts-and-what-temporal-cloud-maps-to-each">The three parts, and what Temporal Cloud maps to each<a class="anchor" href="#the-three-parts-and-what-temporal-cloud-maps-to-each">#</a></h3>
+<p>AWS's whitepaper splits every cell-based system into three parts (<a href="https://docs.aws.amazon.com/wellarchitected/latest/reducing-scope-of-impact-with-cell-based-architecture/what-is-a-cell-based-architecture.html">What is a cell-based architecture?</a>). Here they are, lined up with what Temporal has said publicly.</p>
+<table>
+<thead>
+<tr>
+<th>Part</th>
+<th>AWS definition</th>
+<th>Temporal Cloud (public)</th>
+<th>Source</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Cell</strong></td>
+<td>"A complete workload, with everything needed to operate independently"</td>
+<td>"Dedicated cloud account and VPC; Kubernetes cluster running Temporal services; Primary database with synchronous replication across three availability zones; Elasticsearch for Workflow visibility and search; Load balancers and ingress management; Observability and certificate infrastructure"</td>
+<td><a href="https://docs.temporal.io/cloud/overview">Cloud overview</a></td>
+</tr>
+<tr>
+<td><strong>Cell router</strong></td>
+<td>"The thinnest possible layer, with the responsibility of routing requests to the right cell, and only that"</td>
+<td>Namespace endpoints (<code>&lt;namespace&gt;.&lt;account&gt;.tmprl.cloud:7233</code>) and regional endpoints; on failover, "Temporal Cloud ... updates the CNAME to point at the new active region. The DNS TTL is 15 seconds"</td>
+<td><a href="https://docs.temporal.io/cloud/namespaces">Namespaces</a>, <a href="https://docs.temporal.io/cloud/high-availability/how-it-works">HA — how it works</a></td>
+</tr>
+<tr>
+<td><strong>Control plane</strong></td>
+<td>"Provisioning cells, de-provisioning cells, and migrating cell customers"</td>
+<td>"Handles provisioning, configuration, and lifecycle operations." When you create a Namespace "it selects a cell, provisions resources, generates certificates, and configures ingress routes." And: "The control plane runs those steps on Temporal itself."</td>
+<td><a href="https://docs.temporal.io/cloud/overview">Cloud overview</a></td>
+</tr>
+</tbody>
+</table>
+<p>Three things are worth noticing.</p>
+<ul>
+<li><strong>The cell boundary is a cloud account.</strong> Not a Kubernetes namespace, not a node pool — an account, with its own VPC and its own cluster (<a href="https://temporal.io/blog/building-durable-cloud-control-systems-with-temporal">Building durable cloud control systems with Temporal</a>, Jan 2025). That is the strongest isolation the clouds offer. It separates IAM, API rate limits, service quotas, and billing per cell. The cost is that every cell needs its own account vending, its own guardrails, and its own teardown story — which is guide <a href="03-multicloud-aws-gcp-azure.html">03</a> and guide <a href="08-terraform.html">08</a> territory.</li>
+<li><strong>Inside the cell, Temporal itself is still sharded.</strong> History shards, Matching partitions, and the Ringpop membership ring all live <em>inside</em> one cell (guide <a href="16-temporal-server-internals.html">16</a>). Shards give you throughput; the cell gives you isolation. Do not confuse the two (guide <a href="12-cell-lifecycle-synthesis.html">12</a> has a full comparison table).</li>
+<li><strong>The control plane is built from Temporal.</strong> Each cell has "an entity workflow that manages its lifecycle, from provisioning to upgrades," and there are two control planes — a User CP that handles resources "logically" and an Infra CP that handles them "physically" — both themselves Temporal Namespaces (<a href="https://temporal.io/blog/building-durable-cloud-control-systems-with-temporal">Temporal blog</a>). <em>Inference:</em> those control-plane Namespaces must live somewhere, which means some cell (or a dedicated, specially-protected deployment) hosts the system that manages all cells. Where that lives, and what happens to it during a bad deploy, is a very good week-one question.</li>
+</ul>
+<h3 id="where-the-pattern-comes-from">Where the pattern comes from<a class="anchor" href="#where-the-pattern-comes-from">#</a></h3>
+<p>The idea is old; the names are new. Knowing the lineage helps in design discussions, because people often reach for one of these as the reference point.</p>
+<table>
+<thead>
+<tr>
+<th>Who</th>
+<th>What they call it</th>
+<th>What a cell is there</th>
+<th>Why they did it</th>
+<th>Source</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>AWS</td>
+<td>Cell-based architecture</td>
+<td>A full copy of a service, behind a thin router</td>
+<td>Limit the scope of impact of any single failure or deploy</td>
+<td><a href="https://docs.aws.amazon.com/wellarchitected/latest/reducing-scope-of-impact-with-cell-based-architecture/what-is-a-cell-based-architecture.html">AWS whitepaper</a></td>
+</tr>
+<tr>
+<td>Microsoft Azure</td>
+<td>Deployment Stamps</td>
+<td>"Stamp, service unit, scale unit, or cell"</td>
+<td>Scale limits, tenant separation, staged updates, data residency</td>
+<td><a href="https://learn.microsoft.com/en-us/azure/architecture/patterns/deployment-stamp">Azure Architecture Center</a></td>
+</tr>
+<tr>
+<td>Shopify</td>
+<td>Pods</td>
+<td>A full copy of the stack for a set of shops, with its own MySQL</td>
+<td>Scale past one database; move a pod to another data center "in a minute"</td>
+<td><a href="https://shopify.engineering/a-pods-architecture-to-allow-shopify-to-scale">Shopify Engineering</a></td>
+</tr>
+<tr>
+<td>Slack</td>
+<td>Cellular architecture</td>
+<td><strong>One availability zone</strong>: "each service only communicates with services within its AZ"</td>
+<td>A June 30, 2021 AZ network problem caused errors everywhere; they wanted to be able to drain one AZ</td>
+<td><a href="https://slack.engineering/slacks-migration-to-a-cellular-architecture/">Slack Engineering</a></td>
+</tr>
+<tr>
+<td>Roblox</td>
+<td>Cells</td>
+<td>About 1,400 machines; "more than 70 percent of our back-end service traffic" served from cells at peak (Dec 2023)</td>
+<td>After a 73-hour outage in October 2021</td>
+<td><a href="https://about.roblox.com/newsroom/2023/12/making-robloxs-infrastructure-efficient-resilient">Roblox</a></td>
+</tr>
+<tr>
+<td>Temporal Cloud</td>
+<td>Cells</td>
+<td>Per-cloud-account copy of Temporal plus its databases</td>
+<td>Multi-tenancy without shared fate</td>
+<td><a href="https://docs.temporal.io/cloud/overview">Temporal Cloud overview</a></td>
+</tr>
+</tbody>
+</table>
+<p>Note the important split: <strong>Slack's cell is an AZ; Temporal's cell spans AZs.</strong> Temporal's docs say "components within a cell are distributed across at least three Availability Zones" (<a href="https://docs.temporal.io/cloud/rpo-rto">RPO/RTO</a>), and the database replicates synchronously across three AZs. So in Temporal Cloud, an AZ failure is handled <em>inside</em> a cell with no failover, and a cell failure is handled by <em>failing over to another cell</em>. AWS's whitepaper calls these two choices "AZ independence" vs. "non-AZ independence" for cells. Be ready to explain why Temporal picked the second: Temporal's correctness depends on a strongly consistent database for History (guide <a href="16-temporal-server-internals.html">16</a>), and one AZ cannot hold that database's quorum by itself.</p>
+<h3 id="choosing-the-partition-key">Choosing the partition key<a class="anchor" href="#choosing-the-partition-key">#</a></h3>
+<p>The router needs a <em>partition key</em> in every request to decide which cell it goes to. AWS: keys "must be chosen to match the <em>grain</em> of the service, or the natural ways that a service's workload can be subdivided with minimal cross-grain interactions. A good partition key is one that is easily accessible in most API calls" (<a href="https://docs.aws.amazon.com/wellarchitected/latest/reducing-scope-of-impact-with-cell-based-architecture/cell-partition.html">AWS — Cell partition</a>).</p>
+<p>For Temporal, the Namespace is an almost perfect key:</p>
+<ul>
+<li><strong>It is in every call.</strong> Every Temporal API request carries a Namespace, and the Namespace endpoint even puts it in the hostname — so the router can decide before it decodes a single byte of gRPC (more on SNI below).</li>
+<li><strong>Almost nothing crosses it.</strong> Workflows, Task Queues, Schedules, and Visibility queries all live inside one Namespace. Cross-Namespace calls exist (<a href="https://docs.temporal.io/nexus">Nexus</a> is the explicit, supported way to make them), but they are a small fraction of traffic and go through a defined endpoint rather than a database join.</li>
+<li><strong>It is already the isolation unit customers think in.</strong> Temporal's docs describe a Namespace as "a unit of isolation within Temporal Cloud" (<a href="https://docs.temporal.io/cloud/namespaces">Namespaces</a>).</li>
+</ul>
+<p>The weak spot AWS warns about is the <em>very large tenant</em>: "if you choose the <code>CustomerID</code> for your partition key and a single customer of yours becomes so big that it doesn't fit into a single cell anymore," you need a second dimension. For Temporal, the natural answer is that the customer splits their work across multiple Namespaces, and one Namespace has a hard ceiling set by its cell. <em>Inference:</em> that ceiling is why Temporal Cloud enforces per-Namespace limits — a Namespace must always fit inside one cell's measured capacity.</p>
+<p><strong>Cross-grain operations</strong> — work that has to touch many cells — are unavoidable: billing roll-ups, fleet-wide usage reports, "list all my Namespaces," and admin search. AWS's advice: "instead of letting the cells talk directly to each other, any cross-cell calls have to go back through the normal cell router." The Azure version: have every stamp publish into a central warehouse and query that, instead of querying each stamp live. Either way, the rule is: <strong>no cell ever calls another cell directly.</strong></p>
+<h3 id="mapping-keys-to-cells">Mapping keys to cells<a class="anchor" href="#mapping-keys-to-cells">#</a></h3>
+<p>Once you have a key, you need a function from key to cell. AWS lists four (<a href="https://docs.aws.amazon.com/wellarchitected/latest/reducing-scope-of-impact-with-cell-based-architecture/cell-partition.html">cell partition</a>):</p>
+<table>
+<thead>
+<tr>
+<th>Algorithm</th>
+<th>How it works</th>
+<th>Good at</th>
+<th>Bad at</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Full mapping</strong></td>
+<td>A table: every key → its cell</td>
+<td>Total control. Move any one key. Put a heavy tenant on a quiet cell</td>
+<td>A table you must read on every request and write on every placement. AWS: "a critical read and write dependency on the mapping table, a read-your-writes consistency requirement, and a large amount of state"</td>
+</tr>
+<tr>
+<td><strong>Prefix / range</strong></td>
+<td>Key ranges → cells</td>
+<td>Compact; easy to split a hot range</td>
+<td>Hot ranges; keys must have useful ordering</td>
+</tr>
+<tr>
+<td><strong>Naive modulo</strong></td>
+<td><code>hash(key) % N</code></td>
+<td>No state at all</td>
+<td>Adding one cell remaps almost every key — a mass migration</td>
+</tr>
+<tr>
+<td><strong>Consistent hashing</strong></td>
+<td>Keys and cells on a ring</td>
+<td>Adding a cell moves only about 1/N of keys</td>
+<td>You cannot place one specific tenant where you want it</td>
+</tr>
+</tbody>
+</table>
+<p>AWS adds a warning that applies to all of them: "Regardless of partition mapping approach, it's important to also use an override table to force specific keys to specific cells ... useful for testing, quarantining, and special-case routing for particularly heavy partition keys" (<a href="https://docs.aws.amazon.com/wellarchitected/latest/reducing-scope-of-impact-with-cell-based-architecture/a-warning-for-all-mapping-approaches.html">AWS — warning for all mapping approaches</a>).</p>
+<p><strong>What Temporal Cloud appears to use is full mapping, stored in DNS.</strong> <em>Inference from public behavior:</em> each Namespace gets its own hostname, the control plane chooses its cell when the Namespace is created, and failover works by "updat[ing] the CNAME." A per-Namespace CNAME <em>is</em> a full-mapping table — one row per key — and DNS is its globally replicated, heavily cached, read-optimized storage. This is a clever choice for three reasons:</p>
+<ol>
+<li><strong>Reads never touch your own infrastructure.</strong> Resolution happens in the client's resolver and in DNS caches. The "critical read dependency" AWS warns about is outsourced to the most battle-tested distributed cache on the internet.</li>
+<li><strong>It is statically stable by default.</strong> If the control plane that writes records is down, every existing record keeps resolving. Only <em>changes</em> stop.</li>
+<li><strong>Moving a tenant is a single record change.</strong> That is the "redirect" step of a migration.</li>
+</ol>
+<p>The cost is also clear: DNS gives you eventual consistency bounded by TTL (15 seconds here, per <a href="https://docs.temporal.io/cloud/high-availability/how-it-works">the docs</a>), and you cannot fully control clients that cache longer than the TTL. Long-lived gRPC connections are also not re-resolved just because DNS changed — an already-open HTTP/2 connection to the old cell stays open until something closes it. That is why failover is described as clients converging "within about 30 seconds" rather than instantly, and why the old active side has to actively push clients away rather than just wait.</p>
+<h3 id="the-cell-router-design-choices">The cell router: design choices<a class="anchor" href="#the-cell-router-design-choices">#</a></h3>
+<p>AWS lists the router properties that matter: "Be simple as possible, but not simpler. Have request dispatching isolation between cells. Minimize the amount of business logic in this layer. Abstract underlying cellular implementation and complexity from clients. Fast and reliable. Continue operating normally in other cells even when one cell is unreachable" (<a href="https://docs.aws.amazon.com/wellarchitected/latest/reducing-scope-of-impact-with-cell-based-architecture/cell-routing.html">AWS — Cell routing</a>).</p>
+<p>There are four common ways to build one. Real systems often stack two.</p>
+<table>
+<thead>
+<tr>
+<th>Router style</th>
+<th>How it routes</th>
+<th>Strengths</th>
+<th>Weaknesses</th>
+<th>Where Temporal fits</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>DNS</strong></td>
+<td>Hostname per tenant (or per cell) resolves to the cell's load balancer</td>
+<td>No hop in the data path; scales without limit; statically stable</td>
+<td>TTL-bounded changes; clients that ignore TTL; no per-request logic</td>
+<td>Namespace endpoints</td>
+</tr>
+<tr>
+<td><strong>L7 proxy</strong> (Envoy, API gateway)</td>
+<td>Proxy reads a header or path, looks up the cell, forwards</td>
+<td>Instant changes; per-request decisions; can drain by weight</td>
+<td>A hop in every request; the proxy fleet is itself a global failure domain</td>
+<td>Slack drains AZs this way through Envoy (<a href="https://slack.engineering/slacks-migration-to-a-cellular-architecture/">Slack</a>)</td>
+</tr>
+<tr>
+<td><strong>L4 / SNI routing</strong></td>
+<td>TLS ClientHello's SNI picks the backend; the router never decrypts</td>
+<td>No TLS termination in the router; works for any protocol over TLS, including gRPC</td>
+<td>Only sees the hostname; mTLS must be terminated by the cell</td>
+<td><em>Inference:</em> the regional endpoint docs say clients must set <code>server_name</code> to the Namespace endpoint "since the request to the regional endpoint is redirected to the specific Namespace" — SNI is the key (<a href="https://docs.temporal.io/cloud/namespaces">Namespaces</a>)</td>
+</tr>
+<tr>
+<td><strong>Client-side</strong></td>
+<td>A smart client asks "where is tenant X?" once, then talks to the cell directly</td>
+<td>No hop; the client can retry another cell</td>
+<td>You ship router logic into every SDK in every language; very hard to change</td>
+<td>Not used for Temporal's customer path, as far as public docs show</td>
+</tr>
+</tbody>
+</table>
+<p>The last row is why Temporal's approach matters: Temporal has SDKs in many languages, and none of them needs to know cells exist. AWS lists that as a router goal — "abstract underlying cellular implementation and complexity from clients" — and DNS plus SNI achieves it with no SDK code at all.</p>
+<p><strong>The router has its own blast radius, so make it cellular too.</strong> AWS: "the only component that has the shared state of all cells is the cell router. It presents itself as a single point of failure. Therefore, it is essential that it be built with maximum reliability and also as a cellular component" (<a href="https://docs.aws.amazon.com/wellarchitected/latest/reducing-scope-of-impact-with-cell-based-architecture/about-resilience-of-the-cell-router.html">AWS — router resilience</a>). In practice that means:</p>
+<ul>
+<li><strong>Isolate dispatch per cell (bulkheads).</strong> If cell 7 becomes slow, requests to it pile up. A router with one shared worker pool will fill that pool with cell-7 requests and starve every other cell. Give each cell its own concurrency budget and fail fast when it is full. The hands-on lab below shows exactly this.</li>
+<li><strong>Serve from last-known-good.</strong> The router loads its mapping, validates it, and keeps the previous one if the new one is missing, empty, unparseable, or <em>older</em>. Never let a bad mapping push replace a good one.</li>
+<li><strong>Deploy the router in waves, separately from cells.</strong> A router bug is the one bug that can take down every cell at once. It deserves the slowest, most careful rollout in the company.</li>
+</ul>
+<h3 id="control-plane-data-plane-and-static-stability">Control plane, data plane, and static stability<a class="anchor" href="#control-plane-data-plane-and-static-stability">#</a></h3>
+<p>The Builders' Library definitions: the control plane is "the machinery involved in making changes to a system — adding resources, deleting resources, modifying resources," and the data plane is "the daily business of those resources, that is, what it takes for them to function" (<a href="https://aws.amazon.com/builders-library/static-stability-using-availability-zones/">Static stability</a>). Temporal's version: the data plane is "where your Workflows run," and the control plane "handles provisioning, configuration, and lifecycle operations" (<a href="https://docs.temporal.io/cloud/overview">Cloud overview</a>).</p>
+<p>Static stability is a set of design rules, not a slogan. Check each one against a cell:</p>
+<table>
+<thead>
+<tr>
+<th>Rule</th>
+<th>What it means for a Temporal cell</th>
+<th>How it breaks</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Pre-provision; do not react</strong></td>
+<td>Each cell runs with enough headroom to absorb its own AZ loss without launching anything. AWS's example: with three AZs "we overprovision by 50 percent," so each AZ runs at about 66%</td>
+<td>Relying on Karpenter (guide <a href="06-karpenter.html">06</a>) to add nodes <em>during</em> an AZ outage — when the cloud's EC2 API is most likely to be degraded</td>
+</tr>
+<tr>
+<td><strong>No control-plane call on the request path</strong></td>
+<td>Starting a Workflow must never wait on the control plane, the account system, or a cloud API</td>
+<td>A Frontend that checks a central "is this Namespace allowed?" service on each request</td>
+</tr>
+<tr>
+<td><strong>Cache what you got, keep using it</strong></td>
+<td>Certificates, mapping, config, and secrets are loaded and held; refresh failures are logged, not fatal</td>
+<td>A sidecar that crashes the pod when Vault (guide <a href="10-vault.html">10</a>) is unreachable at refresh time</td>
+</tr>
+<tr>
+<td><strong>Expiry is the hidden dependency</strong></td>
+<td>Anything with a TTL — a cert, a token, a DNS record, a lease — turns "the control plane is down" into "the data plane will be down in N hours"</td>
+<td>Short-lived certs whose issuer lives outside the cell (guide <a href="11-cert-manager-and-pki.html">11</a>)</td>
+</tr>
+<tr>
+<td><strong>The data plane must not need the control plane to restart</strong></td>
+<td>A pod that restarts during a control-plane outage must come back with what is already in the cell</td>
+<td>An image pulled only from a registry outside the cell, with no in-cell mirror or node cache</td>
+</tr>
+</tbody>
+</table>
+<p>The fourth row is the one experienced people still miss. Write down, for every credential and lease in a cell, <em>how long the cell survives if the thing that refreshes it disappears.</em> That number is the cell's real independence, and it should be days, not minutes.</p>
+<h3 id="blast-radius-math-cells-replicas-and-shuffle-sharding">Blast radius math: cells, replicas, and shuffle sharding<a class="anchor" href="#blast-radius-math-cells-replicas-and-shuffle-sharding">#</a></h3>
+<p><strong>Plain cells.</strong> With N equal cells and each tenant in exactly one, a whole-cell failure affects 1/N of tenants. With 20 cells in a region, that is 5%. That is the whole pitch of the pattern, and it is a big improvement over 100%.</p>
+<p><strong>Cells with replicas.</strong> Temporal's High Availability Namespaces add a <em>replica</em> in a second place. With Same-region Replication, "Temporal operates a 'cell architecture' and will replicate the Namespace across multiple cells in that region" (<a href="https://docs.temporal.io/cloud/high-availability">HA docs</a>). Now a tenant lives on a <em>pair</em> of cells (active + replica). A single cell failure no longer causes an outage for HA Namespaces; they fail over, with Temporal publishing "Under 1 minute" RPO and "Under 20 minutes" RTO for a cell outage (<a href="https://docs.temporal.io/cloud/rpo-rto">RPO/RTO</a>). The new risk is losing <em>both</em> cells of a pair at once. If pairs are spread evenly over N cells, there are C(N,2) possible pairs — 190 for N = 20 — so a double failure of two particular cells hits only the tenants on that one pair: about 1/190, or roughly 0.5%.</p>
+<p><strong>Shuffle sharding.</strong> This is the same idea taken further. Instead of one cell per tenant, give each tenant a random <em>combination</em> of k workers out of n. Colm MacCárthaigh's original post compares dealing hands from a deck of cards: with 8 workers and hands of 2, there are far more distinct hands than there are plain shards, so a "poison" tenant that kills its 2 workers almost never takes out another tenant's entire hand (<a href="https://aws.amazon.com/blogs/architecture/shuffle-sharding-massive-and-magical-fault-isolation/">AWS Architecture Blog, 2014</a>). Do the math yourself, because the numbers are the argument:</p>
+<ul>
+<li>n = 100 workers, k = 5 per tenant gives C(100,5) = <strong>75,287,520</strong> distinct hands.</li>
+<li>If one tenant destroys all 5 of its workers, the chance that a random other tenant had the <em>same</em> 5 is about <strong>1 in 75 million</strong>.</li>
+<li>77% of other tenants share <strong>zero</strong> workers with it; 21% share exactly one; fewer than 2% share two or more. With retries across the hand, a tenant that keeps even one healthy worker stays up.</li>
+<li>Route 53 gives each hosted zone four name servers. If those were drawn from a pool of 2,048, C(2048,4) ≈ <strong>7.3 × 10¹¹</strong> combinations — which is why per-customer DNS isolation is practical at that scale.</li>
+</ul>
+<p><strong>How these relate.</strong> Cells are <em>hard</em> isolation: separate accounts, separate databases. Shuffle sharding is <em>statistical</em> isolation on shared machines. They stack: you can shuffle-shard <em>inside</em> a cell (for example, which Matching hosts serve which Task Queue partitions) while the cell is the hard wall around it. In a design review, the strong answer is: "Cells cap the worst case at 1/N. Shuffle sharding makes the <em>expected</em> overlap between two tenants close to zero. Use cells for the faults you cannot reason about — bad deploys, data corruption, quota exhaustion — and shuffle sharding for noisy neighbors on shared fleets."</p>
+<h3 id="cell-sizing-revisited-as-a-capacity-vector">Cell sizing, revisited as a capacity vector<a class="anchor" href="#cell-sizing-revisited-as-a-capacity-vector">#</a></h3>
+<p>Guide <a href="12-cell-lifecycle-synthesis.html">12</a> covers AWS's three forces: big enough for the largest tenant, small enough to test at full scale, big enough for economies of scale. One more thing to add: <strong>a cell's capacity is a vector, not a number.</strong> A Temporal cell runs out of different things for different tenants:</p>
+<table>
+<thead>
+<tr>
+<th>Dimension</th>
+<th>What exhausts it</th>
+<th>Where it is covered</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>History shard throughput</td>
+<td>Many workflows with heavy event histories</td>
+<td>Guide <a href="16-temporal-server-internals.html">16</a></td>
+</tr>
+<tr>
+<td>Persistence IOPS / write bandwidth</td>
+<td>Write-heavy tenants; large payloads</td>
+<td>Guide <a href="16-temporal-server-internals.html">16</a></td>
+</tr>
+<tr>
+<td>Visibility indexing</td>
+<td>High workflow start/close rate; custom search attributes</td>
+<td>Guide <a href="16-temporal-server-internals.html">16</a></td>
+</tr>
+<tr>
+<td>Long-poll connections</td>
+<td>Many Workers per Task Queue</td>
+<td>Guide <a href="15-temporal-programming-model.html">15</a>, guide <a href="02-grpc.html">02</a></td>
+</tr>
+<tr>
+<td>Pod IPs / subnet space</td>
+<td>Cell growth, surge during upgrades</td>
+<td>Guide <a href="05-cni-and-host-networking.html">05</a></td>
+</tr>
+<tr>
+<td>Cloud quotas in the cell's account</td>
+<td>Instances, load balancers, endpoints, KMS calls</td>
+<td>Guide <a href="03-multicloud-aws-gcp-azure.html">03</a></td>
+</tr>
+</tbody>
+</table>
+<p>The placement engine must consider all of them. A cell that is 30% full on CPU and 95% full on persistence IOPS is <em>full</em>. <em>Industry pattern:</em> the usual approach is to express each tenant's expected load and each cell's measured limit along the same dimensions, then place against the tightest one — a multi-dimensional bin-packing problem with a headroom reserve held back for spikes and for failover.</p>
+<h3 id="placement-and-capacity-management">Placement and capacity management<a class="anchor" href="#placement-and-capacity-management">#</a></h3>
+<p>Placement is the control-plane decision "which cell does this new Namespace go to?" Temporal's public description of Namespace creation starts with exactly that: "selecting a suitable cell within the chosen region" (<a href="https://temporal.io/blog/building-durable-cloud-control-systems-with-temporal">Temporal blog</a>). A production-grade placement service, as an <em>industry pattern</em>, handles:</p>
+<ul>
+<li><strong>Hard constraints first.</strong> Region and cloud (the customer chose them). Compliance or tier requirements. For HA Namespaces, <strong>anti-affinity</strong>: the replica must be in a different cell — and for Multi-region or Multi-cloud Replication, a different region or cloud. Temporal's docs add that the multi-region replica "must be on the same continent as the primary region" (<a href="https://docs.temporal.io/cloud/high-availability">HA docs</a>).</li>
+<li><strong>Headroom, not just free space.</strong> A cell that hosts replicas must be able to take <em>their</em> active load after a failover. If cell A holds 40 replicas whose actives are spread across 10 other cells, losing one of those cells moves about 4 tenants' load onto A. Plan for that, or failover becomes the second outage.</li>
+<li><strong>High- and low-water marks.</strong> Stop placing new tenants on a cell at, say, 70% of its tightest dimension; start moving tenants away at 85%. The exact numbers are yours to measure, not copy.</li>
+<li><strong>"No capacity" is a valid answer.</strong> If no cell in the region has room, the system must say so clearly and trigger a new cell. It must not hand back a slow timeout. Provisioning a new cell takes time (guide <a href="12-cell-lifecycle-synthesis.html">12</a> walks the whole DAG), so cell creation has to be driven by a <strong>forecast</strong>, not by the first failed placement.</li>
+<li><strong>Dedicated cells.</strong> Azure's guidance covers this case: "Some large customers might need their own independent instances of your solution." The same placement machinery can put one tenant alone on a cell. The cell is the same; only the placement policy differs.</li>
+</ul>
+<h3 id="migration-moving-a-tenant-between-cells">Migration: moving a tenant between cells<a class="anchor" href="#migration-moving-a-tenant-between-cells">#</a></h3>
+<p>AWS gives the four generic phases (<a href="https://docs.aws.amazon.com/wellarchitected/latest/reducing-scope-of-impact-with-cell-based-architecture/cell-migration.html">Cell migration</a>):</p>
+<ol>
+<li><strong>Clone</strong> "the data from the current location into the new location, as a non-authoritative copy."</li>
+<li><strong>Flip</strong> "the new location copy to be <em>authoritative</em>."</li>
+<li><strong>Redirect</strong> "from old location to new location."</li>
+<li><strong>Forget</strong> "the data from the old location."</li>
+</ol>
+<p>For Temporal, the striking thing is that <strong>the High Availability feature already contains all four steps.</strong> <em>Inference, but a strong one:</em> adding a replica in another cell is <em>Clone</em> — "Workflow Executions are asynchronously replicated from an active Namespace to a replica" (<a href="https://temporal.io/blog/expanding-temporal-clouds-high-availability-offerings">Temporal blog, Mar 2025</a>). A failover is <em>Flip</em> — "The replica becomes active, and the former active becomes a replica." The CNAME update is <em>Redirect</em>. Removing the old replica is <em>Forget</em>. In the open-source server this is the multi-cluster replication path of global Namespaces: the active/standby task executors and version histories described in guide <a href="16-temporal-server-internals.html">16</a>. So the same machinery serves customer-facing HA, cell draining, rebalancing, and moving a tenant to a dedicated cell. That is a big deal for an infra team: <strong>migration is not a special project; it is a routine operation built on a product feature</strong> that already gets tested every day.</p>
+<p>What makes migration hard, in any cell system:</p>
+<ul>
+<li><strong>The in-between state.</strong> During migration, some requests may arrive at the old cell. AWS: this "may involve cross-cell redirects, performing multiple iterations of the mapping algorithm when necessary, or both." Decide ahead of time which side is authoritative at every moment, and make the other side refuse writes or forward them.</li>
+<li><strong>Replication lag at flip time.</strong> A <em>graceful</em> flip waits for the replica to catch up before switching. A <em>forced</em> flip during an outage switches anyway and accepts that the last few seconds may be missing — that is what "Under 1 minute" RPO means. Know which kind you are running before you press the button.</li>
+<li><strong>Old connections.</strong> As covered above, open gRPC connections do not move just because DNS changed. The old side must close or reject them, and clients must retry.</li>
+<li><strong>Forget is the dangerous step.</strong> It is the only irreversible one. Gate it on verification (record counts, last event IDs, a bake period), never on a timer alone.</li>
+</ul>
+<p><strong>Draining a whole cell</strong> is then just "migrate every tenant off it, in a controlled order." Shopify's version: "evacuating a whole data center is nothing more than evacuating each pod active there one at a time" (<a href="https://shopify.engineering/a-pods-architecture-to-allow-shopify-to-scale">Shopify</a>). Draining is how you retire a cell, rebuild one from scratch, or move away from a cell you no longer trust after a gray failure (guide <a href="12-cell-lifecycle-synthesis.html">12</a> has the gray-failure discussion and Slack's "build a button" lesson).</p>
+<h3 id="deploying-to-many-cells">Deploying to many cells<a class="anchor" href="#deploying-to-many-cells">#</a></h3>
+<p>AWS: "the important point here is to deploy in waves, cell by cell or set of cells" (<a href="https://docs.aws.amazon.com/wellarchitected/latest/reducing-scope-of-impact-with-cell-based-architecture/cell-deployment.html">Cell deployment</a>). Temporal's public version is deployment rings: "Ring 0: Synthetic traffic only, no customer impact. Changes are monitored here for at least a week. Ring 1: Low-priority traffic namespaces ... Higher Rings: Gradually expanding to critical, high-priority traffic customers. Within each ring, updates are applied in batches, with pauses between batches" (<a href="https://temporal.io/blog/building-durable-cloud-control-systems-with-temporal">Temporal blog</a>).</p>
+<p>The design rules that turn "rings" from a slide into something safe:</p>
+<ul>
+<li><strong>Each wave must be able to fail on its own.</strong> If wave 1 has three cells in the same region on the same cloud, a region-specific bug shows up in all three at once. Mix regions and clouds early so a wave catches <em>different kinds</em> of bugs.</li>
+<li><strong>Bake time comes from the bug class, not from patience.</strong> Temporal names "memory leaks or race conditions." A leak that adds 1% per hour will not show up in a one-hour canary. Set the soak time from the slowest failure you expect to catch.</li>
+<li><strong>Promote automatically; stop automatically.</strong> A wave moves forward only when the cell health gate (guide <a href="14-observability-for-cells.html">14</a>) is green for the whole bake time, and halts the moment any cell in the wave goes red. A person should be needed to <em>override</em> the pipeline, not to <em>drive</em> it.</li>
+<li><strong>Config is a deploy.</strong> A config change pushed to every cell at once is a global change that skips every ring. Feature flags, rate limits, and mapping data all need the same waves as code. Config pushes are a classic cause of global outages precisely because they feel too small to need a rollout.</li>
+<li><strong>Infra changes go through rings too.</strong> Kubernetes version, node image, CNI version, and Terraform module changes (guides <a href="04-managed-kubernetes-eks-gke-aks.html">04</a>, <a href="05-cni-and-host-networking.html">05</a>, <a href="08-terraform.html">08</a>) are as dangerous as server code, and they are exactly what a cell-infrastructure team ships. GitOps tools fan one change out to N cells (guide <a href="13-gitops-argocd-flux.html">13</a>), so <em>the wave structure has to live in the GitOps layout</em>, not in someone's head.</li>
+<li><strong>Plan for version skew.</strong> During a rollout, different cells run different versions for days or weeks. Anything that crosses cells — the router, the control plane, the replication stream between an active and its replica in another cell — must work across at least two adjacent versions.</li>
+</ul>
+<h3 id="observability-across-cells">Observability across cells<a class="anchor" href="#observability-across-cells">#</a></h3>
+<p>AWS: "Your entire observability stack needs to be cell-aware ... It is important to be able to track each request and identify which cell it is destined for" (<a href="https://docs.aws.amazon.com/wellarchitected/latest/reducing-scope-of-impact-with-cell-based-architecture/cell-observability.html">Cell observability</a>). Guide <a href="14-observability-for-cells.html">14</a> covers the tools; the cell-specific rules are:</p>
+<ul>
+<li><strong><code>cell</code> is a label on everything</strong> — every metric, log line, and trace — from the moment the cell exists. Retrofitting it later is painful.</li>
+<li><strong>Look at the worst cell, not the average.</strong> A fleet average of 99.95% can hide one cell at 97%. Alert per cell; build fleet dashboards that sort by the worst cell.</li>
+<li><strong>Compare cells to each other.</strong> Cells are supposed to be identical, so an outlier is a signal by itself. A cell whose p99 latency is 3× its siblings' on the same version is sick even if it is within its SLO.</li>
+<li><strong>The observability backend is a shared dependency.</strong> If every cell ships telemetry to one central system, that system's outage blinds you to all cells at once — but must not <em>hurt</em> any of them. Keep a short in-cell buffer so a cell's health gate can still be evaluated locally.</li>
+</ul>
+<h3 id="what-you-are-allowed-to-share">What you are allowed to share<a class="anchor" href="#what-you-are-allowed-to-share">#</a></h3>
+<p>AWS's ideal: "Cells should have no dependency on each other at all (that is, no cross-cell API calls, no shared resources like databases or S3 buckets.)" (<a href="https://docs.aws.amazon.com/wellarchitected/latest/reducing-scope-of-impact-with-cell-based-architecture/cell-design.html">Cell design</a>). Real systems share some things anyway. Classify each one:</p>
+<table>
+<thead>
+<tr>
+<th>Shared thing</th>
+<th>On request path?</th>
+<th>If it is down, cells should...</th>
+<th>Common mistake</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Router / DNS for endpoints</td>
+<td><strong>Yes</strong></td>
+<td>Keep serving from cached records</td>
+<td>Short TTLs everywhere "for agility," so caches empty quickly during a DNS-provider incident</td>
+</tr>
+<tr>
+<td>Control plane (User CP, Infra CP)</td>
+<td>No</td>
+<td>Keep serving; only changes stop</td>
+<td>Frontend checks the control plane per request</td>
+</tr>
+<tr>
+<td>Identity / API-key validation</td>
+<td>Often</td>
+<td>Validate locally from cached keys or signed tokens</td>
+<td>Calling a central auth service for every RPC</td>
+</tr>
+<tr>
+<td>Root CA / PKI</td>
+<td>No (if done right)</td>
+<td>Keep serving with already-issued certs until they expire</td>
+<td>Issuer outside the cell plus very short cert lifetimes (guide <a href="11-cert-manager-and-pki.html">11</a>)</td>
+</tr>
+<tr>
+<td>Secrets store</td>
+<td>No (if cached)</td>
+<td>Keep using already-fetched secrets</td>
+<td>Pods that fail to start or crash on refresh failure (guide <a href="10-vault.html">10</a>)</td>
+</tr>
+<tr>
+<td>Container registry</td>
+<td>No</td>
+<td>Restart pods from node cache or an in-cell mirror</td>
+<td>Every restart pulls from a single remote registry</td>
+</tr>
+<tr>
+<td>Observability backend</td>
+<td>No</td>
+<td>Buffer locally; keep serving</td>
+<td>Telemetry exporter backpressure blocking the app</td>
+</tr>
+<tr>
+<td>Deploy pipeline / GitOps</td>
+<td>No</td>
+<td>Keep the last applied state</td>
+<td>A pipeline that pushes to all cells at once</td>
+</tr>
+<tr>
+<td>Billing / usage metering</td>
+<td>No</td>
+<td>Record locally, ship later</td>
+<td>Metering call made inline on each request</td>
+</tr>
+</tbody>
+</table>
+<p>Rule: <strong>for every row, write down the cell's survival time when that thing is down.</strong> "Indefinitely" is the goal for request-path items. For control-path items, the answer should be "until the next change," never "until the next cert expiry in two hours."</p>
+<h3 id="failure-modes-that-are-specific-to-cells">Failure modes that are specific to cells<a class="anchor" href="#failure-modes-that-are-specific-to-cells">#</a></h3>
+<p>Cells remove some failure modes and add new ones. These are the ones to know.</p>
+<ol>
+<li><strong>Router or mapping bug — global.</strong> One bad mapping push sends everyone to the wrong cell, or nowhere. Defenses: validation, refusing older or near-empty mappings, last-known-good, and slow waves for router and mapping changes.</li>
+<li><strong>Correlated deploy — global, delayed.</strong> A bug that only shows up after 48 hours, shipped through rings with 24-hour bakes, reaches every cell before it fires. Defenses: bake times tied to bug classes, mixing cloud and region early, and the ability to halt <em>and</em> roll back across many cells at once.</li>
+<li><strong>Replication spreads poison.</strong> If a "poison" workflow or a corrupted history crashes the active cell, async replication may carry the same data to the replica, and a failover then crashes the replica too. <em>Industry pattern:</em> the replica is safe from infrastructure faults, not from data faults. The defense is the ability to quarantine one tenant (the override table) and per-tenant circuit breakers inside the cell.</li>
+<li><strong>Failover overload.</strong> All HA tenants from a failed cell fail over at once to their replica cells. If those cells have no headroom, the failover causes a second outage. Defense: reserve headroom for replicas and spread a cell's replicas across many other cells, not one.</li>
+<li><strong>Split routing.</strong> During a mapping change, some clients reach the old cell and some reach the new one, and both accept writes. Defense: exactly one authoritative side at every moment, enforced <em>in the cells</em>, not by the router. In Temporal this is what Namespace failover versions do (guide <a href="16-temporal-server-internals.html">16</a>).</li>
+<li><strong>Quota cliffs.</strong> A cell is its own cloud account, so it has its own limits. Growth stops at a cloud limit nobody measured, and raising limits can take days. Defense: track quotas as a capacity dimension, and test new cells to their stated limit.</li>
+<li><strong>Shared dependency failure.</strong> Covered above. The tell-tale sign is "every cell broke at the same minute" — which, in a cell architecture, should be impossible unless something is shared.</li>
+<li><strong>Gray failure in one cell.</strong> The cell looks healthy to its own health checks but is failing for customers. Guide <a href="12-cell-lifecycle-synthesis.html">12</a> covers this in depth; in short, build a fast, safe, <em>manual</em> drain button, since automatic detection is unreliable.</li>
+</ol>
+<h3 id="cells-compared-with-the-alternatives">Cells compared with the alternatives<a class="anchor" href="#cells-compared-with-the-alternatives">#</a></h3>
+<table>
+<thead>
+<tr>
+<th>Approach</th>
+<th>Isolation</th>
+<th>Cost</th>
+<th>Operations</th>
+<th>When it wins</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>One big multi-tenant cluster</strong></td>
+<td>None between tenants</td>
+<td>Cheapest</td>
+<td>One thing to run</td>
+<td>Early stage; small scale</td>
+</tr>
+<tr>
+<td><strong>Single-tenant (cluster per customer)</strong></td>
+<td>Total</td>
+<td>Most expensive; idle capacity per customer</td>
+<td>N = number of customers</td>
+<td>Strict compliance; very large customers. Temporal: "customers end up paying for unused capacity" (<a href="https://temporal.io/blog/building-durable-cloud-control-systems-with-temporal">Temporal blog</a>)</td>
+</tr>
+<tr>
+<td><strong>Sharding only</strong></td>
+<td>Throughput, not faults</td>
+<td>Cheap</td>
+<td>One system, more partitions</td>
+<td>Scaling data, not reducing blast radius</td>
+</tr>
+<tr>
+<td><strong>Cells</strong></td>
+<td>Strong, at cell level</td>
+<td>Medium; some headroom per cell</td>
+<td>N cells, with automation</td>
+<td>Multi-tenant SaaS at scale — Temporal's choice</td>
+</tr>
+<tr>
+<td><strong>Geodes</strong> (every instance serves every user)</td>
+<td>Regional</td>
+<td>High; data everywhere</td>
+<td>Complex replication</td>
+<td>Global read-heavy apps. Azure: geodes are "typically more complex to design and build"</td>
+</tr>
+</tbody>
+</table>
+<p>Microsoft's guidance against the pattern is worth remembering too — don't use stamps when "You can scale your system out or up within a single instance" or "You only need to scale some components and not others" (<a href="https://learn.microsoft.com/en-us/azure/architecture/patterns/deployment-stamp">Azure</a>). And deploy at least two from the start: "If you deploy only a single stamp, you can easily hard-code assumptions into your code or configuration that don't apply when you scale out."</p>
+<hr />
+<h2 id="hands-on">Hands-on<a class="anchor" href="#hands-on">#</a></h2>
+<h3 id="lab-1--a-thin-statically-stable-cell-router-go-20-minutes-free">Lab 1 — A thin, statically stable cell router (Go, ~20 minutes, free)<a class="anchor" href="#lab-1--a-thin-statically-stable-cell-router-go-20-minutes-free">#</a></h3>
+<p>You will build a router in front of two fake cells and watch four properties: routing by partition key, migration by mapping change, static stability when the mapping source is broken, and per-cell bulkheads when one cell gets slow. The code was tested with Go 1.26 on macOS.</p>
+<div class="codehilite"><pre><span></span><code>mkdir -p ~/cell-lab <span class="o">&amp;&amp;</span> <span class="nb">cd</span> ~/cell-lab
+go mod init cell-lab
+</code></pre></div>
+
+<p>Create <code>mapping.json</code>. This is the full-mapping table: partition key → cell, plus cell → address. The <code>version</code> field only ever goes up.</p>
+<div class="codehilite"><pre><span></span><code><span class="p">{</span><span class="w"></span>
+<span class="w">  </span><span class="nt">&quot;version&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"></span>
+<span class="w">  </span><span class="nt">&quot;cells&quot;</span><span class="p">:</span><span class="w">   </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;cell-a&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;http://127.0.0.1:9001&quot;</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;cell-b&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;http://127.0.0.1:9002&quot;</span><span class="w"> </span><span class="p">},</span><span class="w"></span>
+<span class="w">  </span><span class="nt">&quot;tenants&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;acme&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;cell-a&quot;</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;globex&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;cell-b&quot;</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;initech&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;cell-b&quot;</span><span class="w"> </span><span class="p">}</span><span class="w"></span>
+<span class="p">}</span><span class="w"></span>
+</code></pre></div>
+
+<p>Create <code>main.go</code>:</p>
+<div class="codehilite"><pre><span></span><code><span class="c1">// cell-lab: two in-process &quot;cells&quot; behind a thin, statically stable cell router.</span><span class="w"></span>
+<span class="kn">package</span><span class="w"> </span><span class="nx">main</span><span class="w"></span>
+
+<span class="kn">import</span><span class="w"> </span><span class="p">(</span><span class="w"></span>
+<span class="w">    </span><span class="s">&quot;encoding/json&quot;</span><span class="w"></span>
+<span class="w">    </span><span class="s">&quot;fmt&quot;</span><span class="w"></span>
+<span class="w">    </span><span class="s">&quot;log&quot;</span><span class="w"></span>
+<span class="w">    </span><span class="s">&quot;net/http&quot;</span><span class="w"></span>
+<span class="w">    </span><span class="s">&quot;net/http/httputil&quot;</span><span class="w"></span>
+<span class="w">    </span><span class="s">&quot;net/url&quot;</span><span class="w"></span>
+<span class="w">    </span><span class="s">&quot;os&quot;</span><span class="w"></span>
+<span class="w">    </span><span class="s">&quot;strings&quot;</span><span class="w"></span>
+<span class="w">    </span><span class="s">&quot;sync&quot;</span><span class="w"></span>
+<span class="w">    </span><span class="s">&quot;sync/atomic&quot;</span><span class="w"></span>
+<span class="w">    </span><span class="s">&quot;time&quot;</span><span class="w"></span>
+<span class="p">)</span><span class="w"></span>
+
+<span class="c1">// Mapping is the router&#39;s entire world view: partition key -&gt; cell, plus cell -&gt; address.</span><span class="w"></span>
+<span class="kd">type</span><span class="w"> </span><span class="nx">Mapping</span><span class="w"> </span><span class="kd">struct</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">    </span><span class="nx">Version</span><span class="w"> </span><span class="kt">int</span><span class="w">               </span><span class="s">`json:&quot;version&quot;`</span><span class="w"></span>
+<span class="w">    </span><span class="nx">Cells</span><span class="w">   </span><span class="kd">map</span><span class="p">[</span><span class="kt">string</span><span class="p">]</span><span class="kt">string</span><span class="w"> </span><span class="s">`json:&quot;cells&quot;`</span><span class="w">   </span><span class="c1">// cell name -&gt; base URL</span><span class="w"></span>
+<span class="w">    </span><span class="nx">Tenants</span><span class="w"> </span><span class="kd">map</span><span class="p">[</span><span class="kt">string</span><span class="p">]</span><span class="kt">string</span><span class="w"> </span><span class="s">`json:&quot;tenants&quot;`</span><span class="w"> </span><span class="c1">// tenant (partition key) -&gt; cell name</span><span class="w"></span>
+<span class="p">}</span><span class="w"></span>
+
+<span class="kd">type</span><span class="w"> </span><span class="nx">router</span><span class="w"> </span><span class="kd">struct</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">    </span><span class="nx">current</span><span class="w">   </span><span class="nx">atomic</span><span class="p">.</span><span class="nx">Pointer</span><span class="p">[</span><span class="nx">Mapping</span><span class="p">]</span><span class="w"> </span><span class="c1">// last known good</span><span class="w"></span>
+<span class="w">    </span><span class="nx">loadedAt</span><span class="w">  </span><span class="nx">atomic</span><span class="p">.</span><span class="nx">Int64</span><span class="w"></span>
+<span class="w">    </span><span class="nx">lastError</span><span class="w"> </span><span class="nx">atomic</span><span class="p">.</span><span class="nx">Value</span><span class="w"> </span><span class="c1">// string</span><span class="w"></span>
+<span class="w">    </span><span class="nx">mu</span><span class="w">        </span><span class="nx">sync</span><span class="p">.</span><span class="nx">Mutex</span><span class="w"></span>
+<span class="w">    </span><span class="nx">bulkheads</span><span class="w"> </span><span class="kd">map</span><span class="p">[</span><span class="kt">string</span><span class="p">]</span><span class="kd">chan</span><span class="w"> </span><span class="kd">struct</span><span class="p">{}</span><span class="w"> </span><span class="c1">// per-cell in-flight limit</span><span class="w"></span>
+<span class="w">    </span><span class="nx">perCell</span><span class="w">   </span><span class="kt">int</span><span class="w"></span>
+<span class="p">}</span><span class="w"></span>
+
+<span class="kd">func</span><span class="w"> </span><span class="p">(</span><span class="nx">r</span><span class="w"> </span><span class="o">*</span><span class="nx">router</span><span class="p">)</span><span class="w"> </span><span class="nx">reload</span><span class="p">(</span><span class="nx">path</span><span class="w"> </span><span class="kt">string</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">    </span><span class="nx">b</span><span class="p">,</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">os</span><span class="p">.</span><span class="nx">ReadFile</span><span class="p">(</span><span class="nx">path</span><span class="p">)</span><span class="w"></span>
+<span class="w">    </span><span class="kd">var</span><span class="w"> </span><span class="nx">m</span><span class="w"> </span><span class="nx">Mapping</span><span class="w"></span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="kc">nil</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">        </span><span class="nx">err</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="nx">json</span><span class="p">.</span><span class="nx">Unmarshal</span><span class="p">(</span><span class="nx">b</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="nx">m</span><span class="p">)</span><span class="w"></span>
+<span class="w">    </span><span class="p">}</span><span class="w"></span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="kc">nil</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="nx">m</span><span class="p">.</span><span class="nx">Cells</span><span class="p">)</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="mi">0</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="nx">m</span><span class="p">.</span><span class="nx">Version</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">        </span><span class="nx">err</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="nx">fmt</span><span class="p">.</span><span class="nx">Errorf</span><span class="p">(</span><span class="s">&quot;refusing suspicious mapping: version=%d cells=%d&quot;</span><span class="p">,</span><span class="w"> </span><span class="nx">m</span><span class="p">.</span><span class="nx">Version</span><span class="p">,</span><span class="w"> </span><span class="nb">len</span><span class="p">(</span><span class="nx">m</span><span class="p">.</span><span class="nx">Cells</span><span class="p">))</span><span class="w"></span>
+<span class="w">    </span><span class="p">}</span><span class="w"></span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="kc">nil</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="nx">cur</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">r</span><span class="p">.</span><span class="nx">current</span><span class="p">.</span><span class="nx">Load</span><span class="p">();</span><span class="w"> </span><span class="nx">cur</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="kc">nil</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="nx">m</span><span class="p">.</span><span class="nx">Version</span><span class="w"> </span><span class="p">&lt;</span><span class="w"> </span><span class="nx">cur</span><span class="p">.</span><span class="nx">Version</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">            </span><span class="nx">err</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="nx">fmt</span><span class="p">.</span><span class="nx">Errorf</span><span class="p">(</span><span class="s">&quot;refusing rollback from version %d to %d&quot;</span><span class="p">,</span><span class="w"> </span><span class="nx">cur</span><span class="p">.</span><span class="nx">Version</span><span class="p">,</span><span class="w"> </span><span class="nx">m</span><span class="p">.</span><span class="nx">Version</span><span class="p">)</span><span class="w"></span>
+<span class="w">        </span><span class="p">}</span><span class="w"></span>
+<span class="w">    </span><span class="p">}</span><span class="w"></span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="kc">nil</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">        </span><span class="c1">// Static stability: keep serving the last known good mapping.</span><span class="w"></span>
+<span class="w">        </span><span class="nx">r</span><span class="p">.</span><span class="nx">lastError</span><span class="p">.</span><span class="nx">Store</span><span class="p">(</span><span class="nx">err</span><span class="p">.</span><span class="nx">Error</span><span class="p">())</span><span class="w"></span>
+<span class="w">        </span><span class="k">return</span><span class="w"></span>
+<span class="w">    </span><span class="p">}</span><span class="w"></span>
+<span class="w">    </span><span class="nx">r</span><span class="p">.</span><span class="nx">lastError</span><span class="p">.</span><span class="nx">Store</span><span class="p">(</span><span class="s">&quot;&quot;</span><span class="p">)</span><span class="w"></span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="nx">cur</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">r</span><span class="p">.</span><span class="nx">current</span><span class="p">.</span><span class="nx">Load</span><span class="p">();</span><span class="w"> </span><span class="nx">cur</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="kc">nil</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="nx">cur</span><span class="p">.</span><span class="nx">Version</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="nx">m</span><span class="p">.</span><span class="nx">Version</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">        </span><span class="nx">log</span><span class="p">.</span><span class="nx">Printf</span><span class="p">(</span><span class="s">&quot;router: loaded mapping version %d (%d tenants)&quot;</span><span class="p">,</span><span class="w"> </span><span class="nx">m</span><span class="p">.</span><span class="nx">Version</span><span class="p">,</span><span class="w"> </span><span class="nb">len</span><span class="p">(</span><span class="nx">m</span><span class="p">.</span><span class="nx">Tenants</span><span class="p">))</span><span class="w"></span>
+<span class="w">    </span><span class="p">}</span><span class="w"></span>
+<span class="w">    </span><span class="nx">r</span><span class="p">.</span><span class="nx">current</span><span class="p">.</span><span class="nx">Store</span><span class="p">(</span><span class="o">&amp;</span><span class="nx">m</span><span class="p">)</span><span class="w"></span>
+<span class="w">    </span><span class="nx">r</span><span class="p">.</span><span class="nx">loadedAt</span><span class="p">.</span><span class="nx">Store</span><span class="p">(</span><span class="nx">time</span><span class="p">.</span><span class="nx">Now</span><span class="p">().</span><span class="nx">Unix</span><span class="p">())</span><span class="w"></span>
+<span class="p">}</span><span class="w"></span>
+
+<span class="kd">func</span><span class="w"> </span><span class="p">(</span><span class="nx">r</span><span class="w"> </span><span class="o">*</span><span class="nx">router</span><span class="p">)</span><span class="w"> </span><span class="nx">bulkhead</span><span class="p">(</span><span class="nx">cell</span><span class="w"> </span><span class="kt">string</span><span class="p">)</span><span class="w"> </span><span class="kd">chan</span><span class="w"> </span><span class="kd">struct</span><span class="p">{}</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">    </span><span class="nx">r</span><span class="p">.</span><span class="nx">mu</span><span class="p">.</span><span class="nx">Lock</span><span class="p">()</span><span class="w"></span>
+<span class="w">    </span><span class="k">defer</span><span class="w"> </span><span class="nx">r</span><span class="p">.</span><span class="nx">mu</span><span class="p">.</span><span class="nx">Unlock</span><span class="p">()</span><span class="w"></span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="nx">r</span><span class="p">.</span><span class="nx">bulkheads</span><span class="p">[</span><span class="nx">cell</span><span class="p">]</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="kc">nil</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">        </span><span class="nx">r</span><span class="p">.</span><span class="nx">bulkheads</span><span class="p">[</span><span class="nx">cell</span><span class="p">]</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="nb">make</span><span class="p">(</span><span class="kd">chan</span><span class="w"> </span><span class="kd">struct</span><span class="p">{},</span><span class="w"> </span><span class="nx">r</span><span class="p">.</span><span class="nx">perCell</span><span class="p">)</span><span class="w"></span>
+<span class="w">    </span><span class="p">}</span><span class="w"></span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="nx">r</span><span class="p">.</span><span class="nx">bulkheads</span><span class="p">[</span><span class="nx">cell</span><span class="p">]</span><span class="w"></span>
+<span class="p">}</span><span class="w"></span>
+
+<span class="kd">func</span><span class="w"> </span><span class="p">(</span><span class="nx">r</span><span class="w"> </span><span class="o">*</span><span class="nx">router</span><span class="p">)</span><span class="w"> </span><span class="nx">ServeHTTP</span><span class="p">(</span><span class="nx">w</span><span class="w"> </span><span class="nx">http</span><span class="p">.</span><span class="nx">ResponseWriter</span><span class="p">,</span><span class="w"> </span><span class="nx">req</span><span class="w"> </span><span class="o">*</span><span class="nx">http</span><span class="p">.</span><span class="nx">Request</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="nx">req</span><span class="p">.</span><span class="nx">URL</span><span class="p">.</span><span class="nx">Path</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="s">&quot;/debug/mapping&quot;</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">        </span><span class="nx">m</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">r</span><span class="p">.</span><span class="nx">current</span><span class="p">.</span><span class="nx">Load</span><span class="p">()</span><span class="w"></span>
+<span class="w">        </span><span class="nx">age</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">time</span><span class="p">.</span><span class="nx">Now</span><span class="p">().</span><span class="nx">Unix</span><span class="p">()</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="nx">r</span><span class="p">.</span><span class="nx">loadedAt</span><span class="p">.</span><span class="nx">Load</span><span class="p">()</span><span class="w"></span>
+<span class="w">        </span><span class="nx">fmt</span><span class="p">.</span><span class="nx">Fprintf</span><span class="p">(</span><span class="nx">w</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;version=%d age=%ds lastError=%q\n&quot;</span><span class="p">,</span><span class="w"> </span><span class="nx">m</span><span class="p">.</span><span class="nx">Version</span><span class="p">,</span><span class="w"> </span><span class="nx">age</span><span class="p">,</span><span class="w"> </span><span class="nx">r</span><span class="p">.</span><span class="nx">lastError</span><span class="p">.</span><span class="nx">Load</span><span class="p">())</span><span class="w"></span>
+<span class="w">        </span><span class="k">return</span><span class="w"></span>
+<span class="w">    </span><span class="p">}</span><span class="w"></span>
+<span class="w">    </span><span class="c1">// Partition key is the first path segment: /t/&lt;tenant&gt;/...</span><span class="w"></span>
+<span class="w">    </span><span class="nx">parts</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">strings</span><span class="p">.</span><span class="nx">SplitN</span><span class="p">(</span><span class="nx">strings</span><span class="p">.</span><span class="nx">TrimPrefix</span><span class="p">(</span><span class="nx">req</span><span class="p">.</span><span class="nx">URL</span><span class="p">.</span><span class="nx">Path</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;/t/&quot;</span><span class="p">),</span><span class="w"> </span><span class="s">&quot;/&quot;</span><span class="p">,</span><span class="w"> </span><span class="mi">2</span><span class="p">)</span><span class="w"></span>
+<span class="w">    </span><span class="nx">tenant</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">parts</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="w"></span>
+<span class="w">    </span><span class="nx">m</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">r</span><span class="p">.</span><span class="nx">current</span><span class="p">.</span><span class="nx">Load</span><span class="p">()</span><span class="w"></span>
+<span class="w">    </span><span class="nx">cell</span><span class="p">,</span><span class="w"> </span><span class="nx">ok</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">m</span><span class="p">.</span><span class="nx">Tenants</span><span class="p">[</span><span class="nx">tenant</span><span class="p">]</span><span class="w"></span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">!</span><span class="nx">ok</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">        </span><span class="nx">http</span><span class="p">.</span><span class="nx">Error</span><span class="p">(</span><span class="nx">w</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;unknown tenant &quot;</span><span class="o">+</span><span class="nx">tenant</span><span class="p">,</span><span class="w"> </span><span class="nx">http</span><span class="p">.</span><span class="nx">StatusNotFound</span><span class="p">)</span><span class="w"></span>
+<span class="w">        </span><span class="k">return</span><span class="w"></span>
+<span class="w">    </span><span class="p">}</span><span class="w"></span>
+<span class="w">    </span><span class="nx">target</span><span class="p">,</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">url</span><span class="p">.</span><span class="nx">Parse</span><span class="p">(</span><span class="nx">m</span><span class="p">.</span><span class="nx">Cells</span><span class="p">[</span><span class="nx">cell</span><span class="p">])</span><span class="w"></span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="kc">nil</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="nx">m</span><span class="p">.</span><span class="nx">Cells</span><span class="p">[</span><span class="nx">cell</span><span class="p">]</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="s">&quot;&quot;</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">        </span><span class="nx">http</span><span class="p">.</span><span class="nx">Error</span><span class="p">(</span><span class="nx">w</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;no address for cell &quot;</span><span class="o">+</span><span class="nx">cell</span><span class="p">,</span><span class="w"> </span><span class="nx">http</span><span class="p">.</span><span class="nx">StatusBadGateway</span><span class="p">)</span><span class="w"></span>
+<span class="w">        </span><span class="k">return</span><span class="w"></span>
+<span class="w">    </span><span class="p">}</span><span class="w"></span>
+<span class="w">    </span><span class="c1">// Bulkhead: a slow cell may exhaust its own slots, never another cell&#39;s.</span><span class="w"></span>
+<span class="w">    </span><span class="nx">slots</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">r</span><span class="p">.</span><span class="nx">bulkhead</span><span class="p">(</span><span class="nx">cell</span><span class="p">)</span><span class="w"></span>
+<span class="w">    </span><span class="k">select</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">    </span><span class="k">case</span><span class="w"> </span><span class="nx">slots</span><span class="w"> </span><span class="o">&lt;-</span><span class="w"> </span><span class="kd">struct</span><span class="p">{}{}:</span><span class="w"></span>
+<span class="w">        </span><span class="k">defer</span><span class="w"> </span><span class="kd">func</span><span class="p">()</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="o">&lt;-</span><span class="nx">slots</span><span class="w"> </span><span class="p">}()</span><span class="w"></span>
+<span class="w">    </span><span class="k">default</span><span class="p">:</span><span class="w"></span>
+<span class="w">        </span><span class="nx">http</span><span class="p">.</span><span class="nx">Error</span><span class="p">(</span><span class="nx">w</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;cell &quot;</span><span class="o">+</span><span class="nx">cell</span><span class="o">+</span><span class="s">&quot; saturated&quot;</span><span class="p">,</span><span class="w"> </span><span class="nx">http</span><span class="p">.</span><span class="nx">StatusServiceUnavailable</span><span class="p">)</span><span class="w"></span>
+<span class="w">        </span><span class="k">return</span><span class="w"></span>
+<span class="w">    </span><span class="p">}</span><span class="w"></span>
+<span class="w">    </span><span class="nx">w</span><span class="p">.</span><span class="nx">Header</span><span class="p">().</span><span class="nx">Set</span><span class="p">(</span><span class="s">&quot;X-Cell&quot;</span><span class="p">,</span><span class="w"> </span><span class="nx">cell</span><span class="p">)</span><span class="w"></span>
+<span class="w">    </span><span class="nx">httputil</span><span class="p">.</span><span class="nx">NewSingleHostReverseProxy</span><span class="p">(</span><span class="nx">target</span><span class="p">).</span><span class="nx">ServeHTTP</span><span class="p">(</span><span class="nx">w</span><span class="p">,</span><span class="w"> </span><span class="nx">req</span><span class="p">)</span><span class="w"></span>
+<span class="p">}</span><span class="w"></span>
+
+<span class="c1">// startCell runs a fake cell. POST /admin/slow on it makes every request take 2s.</span><span class="w"></span>
+<span class="kd">func</span><span class="w"> </span><span class="nx">startCell</span><span class="p">(</span><span class="nx">name</span><span class="p">,</span><span class="w"> </span><span class="nx">addr</span><span class="w"> </span><span class="kt">string</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">    </span><span class="kd">var</span><span class="w"> </span><span class="nx">slow</span><span class="w"> </span><span class="nx">atomic</span><span class="p">.</span><span class="nx">Bool</span><span class="w"></span>
+<span class="w">    </span><span class="nx">mux</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">http</span><span class="p">.</span><span class="nx">NewServeMux</span><span class="p">()</span><span class="w"></span>
+<span class="w">    </span><span class="nx">mux</span><span class="p">.</span><span class="nx">HandleFunc</span><span class="p">(</span><span class="s">&quot;/admin/slow&quot;</span><span class="p">,</span><span class="w"> </span><span class="kd">func</span><span class="p">(</span><span class="nx">w</span><span class="w"> </span><span class="nx">http</span><span class="p">.</span><span class="nx">ResponseWriter</span><span class="p">,</span><span class="w"> </span><span class="nx">_</span><span class="w"> </span><span class="o">*</span><span class="nx">http</span><span class="p">.</span><span class="nx">Request</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">        </span><span class="nx">slow</span><span class="p">.</span><span class="nx">Store</span><span class="p">(!</span><span class="nx">slow</span><span class="p">.</span><span class="nx">Load</span><span class="p">())</span><span class="w"></span>
+<span class="w">        </span><span class="nx">fmt</span><span class="p">.</span><span class="nx">Fprintf</span><span class="p">(</span><span class="nx">w</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;%s slow=%v\n&quot;</span><span class="p">,</span><span class="w"> </span><span class="nx">name</span><span class="p">,</span><span class="w"> </span><span class="nx">slow</span><span class="p">.</span><span class="nx">Load</span><span class="p">())</span><span class="w"></span>
+<span class="w">    </span><span class="p">})</span><span class="w"></span>
+<span class="w">    </span><span class="nx">mux</span><span class="p">.</span><span class="nx">HandleFunc</span><span class="p">(</span><span class="s">&quot;/&quot;</span><span class="p">,</span><span class="w"> </span><span class="kd">func</span><span class="p">(</span><span class="nx">w</span><span class="w"> </span><span class="nx">http</span><span class="p">.</span><span class="nx">ResponseWriter</span><span class="p">,</span><span class="w"> </span><span class="nx">req</span><span class="w"> </span><span class="o">*</span><span class="nx">http</span><span class="p">.</span><span class="nx">Request</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="nx">slow</span><span class="p">.</span><span class="nx">Load</span><span class="p">()</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">            </span><span class="nx">time</span><span class="p">.</span><span class="nx">Sleep</span><span class="p">(</span><span class="mi">2</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="nx">time</span><span class="p">.</span><span class="nx">Second</span><span class="p">)</span><span class="w"></span>
+<span class="w">        </span><span class="p">}</span><span class="w"></span>
+<span class="w">        </span><span class="nx">fmt</span><span class="p">.</span><span class="nx">Fprintf</span><span class="p">(</span><span class="nx">w</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;served by %s: %s\n&quot;</span><span class="p">,</span><span class="w"> </span><span class="nx">name</span><span class="p">,</span><span class="w"> </span><span class="nx">req</span><span class="p">.</span><span class="nx">URL</span><span class="p">.</span><span class="nx">Path</span><span class="p">)</span><span class="w"></span>
+<span class="w">    </span><span class="p">})</span><span class="w"></span>
+<span class="w">    </span><span class="k">go</span><span class="w"> </span><span class="kd">func</span><span class="p">()</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nx">log</span><span class="p">.</span><span class="nx">Fatal</span><span class="p">(</span><span class="nx">http</span><span class="p">.</span><span class="nx">ListenAndServe</span><span class="p">(</span><span class="nx">addr</span><span class="p">,</span><span class="w"> </span><span class="nx">mux</span><span class="p">))</span><span class="w"> </span><span class="p">}()</span><span class="w"></span>
+<span class="p">}</span><span class="w"></span>
+
+<span class="kd">func</span><span class="w"> </span><span class="nx">main</span><span class="p">()</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">    </span><span class="nx">startCell</span><span class="p">(</span><span class="s">&quot;cell-a&quot;</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;127.0.0.1:9001&quot;</span><span class="p">)</span><span class="w"></span>
+<span class="w">    </span><span class="nx">startCell</span><span class="p">(</span><span class="s">&quot;cell-b&quot;</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;127.0.0.1:9002&quot;</span><span class="p">)</span><span class="w"></span>
+
+<span class="w">    </span><span class="nx">r</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="o">&amp;</span><span class="nx">router</span><span class="p">{</span><span class="nx">bulkheads</span><span class="p">:</span><span class="w"> </span><span class="kd">map</span><span class="p">[</span><span class="kt">string</span><span class="p">]</span><span class="kd">chan</span><span class="w"> </span><span class="kd">struct</span><span class="p">{}{},</span><span class="w"> </span><span class="nx">perCell</span><span class="p">:</span><span class="w"> </span><span class="mi">8</span><span class="p">}</span><span class="w"></span>
+<span class="w">    </span><span class="nx">r</span><span class="p">.</span><span class="nx">reload</span><span class="p">(</span><span class="s">&quot;mapping.json&quot;</span><span class="p">)</span><span class="w"></span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="nx">r</span><span class="p">.</span><span class="nx">current</span><span class="p">.</span><span class="nx">Load</span><span class="p">()</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="kc">nil</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">        </span><span class="nx">log</span><span class="p">.</span><span class="nx">Fatalf</span><span class="p">(</span><span class="s">&quot;no valid mapping at startup: %v&quot;</span><span class="p">,</span><span class="w"> </span><span class="nx">r</span><span class="p">.</span><span class="nx">lastError</span><span class="p">.</span><span class="nx">Load</span><span class="p">())</span><span class="w"></span>
+<span class="w">    </span><span class="p">}</span><span class="w"></span>
+<span class="w">    </span><span class="k">go</span><span class="w"> </span><span class="kd">func</span><span class="p">()</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">        </span><span class="k">for</span><span class="w"> </span><span class="k">range</span><span class="w"> </span><span class="nx">time</span><span class="p">.</span><span class="nx">Tick</span><span class="p">(</span><span class="mi">2</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="nx">time</span><span class="p">.</span><span class="nx">Second</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">            </span><span class="nx">r</span><span class="p">.</span><span class="nx">reload</span><span class="p">(</span><span class="s">&quot;mapping.json&quot;</span><span class="p">)</span><span class="w"></span>
+<span class="w">        </span><span class="p">}</span><span class="w"></span>
+<span class="w">    </span><span class="p">}()</span><span class="w"></span>
+<span class="w">    </span><span class="nx">log</span><span class="p">.</span><span class="nx">Println</span><span class="p">(</span><span class="s">&quot;router listening on 127.0.0.1:8080&quot;</span><span class="p">)</span><span class="w"></span>
+<span class="w">    </span><span class="nx">log</span><span class="p">.</span><span class="nx">Fatal</span><span class="p">(</span><span class="nx">http</span><span class="p">.</span><span class="nx">ListenAndServe</span><span class="p">(</span><span class="s">&quot;127.0.0.1:8080&quot;</span><span class="p">,</span><span class="w"> </span><span class="nx">r</span><span class="p">))</span><span class="w"></span>
+<span class="p">}</span><span class="w"></span>
+</code></pre></div>
+
+<p>Run it in one terminal:</p>
+<div class="codehilite"><pre><span></span><code>cp mapping.json mapping.v1.json   <span class="c1"># keep a copy for later</span>
+go run .
+</code></pre></div>
+
+<p><strong>Step 1 — routing by partition key.</strong> In a second terminal:</p>
+<div class="codehilite"><pre><span></span><code>curl -si localhost:8080/t/acme/hello <span class="p">|</span> grep -E <span class="s1">&#39;X-Cell|served&#39;</span>
+<span class="c1"># X-Cell: cell-a</span>
+<span class="c1"># served by cell-a: /t/acme/hello</span>
+curl -s localhost:8080/t/globex/hello      <span class="c1"># served by cell-b</span>
+curl -s localhost:8080/t/nobody/x          <span class="c1"># unknown tenant nobody</span>
+</code></pre></div>
+
+<p>The unknown tenant gets a 404, not a guess. A router that "defaults" unknown keys to some cell will put data in the wrong place the first time the control plane is late registering a tenant.</p>
+<p><strong>Step 2 — migration as a mapping change.</strong> Move <code>initech</code> to <code>cell-a</code> and bump the version. This is the <em>Redirect</em> step; in a real system <em>Clone</em> and <em>Flip</em> happen in the cells first.</p>
+<div class="codehilite"><pre><span></span><code>sed -e <span class="s1">&#39;s/&quot;version&quot;: 1/&quot;version&quot;: 2/&#39;</span> <span class="se">\</span>
+    -e <span class="s1">&#39;s/&quot;initech&quot;: &quot;cell-b&quot;/&quot;initech&quot;: &quot;cell-a&quot;/&#39;</span> mapping.v1.json &gt; mapping.json
+sleep <span class="m">3</span>
+curl -s localhost:8080/t/initech/x          <span class="c1"># served by cell-a</span>
+</code></pre></div>
+
+<p>Note the 2-second reload interval: during that window, the router still sends <code>initech</code> to <code>cell-b</code>. That window is your TTL, and the old cell must handle it — by forwarding, or by refusing writes so the client retries.</p>
+<p><strong>Step 3 — static stability.</strong> Break the mapping source, as if the control plane pushed garbage or the config store went away:</p>
+<div class="codehilite"><pre><span></span><code><span class="nb">echo</span> <span class="s1">&#39;{ not json&#39;</span> &gt; mapping.json
+sleep <span class="m">3</span>
+curl -s localhost:8080/debug/mapping
+<span class="c1"># version=2 age=4s lastError=&quot;invalid character &#39;n&#39; looking for beginning of object key string&quot;</span>
+curl -s localhost:8080/t/initech/x          <span class="c1"># still served by cell-a</span>
+</code></pre></div>
+
+<p>Then try to "roll back" to an older mapping:</p>
+<div class="codehilite"><pre><span></span><code>cp mapping.v1.json mapping.json
+sleep <span class="m">3</span>
+curl -s localhost:8080/debug/mapping
+<span class="c1"># version=2 ... lastError=&quot;refusing rollback from version 2 to 1&quot;</span>
+</code></pre></div>
+
+<p>The data plane kept working through both bad pushes. Note that <code>age</code> keeps growing — <strong>that number is what you alert on.</strong> A router serving a stale mapping is fine for minutes and dangerous after days.</p>
+<p><strong>Step 4 — bulkheads.</strong> Make <code>cell-b</code> slow, flood it, and check that <code>cell-a</code> tenants don't notice:</p>
+<div class="codehilite"><pre><span></span><code>curl -s -X POST <span class="m">127</span>.0.0.1:9002/admin/slow      <span class="c1"># cell-b slow=true</span>
+<span class="k">for</span> i <span class="k">in</span> <span class="k">$(</span>seq <span class="m">1</span> <span class="m">30</span><span class="k">)</span><span class="p">;</span> <span class="k">do</span>
+  curl -s -o /dev/null -w <span class="s1">&#39;%{http_code}\n&#39;</span> localhost:8080/t/globex/x <span class="p">&amp;</span>
+<span class="k">done</span> &gt; flood.txt
+sleep <span class="m">0</span>.3
+<span class="nb">time</span> curl -s localhost:8080/t/acme/x           <span class="c1"># fast: ~20 ms</span>
+sleep <span class="m">3</span><span class="p">;</span> sort flood.txt <span class="p">|</span> uniq -c
+<span class="c1">#    8 200</span>
+<span class="c1">#   22 503</span>
+</code></pre></div>
+
+<p>Eight requests got <code>cell-b</code>'s eight slots and waited; the other 22 were refused immediately; <code>acme</code> on <code>cell-a</code> never waited. Now set <code>perCell</code> to a very large number, rebuild, and repeat. In this toy the router's goroutines are cheap, so <code>acme</code> will still be fast — in a real proxy with a fixed worker pool or connection pool it would not be, and that is the outage the bulkhead prevents. Say this out loud in a design review: <em>a router without per-cell isolation turns one slow cell into a global outage.</em></p>
+<p><strong>Exercises.</strong></p>
+<ol>
+<li>Add an <code>overrides</code> map that takes priority over <code>tenants</code> (AWS's "override table"), and use it to quarantine one tenant to a cell named <code>cell-quarantine</code>.</li>
+<li>Replace the full mapping for unknown tenants with consistent hashing over the cells. Add a third cell and count how many tenants move. Then compare with <code>hash % N</code>.</li>
+<li>Add a <code>max_age</code> check: if the mapping is older than some limit, keep serving but return a warning header and log loudly. Decide what the limit should be and why.</li>
+</ol>
+<h3 id="lab-2--blast-radius-calculator-python-5-minutes">Lab 2 — Blast-radius calculator (Python, 5 minutes)<a class="anchor" href="#lab-2--blast-radius-calculator-python-5-minutes">#</a></h3>
+<p>Check the numbers from the blast-radius section yourself, then change them to match a real fleet.</p>
+<div class="codehilite"><pre><span></span><code><span class="kn">from</span> <span class="nn">math</span> <span class="kn">import</span> <span class="n">comb</span>
+
+<span class="k">def</span> <span class="nf">shuffle_shard_overlap</span><span class="p">(</span><span class="n">n</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">k</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="n">total</span> <span class="o">=</span> <span class="n">comb</span><span class="p">(</span><span class="n">n</span><span class="p">,</span> <span class="n">k</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;n=</span><span class="si">{</span><span class="n">n</span><span class="si">}</span><span class="s2"> k=</span><span class="si">{</span><span class="n">k</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="n">total</span><span class="si">:</span><span class="s2">,</span><span class="si">}</span><span class="s2"> distinct hands&quot;</span><span class="p">)</span>
+    <span class="k">for</span> <span class="n">j</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">k</span> <span class="o">+</span> <span class="mi">1</span><span class="p">):</span>
+        <span class="n">p</span> <span class="o">=</span> <span class="n">comb</span><span class="p">(</span><span class="n">k</span><span class="p">,</span> <span class="n">j</span><span class="p">)</span> <span class="o">*</span> <span class="n">comb</span><span class="p">(</span><span class="n">n</span> <span class="o">-</span> <span class="n">k</span><span class="p">,</span> <span class="n">k</span> <span class="o">-</span> <span class="n">j</span><span class="p">)</span> <span class="o">/</span> <span class="n">total</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;  share exactly </span><span class="si">{</span><span class="n">j</span><span class="si">}</span><span class="s2"> of </span><span class="si">{</span><span class="n">k</span><span class="si">}</span><span class="s2"> workers with a given tenant: </span><span class="si">{</span><span class="n">p</span><span class="si">:</span><span class="s2">.6%</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+<span class="k">def</span> <span class="nf">replica_pairs</span><span class="p">(</span><span class="n">cells</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="n">pairs</span> <span class="o">=</span> <span class="n">comb</span><span class="p">(</span><span class="n">cells</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">cells</span><span class="si">}</span><span class="s2"> cells: single-cell outage hits </span><span class="si">{</span><span class="mi">1</span><span class="o">/</span><span class="n">cells</span><span class="si">:</span><span class="s2">.1%</span><span class="si">}</span><span class="s2"> of non-HA tenants; &quot;</span>
+          <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">pairs</span><span class="si">}</span><span class="s2"> active/replica pairs, so a specific double failure hits ~</span><span class="si">{</span><span class="mi">1</span><span class="o">/</span><span class="n">pairs</span><span class="si">:</span><span class="s2">.2%</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+<span class="n">shuffle_shard_overlap</span><span class="p">(</span><span class="mi">100</span><span class="p">,</span> <span class="mi">5</span><span class="p">)</span>
+<span class="n">shuffle_shard_overlap</span><span class="p">(</span><span class="mi">8</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span>
+<span class="k">for</span> <span class="n">n</span> <span class="ow">in</span> <span class="p">(</span><span class="mi">10</span><span class="p">,</span> <span class="mi">20</span><span class="p">,</span> <span class="mi">40</span><span class="p">):</span>
+    <span class="n">replica_pairs</span><span class="p">(</span><span class="n">n</span><span class="p">)</span>
+</code></pre></div>
+
+<p>Expected highlights: C(100,5) = 75,287,520; 76.96% of tenants share zero workers; with 20 cells there are 190 pairs. Then ask the more useful question: <em>what assumption makes these numbers lie?</em> (Answer: they assume failures are independent and placement is uniform. A shared dependency or a correlated deploy breaks both assumptions — which is why the sharing table above matters more than the math.)</p>
+<hr />
+<h2 id="production-gotchas">Production gotchas<a class="anchor" href="#production-gotchas">#</a></h2>
+<ol>
+<li><strong>The router is the most dangerous thing you own.</strong> It is the only component whose bug reaches every cell. Give router and mapping changes the slowest rollout in the company, and test the mapping validator as hard as the router.</li>
+<li><strong>Config pushes skip your rings.</strong> A flag flipped "everywhere" is a global deploy. Put config, rate limits, and mapping data through the same waves as code.</li>
+<li><strong>TTL does not move open connections.</strong> gRPC clients keep long-lived HTTP/2 connections. A CNAME change only affects <em>new</em> connections. The old side must actively close or reject.</li>
+<li><strong>Clients cache DNS longer than you think.</strong> Some runtimes and resolvers have their own cache settings independent of the record TTL. Measure real convergence time in a failover drill; don't compute it from the TTL.</li>
+<li><strong>Expiring things are hidden dependencies.</strong> Certs, tokens, leases, and signed URLs turn a control-plane outage into a delayed data-plane outage. List each with its lifetime and where its refresher lives.</li>
+<li><strong>Replicas need headroom.</strong> A cell full of replicas must still have room to make them all active. Spread replicas so one failure lands on many cells, not one.</li>
+<li><strong>Replication copies data faults too.</strong> A replica protects against infrastructure loss, not against a poison workflow or bad data. You still need per-tenant quarantine.</li>
+<li><strong>Cell capacity is multi-dimensional.</strong> CPU, persistence IOPS, visibility indexing, connections, IP space, and cloud quotas all run out separately. Place against the tightest one.</li>
+<li><strong>"Cell full" must be a clean answer.</strong> A placement that times out is worse than one that says "no capacity in this region." And because new cells take a long time to build, create them from a forecast.</li>
+<li><strong>The first cell lies.</strong> Code written against one cell hard-codes assumptions. Azure's advice: run at least two from day one. Run every test against the second cell, not just the first.</li>
+<li><strong>"Forget" is the only irreversible migration step.</strong> Gate deletion of the old copy on verification and a bake period, not on a timer.</li>
+<li><strong>Fleet averages hide sick cells.</strong> Alert per cell; build dashboards around the worst cell and around outliers among identical cells.</li>
+<li><strong>Everything that spans cells must be simpler than anything inside a cell.</strong> If a cross-cell component is starting to grow business logic, push that logic down into the cells or into the control plane.</li>
+</ol>
+<hr />
+<h2 id="how-this-shows-up-in-cell-lifecycle">How this shows up in cell lifecycle<a class="anchor" href="#how-this-shows-up-in-cell-lifecycle">#</a></h2>
+<ul>
+<li><strong>Provisioning (guide <a href="12-cell-lifecycle-synthesis.html">12</a>)</strong> builds one unit of this architecture. The cell DAG ends at the health gate (guide <a href="14-observability-for-cells.html">14</a>) because a cell must not join the placement pool until it is proven healthy — the gate is the line between "a cell that exists" and "a cell the router may send traffic to."</li>
+<li><strong>The account boundary (guide <a href="03-multicloud-aws-gcp-azure.html">03</a>)</strong> is the cell's outer wall. Per-cell accounts are why quotas are a capacity dimension and why teardown must leave nothing behind.</li>
+<li><strong>Terraform state layout (guide <a href="08-terraform.html">08</a>)</strong> is blast radius for infrastructure changes. One state per cell keeps a bad apply inside one cell; one state for many cells turns your IaC tool into a shared dependency.</li>
+<li><strong>GitOps (guide <a href="13-gitops-argocd-flux.html">13</a>)</strong> is where deployment waves actually live. The directory or ApplicationSet structure <em>is</em> the ring structure.</li>
+<li><strong>PKI and secrets (guides <a href="10-vault.html">10</a>, <a href="11-cert-manager-and-pki.html">11</a>)</strong> decide how long a cell survives a control-plane outage. That number is the real measure of the cell's independence.</li>
+<li><strong>Temporal internals (guide <a href="16-temporal-server-internals.html">16</a>)</strong> supply the migration and failover mechanics: replication tasks, active/standby executors, and version histories are what make <em>Clone</em> and <em>Flip</em> safe.</li>
+<li><strong>The control plane runs on Temporal (guide <a href="15-temporal-programming-model.html">15</a>).</strong> Cell lifecycle operations are long-running, retryable workflows — an entity workflow per cell — which is what makes "drain cell 7 and rebuild it" a safe, resumable operation rather than a runbook.</li>
+</ul>
+<hr />
+<h2 id="explaining-cells-in-a-design-review">Explaining cells in a design review<a class="anchor" href="#explaining-cells-in-a-design-review">#</a></h2>
+<p>The questions below come up when the system under discussion is multi-tenant infrastructure. Each answer is a starting point; be ready to go two levels deeper.</p>
+<p><strong>"Why not just run one big cluster and scale it?"</strong> Because scaling fixes throughput, not blast radius. In one big cluster, a bad deploy, a poison tenant, or a corrupted index hits everyone. Cells cap any single failure at 1/N of tenants, let you deploy in waves, and keep each copy small enough to load-test to its limit. The cost is N copies to operate, which is fine only if automation makes that cheap.</p>
+<p><strong>"Why not one cluster per customer?"</strong> Idle capacity and N = number of customers. Temporal explicitly rejected it: "customers end up paying for unused capacity, and providers shoulder higher operational costs." Cells are the middle path, and you can still give a very large tenant a dedicated cell through placement policy.</p>
+<p><strong>"How does a request find its cell?"</strong> A partition key that is in every request — the Namespace — and a thin router. For Temporal, a per-Namespace DNS name is effectively a full-mapping table stored in DNS, with SNI routing for regional endpoints. Then discuss the trade-off: no data-path hop and strong static stability, against TTL-bounded changes and connections that don't move on their own.</p>
+<p><strong>"What happens when the control plane is down?"</strong> Nothing visible to running workloads; only changes stop — new Namespaces, migrations, config. Then prove it: no control-plane calls on the request path, cached credentials, and cert lifetimes long enough to survive a long control-plane outage.</p>
+<p><strong>"How do you move a tenant?"</strong> Clone, Flip, Redirect, Forget — and for Temporal, the HA replication path already does all four. Talk about graceful versus forced flip (RPO), the in-between state, old connections, and gating Forget on verification.</p>
+<p><strong>"How do you roll out a change to 300 cells?"</strong> Rings and waves: synthetic-only first with a long soak, then low-priority tenants, then batches with pauses; automatic promotion on a green health gate and automatic halt on red; mixed clouds and regions early; config through the same pipeline; tolerate version skew.</p>
+<p><strong>"What is still shared, and what happens when it breaks?"</strong> Walk the sharing table: router/DNS, control plane, identity, PKI, secrets, registry, observability, pipelines. For each, say whether it is on the request path and how long a cell survives without it.</p>
+<p><strong>"Cells or shuffle sharding?"</strong> Both. Cells are hard walls for faults you cannot predict; shuffle sharding is statistical isolation for noisy neighbors on shared fleets. Quote the math: 5 of 100 gives 75 million distinct hands.</p>
+<hr />
+<h2 id="learning-path">Learning path<a class="anchor" href="#learning-path">#</a></h2>
+<h3 id="day-1-about-3-hours">Day 1 (about 3 hours)<a class="anchor" href="#day-1-about-3-hours">#</a></h3>
+<ul>
+<li>Read the AWS whitepaper end to end: <a href="https://docs.aws.amazon.com/wellarchitected/latest/reducing-scope-of-impact-with-cell-based-architecture/what-is-a-cell-based-architecture.html">what is a cell</a>, cell design, partition, routing, migration, deployment, observability. It is short and it is the shared vocabulary.</li>
+<li>Read Temporal's <a href="https://docs.temporal.io/cloud/overview">Cloud overview</a>, <a href="https://docs.temporal.io/cloud/rpo-rto">RPO/RTO</a>, and <a href="https://docs.temporal.io/cloud/high-availability">High Availability</a> pages. Write down every sentence that mentions cells.</li>
+<li>Do Lab 1 and Lab 2.</li>
+</ul>
+<h3 id="week-1">Week 1<a class="anchor" href="#week-1">#</a></h3>
+<ul>
+<li>Read <a href="https://temporal.io/blog/building-durable-cloud-control-systems-with-temporal">Building durable cloud control systems with Temporal</a> twice: once for the architecture, once for the workflow design.</li>
+<li>Read the Builders' Library articles on <a href="https://aws.amazon.com/builders-library/static-stability-using-availability-zones/">static stability</a> and <a href="https://aws.amazon.com/builders-library/reliability-and-constant-work/">constant work</a>, and the <a href="https://aws.amazon.com/blogs/architecture/shuffle-sharding-massive-and-magical-fault-isolation/">original shuffle sharding post</a>.</li>
+<li>Read <a href="https://slack.engineering/slacks-migration-to-a-cellular-architecture/">Slack</a>, <a href="https://shopify.engineering/a-pods-architecture-to-allow-shopify-to-scale">Shopify</a>, and <a href="https://about.roblox.com/newsroom/2023/12/making-robloxs-infrastructure-efficient-resilient">Roblox</a>. For each, write one line: what is their cell, and what failure made them build it?</li>
+<li>Do the three Lab 1 exercises.</li>
+</ul>
+<h3 id="month-1-on-the-team">Month 1 (on the team)<a class="anchor" href="#month-1-on-the-team">#</a></h3>
+<ul>
+<li>Draw the real sharing table for Temporal Cloud cells, with a survival time for every row. Find the row with the shortest survival time; that is your first project candidate.</li>
+<li>Find out where the control-plane Namespaces themselves run, and what protects them from a bad deploy.</li>
+<li>Run, or shadow, a cell drain and a failover drill. Measure real client convergence time and compare it with the TTL.</li>
+<li>Learn how placement decides "this cell is full," along which dimensions, and how far ahead new cells are forecast.</li>
+</ul>
+<hr />
+<h2 id="references">References<a class="anchor" href="#references">#</a></h2>
+<ol>
+<li><a href="https://docs.aws.amazon.com/wellarchitected/latest/reducing-scope-of-impact-with-cell-based-architecture/what-is-a-cell-based-architecture.html">AWS Well-Architected — What is a cell-based architecture?</a> — the cell, router, and control-plane decomposition; the bulkhead analogy.</li>
+<li><a href="https://docs.aws.amazon.com/wellarchitected/latest/reducing-scope-of-impact-with-cell-based-architecture/cell-design.html">AWS Well-Architected — Cell design</a> — "no dependency on each other at all"; separate accounts encouraged.</li>
+<li><a href="https://docs.aws.amazon.com/wellarchitected/latest/reducing-scope-of-impact-with-cell-based-architecture/cell-partition.html">AWS Well-Architected — Cell partition</a> — partition keys, grain, the large-tenant problem, cross-grain calls through the router.</li>
+<li><a href="https://docs.aws.amazon.com/wellarchitected/latest/reducing-scope-of-impact-with-cell-based-architecture/full-mapping.html">AWS Well-Architected — Full mapping</a> — trade-offs of mapping every key explicitly.</li>
+<li><a href="https://docs.aws.amazon.com/wellarchitected/latest/reducing-scope-of-impact-with-cell-based-architecture/a-warning-for-all-mapping-approaches.html">AWS Well-Architected — A warning for all mapping approaches</a> — the override table.</li>
+<li><a href="https://docs.aws.amazon.com/wellarchitected/latest/reducing-scope-of-impact-with-cell-based-architecture/cell-routing.html">AWS Well-Architected — Cell routing</a> — router properties and design options.</li>
+<li><a href="https://docs.aws.amazon.com/wellarchitected/latest/reducing-scope-of-impact-with-cell-based-architecture/about-resilience-of-the-cell-router.html">AWS Well-Architected — About resilience of the cell router</a> — the router as the one shared component; make it cellular.</li>
+<li><a href="https://docs.aws.amazon.com/wellarchitected/latest/reducing-scope-of-impact-with-cell-based-architecture/cell-migration.html">AWS Well-Architected — Cell migration</a> — Clone, Flip, Redirect, Forget.</li>
+<li><a href="https://docs.aws.amazon.com/wellarchitected/latest/reducing-scope-of-impact-with-cell-based-architecture/cell-deployment.html">AWS Well-Architected — Cell deployment</a> — deploy in waves, cell by cell.</li>
+<li><a href="https://docs.aws.amazon.com/wellarchitected/latest/reducing-scope-of-impact-with-cell-based-architecture/cell-observability.html">AWS Well-Architected — Cell observability</a> — a cell-aware observability stack.</li>
+<li><a href="https://docs.aws.amazon.com/wellarchitected/latest/reducing-scope-of-impact-with-cell-based-architecture/cell-sizing.html">AWS Well-Architected — Cell sizing</a> — the three forces on cell size.</li>
+<li><a href="https://aws.amazon.com/builders-library/static-stability-using-availability-zones/">Amazon Builders' Library — Static stability using Availability Zones</a> — control plane vs data plane; overprovisioning by 50% across three AZs.</li>
+<li><a href="https://aws.amazon.com/builders-library/reliability-and-constant-work/">Amazon Builders' Library — Reliability, constant work, and a good cup of coffee</a> — why simple, constant-work designs make reliable routers.</li>
+<li><a href="https://aws.amazon.com/blogs/architecture/shuffle-sharding-massive-and-magical-fault-isolation/">AWS Architecture Blog — Shuffle Sharding: Massive and Magical Fault Isolation (2014)</a> — the original shuffle sharding explanation.</li>
+<li><a href="https://aws.amazon.com/builders-library/workload-isolation-using-shuffle-sharding/">Amazon Builders' Library — Workload isolation using shuffle sharding</a> — the longer treatment, including Route 53 (now redirects to AWS Builder Center).</li>
+<li><a href="https://learn.microsoft.com/en-us/azure/architecture/patterns/deployment-stamp">Microsoft Azure Architecture Center — Deployment Stamps pattern</a> — stamps, scale units, routing, when not to use the pattern, run at least two.</li>
+<li><a href="https://docs.temporal.io/cloud/overview">Temporal Cloud — Overview</a> — "Temporal Cloud uses a cell-based architecture"; what a cell contains; data vs control plane.</li>
+<li><a href="https://docs.temporal.io/cloud/rpo-rto">Temporal Cloud — Outages and recovery objectives (RPO/RTO)</a> — cells across at least three AZs; RPO/RTO by failure scope.</li>
+<li><a href="https://docs.temporal.io/cloud/high-availability">Temporal Cloud — High Availability</a> — Same-region, Multi-region, and Multi-cloud Replication; "replicate the Namespace across multiple cells in that region."</li>
+<li><a href="https://docs.temporal.io/cloud/high-availability/how-it-works">Temporal Cloud — High Availability: how it works</a> — CNAME update on failover; 15-second TTL; clients converge in about 30 seconds.</li>
+<li><a href="https://docs.temporal.io/cloud/namespaces">Temporal Cloud — Namespaces</a> — Namespace as a unit of isolation; Namespace and regional endpoints; <code>server_name</code> for regional endpoints.</li>
+<li><a href="https://temporal.io/blog/building-durable-cloud-control-systems-with-temporal">Temporal blog — Building durable cloud control systems with Temporal (Sergey Bykov, Jan 16, 2025)</a> — cells as per-account units; User CP and Infra CP; entity workflow per cell; deployment rings.</li>
+<li><a href="https://temporal.io/blog/expanding-temporal-clouds-high-availability-offerings">Temporal blog — Temporal Cloud expands High Availability (Nikitha Suryadevara, Mar 4, 2025)</a> — "Each cell ... acts as a failure domain"; asynchronous replication to a replica.</li>
+<li><a href="https://temporal.io/blog/multi-cloud-thats-one-small-step-for-temporal-one-giant-leap-for-reliability">Temporal blog — Multi-cloud: one small step for Temporal</a> — how the cell abstraction carried over from AWS to GCP.</li>
+<li><a href="https://docs.temporal.io/nexus">Temporal docs — Nexus</a> — the supported way to call across Namespaces.</li>
+<li><a href="https://slack.engineering/slacks-migration-to-a-cellular-architecture/">Slack Engineering — Slack's Migration to a Cellular Architecture</a> — AZ-as-cell; draining through Envoy weights in seconds.</li>
+<li><a href="https://shopify.engineering/a-pods-architecture-to-allow-shopify-to-scale">Shopify Engineering — A Pods Architecture to Allow Shopify to Scale</a> — Sorting Hat routing and the Pod Mover.</li>
+<li><a href="https://about.roblox.com/newsroom/2023/12/making-robloxs-infrastructure-efficient-resilient">Roblox — How We're Making Roblox's Infrastructure More Efficient and Resilient (Dec 7, 2023)</a> — ~1,400-machine cells; &gt;70% of back-end traffic in cells; the 73-hour outage that motivated them.</li>
+</ol><p class="disclaimer"><strong>Disclaimer.</strong> I wrote this library before I joined Temporal, to ramp up on the areas my new role would likely touch. It contains no internal information &mdash; nothing here was sourced from Temporal&rsquo;s internal knowledge. Temporal is open source, so the programming model and server internals come from public code and documentation, and every statement about Temporal Cloud comes from Temporal&rsquo;s public docs and engineering blog, linked inline. Most of the library is general infrastructure technology &mdash; Go, gRPC, Kubernetes, Karpenter, Terraform, Helm, Vault, cert-manager, GitOps, observability &mdash; that has nothing to do with any one company. Where a guide goes beyond public sources, it says so and labels the claim as inference.</p></article><aside class="rail"><div class="rail-label">On this page</div><a href="#the-mental-model">The mental model</a><a href="#core-concepts">Core concepts</a><a class="h3" href="#the-three-parts-and-what-temporal-cloud-maps-to-each">The three parts, and what Temporal Cloud maps to each</a><a class="h3" href="#where-the-pattern-comes-from">Where the pattern comes from</a><a class="h3" href="#choosing-the-partition-key">Choosing the partition key</a><a class="h3" href="#mapping-keys-to-cells">Mapping keys to cells</a><a class="h3" href="#the-cell-router-design-choices">The cell router: design choices</a><a class="h3" href="#control-plane-data-plane-and-static-stability">Control plane, data plane, and static stability</a><a class="h3" href="#blast-radius-math-cells-replicas-and-shuffle-sharding">Blast radius math: cells, replicas, and shuffle sharding</a><a class="h3" href="#cell-sizing-revisited-as-a-capacity-vector">Cell sizing, revisited as a capacity vector</a><a class="h3" href="#placement-and-capacity-management">Placement and capacity management</a><a class="h3" href="#migration-moving-a-tenant-between-cells">Migration: moving a tenant between cells</a><a class="h3" href="#deploying-to-many-cells">Deploying to many cells</a><a class="h3" href="#observability-across-cells">Observability across cells</a><a class="h3" href="#what-you-are-allowed-to-share">What you are allowed to share</a><a class="h3" href="#failure-modes-that-are-specific-to-cells">Failure modes that are specific to cells</a><a class="h3" href="#cells-compared-with-the-alternatives">Cells compared with the alternatives</a><a href="#hands-on">Hands-on</a><a class="h3" href="#lab-1--a-thin-statically-stable-cell-router-go-20-minutes-free">Lab 1 — A thin, statically stable cell router (Go, ~20 minutes, free)</a><a class="h3" href="#lab-2--blast-radius-calculator-python-5-minutes">Lab 2 — Blast-radius calculator (Python, 5 minutes)</a><a href="#production-gotchas">Production gotchas</a><a href="#how-this-shows-up-in-cell-lifecycle">How this shows up in cell lifecycle</a><a href="#explaining-cells-in-a-design-review">Explaining cells in a design review</a><a href="#learning-path">Learning path</a><a class="h3" href="#day-1-about-3-hours">Day 1 (about 3 hours)</a><a class="h3" href="#week-1">Week 1</a><a class="h3" href="#month-1-on-the-team">Month 1 (on the team)</a><a href="#references">References</a></aside></div></div><script>
+document.querySelectorAll('.codehilite').forEach(function(block){
+  var wrap=document.createElement('div'); wrap.className='codewrap';
+  block.parentNode.insertBefore(wrap,block); wrap.appendChild(block);
+  var b=document.createElement('button'); b.className='copybtn'; b.textContent='copy';
+  b.addEventListener('click',function(){
+    var txt=block.innerText;
+    if(navigator.clipboard&&navigator.clipboard.writeText){
+      navigator.clipboard.writeText(txt).then(function(){
+        b.textContent='copied'; setTimeout(function(){b.textContent='copy';},1200);
+      }).catch(function(){b.textContent='select manually';});
+    } else {
+      var ta=document.createElement('textarea'); ta.value=txt; document.body.appendChild(ta);
+      ta.select(); try{document.execCommand('copy'); b.textContent='copied';}catch(e){}
+      document.body.removeChild(ta); setTimeout(function(){b.textContent='copy';},1200);
+    }
+  });
+  wrap.appendChild(b);
+});
+
+document.querySelectorAll('.doc table').forEach(function(t){
+  if(t.parentNode.classList.contains('tablewrap'))return;
+  var w=document.createElement('div'); w.className='tablewrap';
+  t.parentNode.insertBefore(w,t); w.appendChild(t);
+});
+
+(function(){
+  var links=Array.prototype.slice.call(document.querySelectorAll('.rail a'));
+  if(!links.length)return;
+  var map={};
+  links.forEach(function(a){
+    var el=document.getElementById(a.getAttribute('href').slice(1));
+    if(el)map[a.getAttribute('href').slice(1)]=a;
+  });
+  var obs=new IntersectionObserver(function(entries){
+    entries.forEach(function(e){
+      var a=map[e.target.id]; if(!a)return;
+      if(e.isIntersecting){
+        links.forEach(function(x){x.classList.remove('here');});
+        a.classList.add('here');
+      }
+    });
+  },{rootMargin:'0px 0px -78% 0px',threshold:0});
+  Object.keys(map).forEach(function(id){
+    var el=document.getElementById(id); if(el)obs.observe(el);
+  });
+})();
+</script>
+<script>/* open external links in a new tab; links within the library stay in this tab */
+document.addEventListener('click',function(e){var a=e.target.closest&&e.target.closest('a[href]');if(!a)return;var h=a.getAttribute('href');if(!h||h.charAt(0)==='#'||h.indexOf('javascript:')===0||a.hasAttribute('download'))return;if(!/^https?:$/.test(a.protocol)||a.host===location.host)return;a.target='_blank';a.rel='noopener';},true);
+</script>
+</body>
+</html>

@@ -1,0 +1,1869 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AWS / GCP / Azure Foundations for a Portable Cell - Temporal Cloud Infrastructure Ramp-Up</title>
+<link rel="stylesheet" href="style.css">
+<script>
+(function(){
+  try{
+    var t=localStorage.getItem('rampup-theme');
+    if(t){document.documentElement.setAttribute('data-theme',t);}
+  }catch(e){}
+  window.__toggleTheme=function(){
+    var el=document.documentElement;
+    var cur=el.getAttribute('data-theme');
+    if(!cur){
+      cur=window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';
+    }
+    var next=cur==='dark'?'light':'dark';
+    el.setAttribute('data-theme',next);
+    try{localStorage.setItem('rampup-theme',next);}catch(e){}
+  };
+})();
+</script>
+
+</head>
+<body>
+<div class="shell"><aside class="sidebar">
+  <div class="brand"><a href="../index.html">
+    <div class="brand-title">Temporal Cloud Infrastructure Ramp-Up</div>
+    <div class="brand-sub">New-role ramp-up &middot; public sources only</div>
+  </a></div>
+  <div class="nav-label">Guides</div>
+  <nav class="nav"><a href="01-golang.html"><span class="num">01</span><span>Go</span></a><a href="02-grpc.html"><span class="num">02</span><span>gRPC &amp; Protobuf</span></a><a href="03-multicloud-aws-gcp-azure.html" class="active"><span class="num">03</span><span>Multi-Cloud</span></a><a href="04-managed-kubernetes-eks-gke-aks.html"><span class="num">04</span><span>Managed Kubernetes</span></a><a href="05-cni-and-host-networking.html"><span class="num">05</span><span>CNI &amp; Host Networking</span></a><a href="06-karpenter.html"><span class="num">06</span><span>Karpenter</span></a><a href="07-kyverno.html"><span class="num">07</span><span>Kyverno</span></a><a href="08-terraform.html"><span class="num">08</span><span>Terraform</span></a><a href="09-helm.html"><span class="num">09</span><span>Helm</span></a><a href="10-vault.html"><span class="num">10</span><span>Vault</span></a><a href="11-cert-manager-and-pki.html"><span class="num">11</span><span>cert-manager &amp; PKI</span></a><a href="12-cell-lifecycle-synthesis.html"><span class="num">12</span><span>Cell Lifecycle</span></a><a href="13-gitops-argocd-flux.html"><span class="num">13</span><span>GitOps</span></a><a href="14-observability-for-cells.html"><span class="num">14</span><span>Observability</span></a><a href="15-temporal-programming-model.html"><span class="num">15</span><span>Temporal: Programming Model</span></a><a href="16-temporal-server-internals.html"><span class="num">16</span><span>Temporal Server Internals</span></a><a href="17-cell-based-architecture.html"><span class="num">17</span><span>Cell-Based Architecture</span></a></nav>
+  <div class="nav-label" style="margin-top:1rem">Practice</div>
+  <nav class="nav"><a href="../drill.html"><span class="num">&#9670;</span><span>Drill deck</span></a></nav>
+</aside><div class="main"><article class="doc"><div class="topbar">
+  <div class="crumbs"><span class="pill">Guide 03</span><span class="pill">77 refs</span><span class="pill">16,130 words</span></div>
+  <div style="display:flex;gap:.5rem;align-items:center">
+    <span>~81 min read</span>
+    <button class="iconbtn" onclick="__toggleTheme()">theme</button>
+  </div>
+</div><h1>AWS / GCP / Azure Foundations for a Portable Cell</h1>
+<div class="lede"><p><strong>Why this matters.</strong> Cell lifecycle work — provisioning, upgrading, and tearing down isolated Kubernetes-based units of Temporal Cloud capacity — spans AWS, GCP, and Azure. That means you are not "an AWS engineer who also touches GCP." You are the person who has to answer, for every capability a cell needs, three questions at once: what is this called here, what is its scoping model, and what breaks when I assume it behaves like the other two. Temporal has already walked part of this road publicly: the expansion from AWS-only to AWS + GCP is documented in <a href="https://temporal.io/blog/multi-cloud-thats-one-small-step-for-temporal-one-giant-leap-for-reliability">Making Temporal Cloud a Multi-Cloud Platform</a>, which is explicit that Kubernetes and Terraform standardize <em>less</em> than people expect, that the load balancer resource graphs differ in <em>shape</em> and not just in naming, and that the visibility layer (OpenSearch on AWS) had no drop-in GCP equivalent. Azure is named in that post as the next target. This guide is the comparison substrate for that work.</p></div>
+<p>Everything below is organized as: capability → three-column table → the deltas that actually bite.</p>
+<hr />
+<h2 id="the-mental-model">The mental model<a class="anchor" href="#the-mental-model">#</a></h2>
+<p>Three framings make three clouds tractable simultaneously. Internalize these and most individual facts become derivable.</p>
+<h3 id="framing-1-every-cloud-answers-the-same-six-questions-differently">Framing 1: every cloud answers the same six questions, differently<a class="anchor" href="#framing-1-every-cloud-answers-the-same-six-questions-differently">#</a></h3>
+<p>For any cell you provision, the platform must supply: (1) a <strong>tenancy container</strong> that bounds blast radius and quota, (2) a <strong>principal</strong> the cell's software runs as, (3) an <strong>L3 fabric</strong> with addressing and policy, (4) an <strong>ingress surface</strong> that terminates client traffic, (5) <strong>durable state</strong> (block, object, database), and (6) <strong>key material</strong> for encryption and TLS. Every cloud answers all six. The names are noise; the <em>scoping models</em> are signal. When you hit an unfamiliar service, ask "which of the six is this, and what is its scope?" rather than "what is the AWS equivalent?"</p>
+<h3 id="framing-2-the-scope-axis-is-the-single-biggest-source-of-surprise">Framing 2: the scope axis is the single biggest source of surprise<a class="anchor" href="#framing-2-the-scope-axis-is-the-single-biggest-source-of-surprise">#</a></h3>
+<p>Each cloud has a different default scope for the same object. Memorize this table and half the multi-cloud bugs become predictable:</p>
+<table>
+<thead>
+<tr>
+<th>Object</th>
+<th>AWS scope</th>
+<th>GCP scope</th>
+<th>Azure scope</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Virtual network</td>
+<td>Regional (VPC)</td>
+<td><strong>Global</strong> (VPC network)</td>
+<td>Regional (VNet)</td>
+</tr>
+<tr>
+<td>Subnet</td>
+<td><strong>Zonal</strong></td>
+<td><strong>Regional</strong> (spans all zones)</td>
+<td>Regional (spans all zones)</td>
+</tr>
+<tr>
+<td>Routes / route tables</td>
+<td>Per-subnet route table, regional</td>
+<td>Global routes on the VPC</td>
+<td>Per-subnet UDR, regional</td>
+</tr>
+<tr>
+<td>Firewall object</td>
+<td>Attached to ENI (security group), regional</td>
+<td>Attached to the <strong>VPC</strong>, targeted by tag/service account</td>
+<td>Attached to subnet <strong>and/or</strong> NIC (NSG)</td>
+</tr>
+<tr>
+<td>L7 load balancer</td>
+<td>Regional (ALB)</td>
+<td>Global <strong>or</strong> regional (ALB)</td>
+<td>Regional (App Gateway) or global (Front Door)</td>
+</tr>
+<tr>
+<td>Block volume</td>
+<td><strong>Zonal</strong></td>
+<td>Zonal, plus <strong>regional (2-zone sync)</strong> options</td>
+<td>Zonal, plus <strong>ZRS</strong> options</td>
+</tr>
+<tr>
+<td>Managed K8s control plane</td>
+<td>Regional</td>
+<td>Zonal or regional</td>
+<td>Regional</td>
+</tr>
+<tr>
+<td>Identity boundary</td>
+<td>Account</td>
+<td>Project (in an Organization)</td>
+<td><strong>Entra tenant, separate from the ARM subscription</strong></td>
+</tr>
+<tr>
+<td>Quota boundary</td>
+<td>Account × region</td>
+<td>Project × region</td>
+<td>Subscription × region</td>
+</tr>
+</tbody>
+</table>
+<p>The three classics: GCP subnets are regional so a "subnet per AZ" loop produces one subnet, not three; GCP VPCs are global so cross-region connectivity needs no peering at all; Azure splits identity (Entra) from resource management (ARM) so "create the identity then grant it a role" is two different APIs with two different consistency models.</p>
+<h3 id="framing-3-abstract-the-verbs-never-the-nouns">Framing 3: abstract the verbs, never the nouns<a class="anchor" href="#framing-3-abstract-the-verbs-never-the-nouns">#</a></h3>
+<p>The failure mode of multi-cloud is a <code>CloudLoadBalancer</code> type with a lowest-common-denominator field set. Temporal's own answer, published in the multi-cloud blog, is an interface of <em>operations</em> (<code>DeployPersistenceStore</code>, <code>DeployVisibilityPersistenceStore</code>) plus a factory that returns a provider-specific implementation, with cloud-agnostic parent workflows spawning cloud-specific child workflows. The interface is a list of verbs the cell lifecycle needs. The implementations are allowed to be wildly different — three Terraform resources on GCP versus two on AWS, a different vendor entirely for visibility. Adding a method to the interface forces you to implement it everywhere, which is exactly the feature-parity pressure you want.</p>
+<p>Corollary: the thing you keep stable is the <strong>cell contract</strong> — what a finished cell exposes to the rest of the system (endpoints, identity, persistence handles, telemetry streams, teardown semantics) — not the resource graph that produces it.</p>
+<hr />
+<h2 id="core-concepts">Core concepts<a class="anchor" href="#core-concepts">#</a></h2>
+<h3 id="resource-hierarchy-and-tenancy">Resource hierarchy and tenancy<a class="anchor" href="#resource-hierarchy-and-tenancy">#</a></h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>AWS</th>
+<th>GCP</th>
+<th>Azure</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Top</td>
+<td>Organization (management account)</td>
+<td>Organization (tied to a Cloud Identity/Workspace domain)</td>
+<td>Entra ID tenant</td>
+</tr>
+<tr>
+<td>Grouping</td>
+<td>Organizational Units, nestable <a href="https://docs.aws.amazon.com/organizations/latest/userguide/orgs_reference_limits.html">5 levels deep</a></td>
+<td>Folders, nestable <a href="https://docs.cloud.google.com/resource-manager/docs/limits">up to 10 levels</a>, max 300 folders per parent</td>
+<td>Management groups, <a href="https://learn.microsoft.com/en-us/azure/governance/management-groups/overview">6 levels of depth</a> excluding root and subscription</td>
+</tr>
+<tr>
+<td>Isolation + quota unit</td>
+<td><strong>Account</strong></td>
+<td><strong>Project</strong></td>
+<td><strong>Subscription</strong></td>
+</tr>
+<tr>
+<td>Sub-container</td>
+<td>none (region is not a container)</td>
+<td>none</td>
+<td><strong>Resource group</strong> (has its own location; metadata lives there)</td>
+</tr>
+<tr>
+<td>Guardrail policy</td>
+<td>SCPs (identity-side) and <a href="https://aws.amazon.com/about-aws/whats-new/2024/11/resource-control-policies-restrict-access-aws-resources">RCPs</a> (resource-side), introduced Nov 2024</td>
+<td>Organization Policy constraints (inherited down the hierarchy) + IAM deny policies</td>
+<td>Azure Policy (+ deny assignments) at MG/subscription/RG</td>
+</tr>
+<tr>
+<td>Default creation limit</td>
+<td><a href="https://docs.aws.amazon.com/organizations/latest/userguide/orgs_reference_limits.html">10 accounts by default</a>, raisable via Service Quotas</td>
+<td>Project-creation quota on the creating principal <em>and</em> the org</td>
+<td>Subscription creation is a billing-agreement operation, not a quota bump</td>
+</tr>
+<tr>
+<td>Deletion semantics</td>
+<td>Account close, 90-day suspension before removal</td>
+<td>Project delete → 30-day soft delete, ID <strong>never reusable</strong></td>
+<td>Subscription cancel; RG delete is synchronous-ish and cascades</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Deltas that bite.</strong></p>
+<ul>
+<li><strong>Azure has a fourth level nobody else has.</strong> The resource group is a real lifecycle container: deleting it cascades, and every resource must live in exactly one. That makes <code>rg-cell-&lt;id&gt;</code> an attractive cell boundary — one delete, whole cell gone — but resource groups are <em>not</em> a quota boundary and <em>not</em> a security boundary by default, and their <code>location</code> only stores metadata (a resource in <code>eastus2</code> can live in a <code>westus</code> RG, which produces confusing failure modes during regional outages). Do not confuse RG-per-cell with account-per-cell.</li>
+<li><strong>The quota boundary is the real cell boundary.</strong> On all three, quota is enforced at account/project/subscription × region. If you put ten cells in one account, they share one EC2 vCPU quota and one throttling budget, and a runaway cell starves its neighbors. Cell-per-account (AWS), cell-per-project (GCP), cell-per-subscription (Azure) gives you hard quota isolation and a clean <a href="https://docs.aws.amazon.com/wellarchitected/latest/reducing-scope-of-impact-with-cell-based-architecture/reducing-scope-of-impact-with-cell-based-architecture.html">blast-radius story</a> — at the cost of N× the quota-increase paperwork, N× the org-policy attachment surface, and N× the "which account is this?" cognitive load.</li>
+<li><strong>Project IDs are permanently burned on GCP.</strong> A deleted project's ID cannot be reused. If your cell naming scheme derives project IDs from cell IDs, a create-fail-destroy-retry loop permanently consumes names. Design cell IDs with a generation suffix from day one.</li>
+<li><strong>GCP projects are cheap; AWS accounts and Azure subscriptions are not.</strong> Programmatic project creation is a normal API call bounded by quota. Programmatic AWS account creation via Organizations is possible but slow and rate-limited. Azure subscription creation depends on your agreement type (EA/MCA) and is the least ergonomic of the three. This asymmetry alone often pushes teams toward cell-per-project on GCP and cell-per-namespace-in-a-shared-account elsewhere — which then makes the three implementations structurally different, which is fine, as long as the cell contract hides it.</li>
+</ul>
+<h3 id="regions-zones-and-what-multi-region-actually-means">Regions, zones, and what "multi-region" actually means<a class="anchor" href="#regions-zones-and-what-multi-region-actually-means">#</a></h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>AWS</th>
+<th>GCP</th>
+<th>Azure</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Failure domain inside a region</td>
+<td>Availability Zone</td>
+<td>Zone</td>
+<td>Availability Zone (not present in every region)</td>
+</tr>
+<tr>
+<td>Typical count</td>
+<td>3+ per region</td>
+<td>3+ per region</td>
+<td>3 where supported; some regions have none</td>
+</tr>
+<tr>
+<td>Naming stability</td>
+<td>AZ <strong>names</strong> are per-account aliases; <strong>AZ IDs</strong> (<code>use1-az1</code>) are stable</td>
+<td>Zone names are globally stable</td>
+<td>Logical zones 1/2/3 are mapped <strong>per subscription</strong> to physical zones (<a href="https://learn.microsoft.com/en-us/azure/reliability/availability-zones-overview">docs</a>)</td>
+</tr>
+<tr>
+<td>Region pairing</td>
+<td>None (you choose)</td>
+<td>None (you choose)</td>
+<td>Historically paired regions drive some replication defaults</td>
+</tr>
+<tr>
+<td>Global services</td>
+<td>IAM, Route 53, CloudFront, Organizations</td>
+<td>IAM, Cloud DNS, global LB, <strong>VPC networks</strong></td>
+<td>Entra ID, Front Door, Traffic Manager, DNS</td>
+</tr>
+<tr>
+<td>Resource that spans regions natively</td>
+<td>None</td>
+<td><strong>VPC network</strong>, global LB, multi-region GCS buckets</td>
+<td>None at the network layer</td>
+</tr>
+</tbody>
+</table>
+<p>Two consequences for cells.</p>
+<p>First, <strong>"deploy the cell across three zones" is not a portable instruction.</strong> On AWS it means three subnets, three NAT gateways, three node groups (or one spanning group with three subnets), and a conscious cross-AZ traffic bill. On GCP it means one subnet and a regional node pool. On Azure it means one subnet, zone-spanning VM scale sets, and free inter-zone traffic — but you must first confirm the region <em>has</em> zones, because not all do, and a zone-redundant template deployed to a non-zonal region either fails or silently degrades to single-zone.</p>
+<p>Second, <strong>zone anti-affinity across cells is only meaningful if you can name physical zones.</strong> If cell A and cell B live in different AWS accounts and both "spread across a, b, c," they may be spread across the <em>same</em> physical zones or completely different ones — the alias mapping is per account. The same applies across Azure subscriptions. Record AZ IDs and physical zone mappings in cell metadata at provision time; you cannot reconstruct them later from the names.</p>
+<h3 id="identity-and-authorization">Identity and authorization<a class="anchor" href="#identity-and-authorization">#</a></h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>AWS</th>
+<th>GCP</th>
+<th>Azure</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Principal types</td>
+<td>IAM users, IAM roles, service-linked roles</td>
+<td>User accounts, groups, <strong>service accounts</strong>, federated principals</td>
+<td>Users, groups, <strong>service principals</strong>, managed identities (system- or user-assigned)</td>
+</tr>
+<tr>
+<td>Policy attachment</td>
+<td>Identity policies + <strong>resource policies</strong> (S3, KMS, SQS, …) + role <strong>trust policies</strong></td>
+<td><a href="https://docs.cloud.google.com/iam/docs/overview">Allow policies bound to resources</a> at org/folder/project/resource; roles are collections of permissions</td>
+<td><a href="https://learn.microsoft.com/en-us/azure/role-based-access-control/overview">Role assignments</a> = (principal, role definition, scope) as ARM resources</td>
+</tr>
+<tr>
+<td>Inheritance</td>
+<td>None down the hierarchy; SCPs only <em>subtract</em></td>
+<td>Allow policies <strong>inherit</strong> down the hierarchy and are additive</td>
+<td>Role assignments <strong>inherit</strong> down MG → subscription → RG → resource</td>
+</tr>
+<tr>
+<td>Deny</td>
+<td>Explicit <code>Deny</code> in policy; SCP/RCP boundaries</td>
+<td>IAM <strong>deny policies</strong> (separate object) + org policy constraints</td>
+<td>Deny assignments (created by Azure Blueprints/managed apps, not directly authorable)</td>
+</tr>
+<tr>
+<td>Assume/impersonate</td>
+<td><code>sts:AssumeRole</code> gated by the target role's <strong>trust policy</strong></td>
+<td><strong>Impersonate a service account</strong> — you need <code>iam.serviceAccounts.getAccessToken</code> / <code>actAs</code> on the SA <em>resource</em>, and the SA needs roles on the target</td>
+<td>No impersonation model; you <em>are</em> the managed identity, or you hold the SP's credential</td>
+</tr>
+<tr>
+<td>Control-plane vs identity-plane</td>
+<td>Single plane (IAM + STS)</td>
+<td>Single plane (Cloud IAM + IAM Credentials API)</td>
+<td><strong>Split</strong>: Microsoft Graph for identity objects, ARM for role assignments</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Why GCP's model genuinely differs from AWS assume-role.</strong> In AWS, a role is a <em>container of permissions</em> whose trust policy says who may wear it; <code>AssumeRole</code> swaps your identity wholesale. In GCP, a service account is simultaneously a <strong>principal</strong> (it can hold IAM roles on other resources) and a <strong>resource</strong> (it has its own IAM policy saying who may act as it). Getting a token therefore requires a two-sided grant: someone must grant <em>you</em> <code>roles/iam.serviceAccountTokenCreator</code> <strong>on the service account object</strong>, and someone must grant <em>the service account</em> a role <strong>on the thing you want to touch</strong>. This is <a href="https://docs.cloud.google.com/iam/docs/service-account-impersonation">service account impersonation</a>, and it composes: SA-A can impersonate SA-B which can impersonate SA-C, producing delegation chains AWS models with role chaining (and AWS caps role chaining at one hour of session duration, which GCP does not have an analogue for). The practical consequence for cell automation: your GCP provisioning identity needs <em>two</em> grants per target, in two different projects potentially, and forgetting the resource-side grant produces a <code>PERMISSION_DENIED</code> that names the wrong thing.</p>
+<p><strong>Why Azure's split plane bites.</strong> Creating a user-assigned managed identity is an ARM operation. Creating an app registration + service principal is a <strong>Microsoft Graph</strong> operation against Entra ID. Granting either a role is an ARM operation. These have independent throttling, independent RBAC (Entra directory roles are <em>not</em> Azure RBAC roles — see <a href="https://learn.microsoft.com/en-us/azure/role-based-access-control/rbac-and-directory-admin-roles">the comparison doc</a>), and — critically — <strong>independent replication latency</strong>. A freshly created service principal frequently is not yet visible to ARM when you immediately try to assign it a role, producing <code>PrincipalNotFound</code>. Every mature Azure provisioning workflow has a retry loop around role assignment. In Temporal terms this is exactly what activity retry policies are for; do not "fix" it with <code>sleep 30</code>.</p>
+<p><strong>The same grant, three ways.</strong> "Let the cell's provisioner read one bucket" looks like this:</p>
+<div class="codehilite"><pre><span></span><code>// AWS — two documents: a trust policy on the role, an identity policy for the permission
+// Trust policy (who may become this role):
+{ &quot;Version&quot;: &quot;2012-10-17&quot;, &quot;Statement&quot;: [{
+    &quot;Effect&quot;: &quot;Allow&quot;,
+    &quot;Principal&quot;: { &quot;Federated&quot;: &quot;arn:aws:iam::111122223333:oidc-provider/oidc.eks.us-east-1.amazonaws.com/id/EXAMPLE&quot; },
+    &quot;Action&quot;: &quot;sts:AssumeRoleWithWebIdentity&quot;,
+    &quot;Condition&quot;: { &quot;StringEquals&quot;: {
+      &quot;oidc.eks.us-east-1.amazonaws.com/id/EXAMPLE:sub&quot;: &quot;system:serviceaccount:temporal:provisioner&quot;,
+      &quot;oidc.eks.us-east-1.amazonaws.com/id/EXAMPLE:aud&quot;: &quot;sts.amazonaws.com&quot; }}}]}
+// Identity policy (what the role may do): s3:GetObject on arn:aws:s3:::cell-artifacts/*
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="c1"># GCP — one binding if you use direct resource access; two if you impersonate a service account</span>
+gcloud storage buckets add-iam-policy-binding gs://cell-artifacts <span class="se">\</span>
+  --role<span class="o">=</span>roles/storage.objectViewer <span class="se">\</span>
+  --member<span class="o">=</span><span class="s2">&quot;principal://iam.googleapis.com/projects/</span><span class="si">${</span><span class="nv">PROJECT_NUMBER</span><span class="si">}</span><span class="s2">/locations/global/workloadIdentityPools/</span><span class="si">${</span><span class="nv">PROJECT_ID</span><span class="si">}</span><span class="s2">.svc.id.goog/subject/ns/temporal/sa/provisioner&quot;</span>
+
+<span class="c1"># The older two-sided form, for comparison — note BOTH grants are required:</span>
+gcloud iam service-accounts add-iam-policy-binding provisioner@<span class="si">${</span><span class="nv">PROJECT_ID</span><span class="si">}</span>.iam.gserviceaccount.com <span class="se">\</span>
+  --role<span class="o">=</span>roles/iam.workloadIdentityUser <span class="se">\</span>
+  --member<span class="o">=</span><span class="s2">&quot;serviceAccount:</span><span class="si">${</span><span class="nv">PROJECT_ID</span><span class="si">}</span><span class="s2">.svc.id.goog[temporal/provisioner]&quot;</span>   <span class="c1"># grant ON the SA</span>
+gcloud storage buckets add-iam-policy-binding gs://cell-artifacts <span class="se">\</span>
+  --role<span class="o">=</span>roles/storage.objectViewer <span class="se">\</span>
+  --member<span class="o">=</span><span class="s2">&quot;serviceAccount:provisioner@</span><span class="si">${</span><span class="nv">PROJECT_ID</span><span class="si">}</span><span class="s2">.iam.gserviceaccount.com&quot;</span> <span class="c1"># grant TO the SA</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="c1"># Azure — the identity is a resource; the grant is a separate ARM resource; the federation is a third</span>
+az identity create -g rg-cell-0001 -n uami-provisioner
+<span class="nv">CID</span><span class="o">=</span><span class="k">$(</span>az identity show -g rg-cell-0001 -n uami-provisioner --query clientId -o tsv<span class="k">)</span>
+<span class="nv">PID</span><span class="o">=</span><span class="k">$(</span>az identity show -g rg-cell-0001 -n uami-provisioner --query principalId -o tsv<span class="k">)</span>
+az role assignment create --assignee-object-id <span class="s2">&quot;</span><span class="nv">$PID</span><span class="s2">&quot;</span> <span class="se">\</span>
+  --assignee-principal-type ServicePrincipal <span class="se">\</span>
+  --role <span class="s2">&quot;Storage Blob Data Reader&quot;</span> <span class="se">\</span>
+  --scope <span class="s2">&quot;/subscriptions/</span><span class="nv">$SUB</span><span class="s2">/resourceGroups/rg-cell-0001/providers/Microsoft.Storage/storageAccounts/cellartifacts&quot;</span>
+az identity federated-credential create --name k8s-provisioner <span class="se">\</span>
+  --identity-name uami-provisioner -g rg-cell-0001 <span class="se">\</span>
+  --issuer <span class="s2">&quot;</span><span class="nv">$AKS_OIDC_ISSUER</span><span class="s2">&quot;</span> <span class="se">\</span>
+  --subject <span class="s2">&quot;system:serviceaccount:temporal:provisioner&quot;</span> <span class="se">\</span>
+  --audiences <span class="s2">&quot;api://AzureADTokenExchange&quot;</span>
+</code></pre></div>
+
+<p>Notice the shape difference: AWS expresses trust <em>inside the role</em>, GCP expresses it as a <em>principal string</em> in an ordinary IAM binding, and Azure expresses it as a <em>separate child resource</em> of the identity, subject to the 20-credential cap. There is no faithful common representation of these three, which is exactly why the abstraction belongs at the level of "bind this workload to this capability."</p>
+<p><strong>Deltas summary.</strong></p>
+<ul>
+<li>AWS is the only one where a <em>resource</em> policy is a routine, first-class part of everyday access design (bucket policies, KMS key policies). On GCP and Azure, permissions almost always flow from the hierarchy. A KMS key policy on AWS can lock you out of your own key permanently; there is no GCP/Azure equivalent of that particular self-inflicted wound.</li>
+<li>GCP's inheritance is additive-only in the allow direction, so "grant at the folder to reduce toil" silently widens blast radius. Use deny policies and org policy constraints as the counterweight; <a href="https://docs.cloud.google.com/organization-policy/restrict-service-accounts"><code>iam.disableServiceAccountKeyCreation</code></a> should be on by default in every cell project, which forces every workload onto federation (good).</li>
+<li>Azure role assignments are ARM resources with their own GUIDs and a per-subscription cap. Cell-per-subscription keeps you far from that cap; shared-subscription-many-cells will eventually hit it.</li>
+</ul>
+<h3 id="workload-identity-how-a-pod-gets-a-cloud-credential">Workload identity: how a pod gets a cloud credential<a class="anchor" href="#workload-identity-how-a-pod-gets-a-cloud-credential">#</a></h3>
+<p>This is the single most important portability surface for a Kubernetes-based cell, because <em>everything</em> in the cell — the CSI driver, external-dns, cert-manager, the Vault unsealer, the backup agent, the Temporal services themselves — needs a cloud credential and none of them should hold a static key.</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>AWS (IRSA)</th>
+<th>AWS (EKS Pod Identity)</th>
+<th>GCP (Workload Identity Federation for GKE)</th>
+<th>Azure (Microsoft Entra Workload ID)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Trust anchor</td>
+<td>Cluster's OIDC issuer registered as an <a href="https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_providers_create_oidc.html">IAM OIDC provider</a></td>
+<td><code>pods.eks.amazonaws.com</code> service principal + <a href="https://docs.aws.amazon.com/eks/latest/userguide/pod-identity.html">association API</a></td>
+<td>Cluster-bound workload identity pool <code>PROJECT_ID.svc.id.goog</code></td>
+<td>Cluster's <a href="https://learn.microsoft.com/en-us/azure/aks/workload-identity-overview">OIDC issuer</a> + federated identity credential</td>
+</tr>
+<tr>
+<td>Binding expressed as</td>
+<td>Role trust policy condition on <code>sub</code> = <code>system:serviceaccount:NS:SA</code></td>
+<td><code>CreatePodIdentityAssociation(cluster, namespace, sa, role)</code></td>
+<td>KSA annotation → GSA, <strong>or</strong> direct <code>principal://…/subject/ns/NS/sa/KSA</code> binding</td>
+<td>KSA annotation <code>azure.workload.identity/client-id</code> + pod label <code>azure.workload.identity/use: "true"</code></td>
+</tr>
+<tr>
+<td>Delivery mechanism</td>
+<td>Projected SA token file; SDK calls <code>AssumeRoleWithWebIdentity</code></td>
+<td>Node-local <strong>Pod Identity Agent</strong> DaemonSet serves credentials over a link-local endpoint</td>
+<td><code>gke-metadata-server</code> DaemonSet intercepts the metadata endpoint and exchanges the projected token via STS</td>
+<td>Mutating webhook injects <code>AZURE_CLIENT_ID</code>, <code>AZURE_TENANT_ID</code>, <code>AZURE_FEDERATED_TOKEN_FILE</code>; SDK exchanges at the Entra token endpoint</td>
+</tr>
+<tr>
+<td>Per-cluster setup cost</td>
+<td>One IAM OIDC provider <strong>per cluster</strong></td>
+<td>One add-on install; trust policy is cluster-agnostic</td>
+<td>Enable WI on cluster <strong>and</strong> set node pool metadata to <code>GKE_METADATA</code></td>
+<td>Enable OIDC issuer + workload identity add-on</td>
+</tr>
+<tr>
+<td>Scales to N clusters</td>
+<td>Poorly — every new cluster needs a new OIDC provider and every role's trust policy edited</td>
+<td>Well — one role, many associations</td>
+<td>Moderately — pool is per project; the subject encodes cluster only in the direct-binding form</td>
+<td>Poorly by default — <strong>max 20 federated identity credentials per identity</strong> (<a href="https://learn.microsoft.com/en-us/entra/workload-id/workload-identity-federation-considerations">docs</a>)</td>
+</tr>
+<tr>
+<td>Cross-account/subscription</td>
+<td>Role chaining</td>
+<td><a href="https://aws.amazon.com/about-aws/whats-new/2025/06/amazon-eks-pod-identity-cross-account-access">Supported since June 2025</a> via target-account details on the association</td>
+<td>Cross-project via granting the KSA principal roles in another project</td>
+<td>Cross-subscription within a tenant is fine; cross-tenant needs multi-tenant app registration</td>
+</tr>
+<tr>
+<td>Notable gotcha</td>
+<td>Trust policy <code>sub</code> string is brittle; <code>aud</code> must be <code>sts.amazonaws.com</code></td>
+<td>Not available on Fargate (no DaemonSets)</td>
+<td>Metadata server takes seconds to become ready — early auth <strong>fails</strong>, must retry</td>
+<td>20-FIC ceiling; <a href="https://learn.microsoft.com/en-us/entra/workload-id/workload-identities-flexible-federated-identity-credentials">flexible FICs</a> with subject matching are the escape hatch</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Deprecation you must know:</strong> Microsoft Entra pod-managed identity (AAD Pod Identity) is dead. The open-source project is <a href="https://github.com/Azure/aad-pod-identity">archived</a>, and the AKS managed add-on was documented as patched and supported only through September 2025; the <a href="https://learn.microsoft.com/en-us/azure/aks/workload-identity-migrate-from-pod-identity">official migration path</a> is Entra Workload ID. If you inherit any AKS estate with <code>AzureIdentity</code>/<code>AzureIdentityBinding</code> CRDs, that is unsupported technical debt, not a working system. On the AWS side, both IRSA and EKS Pod Identity are current; Pod Identity is the better choice for a fleet of cells because the role trust policy no longer names a specific cluster, which removes an IAM write from the cell-creation critical path.</p>
+<p><strong>The portable shape.</strong> All four mechanisms reduce to the same three steps: (1) the cluster issues a signed JWT for a Kubernetes ServiceAccount, (2) the cloud's STS verifies it against a registered issuer and a subject predicate, (3) the workload receives a short-lived cloud credential. Your cell provisioning interface therefore wants exactly one verb — <code>BindWorkloadIdentity(namespace, serviceAccount, capability)</code> — with three implementations. Do <strong>not</strong> expose "IAM role ARN" in the interface; expose "capability", and let each implementation decide whether that becomes a role, a GSA/principal binding, or a user-assigned managed identity plus FIC.</p>
+<h3 id="cross-cloud-federation-control-plane-in-cloud-a-provisioning-cloud-b">Cross-cloud federation (control plane in cloud A provisioning cloud B)<a class="anchor" href="#cross-cloud-federation-control-plane-in-cloud-a-provisioning-cloud-b">#</a></h3>
+<p>This is the piece that makes a multi-cloud control plane possible without a secret-sprawl disaster. All three clouds accept an external OIDC issuer as a trust anchor.</p>
+<table>
+<thead>
+<tr>
+<th>Direction</th>
+<th>Mechanism</th>
+<th>Key objects</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>→ AWS</td>
+<td><code>AssumeRoleWithWebIdentity</code> against an <a href="https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_providers_create_oidc.html">IAM OIDC identity provider</a></td>
+<td>OIDC provider (issuer URL + audience), role trust policy with <code>sub</code>/<code>aud</code> conditions. Google's <code>accounts.google.com</code> is a built-in provider — no provider object needed</td>
+</tr>
+<tr>
+<td>→ GCP</td>
+<td><a href="https://docs.cloud.google.com/iam/docs/workload-identity-federation">Workload Identity Federation</a>: pool + provider (AWS, OIDC, or SAML), attribute mapping, attribute condition; then either impersonate a service account or bind roles directly to the federated principal</td>
+<td>Workload identity pool, provider, attribute mapping expressions</td>
+</tr>
+<tr>
+<td>→ Azure</td>
+<td><a href="https://learn.microsoft.com/en-us/entra/workload-id/workload-identity-federation-considerations">Federated identity credential</a> on a user-assigned managed identity or app registration</td>
+<td>FIC (issuer, subject, audience); hard cap of 20 per identity</td>
+</tr>
+</tbody>
+</table>
+<p><strong>AWS as the source is special.</strong> GCP has a first-class <a href="https://docs.cloud.google.com/iam/docs/workload-identity-federation-with-other-clouds">AWS provider type</a> that does not use OIDC at all — it validates a signed <code>GetCallerIdentity</code> request, meaning an EC2/EKS workload's SigV4 identity is directly usable as a GCP principal. That is materially simpler than minting an OIDC token, and it is the right primitive if your Infra CP runs on AWS and provisions GCP.</p>
+<p><strong>Design guidance for a multi-cloud control plane.</strong></p>
+<ul>
+<li>Pick one <strong>home cloud</strong> for the control plane and make its workload identity the root of all cross-cloud trust. Two-directional federation doubles the trust surface for no benefit.</li>
+<li>The subject predicate should encode <em>both</em> the cluster/namespace and the purpose, so a compromised sidecar cannot borrow the provisioner's identity. On GCP use attribute conditions, on AWS a <code>StringEquals</code> on <code>sub</code>, on Azure a precise FIC subject.</li>
+<li>Budget around Azure's 20-FIC ceiling early. One identity per <em>capability</em> (provisioner, DNS writer, KMS user) with flexible FICs beats one identity per cell, which hits the wall at 20 cells.</li>
+<li>Never provision cloud B with a stored key from cloud B. <code>iam.disableServiceAccountKeyCreation</code> and equivalent guardrails should make that impossible by policy rather than by convention.</li>
+</ul>
+<h3 id="networking-vpc-vs-vpc-vs-vnet">Networking: VPC vs VPC vs VNet<a class="anchor" href="#networking-vpc-vs-vpc-vs-vnet">#</a></h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>AWS VPC</th>
+<th>GCP VPC network</th>
+<th>Azure VNet</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Scope</td>
+<td>Regional</td>
+<td><a href="https://docs.cloud.google.com/vpc/docs/vpc">Global</a></td>
+<td>Regional</td>
+</tr>
+<tr>
+<td>Subnet scope</td>
+<td><strong>One AZ</strong></td>
+<td><a href="https://docs.cloud.google.com/vpc/docs/subnets">Regional — spans all zones</a></td>
+<td>Regional — spans all zones</td>
+</tr>
+<tr>
+<td>Addressing</td>
+<td>Primary CIDR + up to 4 secondary CIDRs</td>
+<td>Subnet primary range + <strong>secondary ranges</strong> (used by GKE for pods/services)</td>
+<td>Address spaces on the VNet; subnets carve them up</td>
+</tr>
+<tr>
+<td>Expand later</td>
+<td>Add secondary CIDRs; cannot resize a subnet</td>
+<td><strong>Can expand a subnet's primary range in place</strong></td>
+<td>Can add address spaces; subnet resize is constrained by neighbors</td>
+</tr>
+<tr>
+<td>Routing</td>
+<td>Route table per subnet; local route non-removable</td>
+<td>Global routes with priorities and instance tags</td>
+<td>UDR per subnet; system routes plus BGP-learned</td>
+</tr>
+<tr>
+<td>Cross-region without peering</td>
+<td>No</td>
+<td><strong>Yes</strong> — one VPC spans regions</td>
+<td>No</td>
+</tr>
+<tr>
+<td>Default connectivity within network</td>
+<td>Subnets route to each other; SG default denies cross-SG</td>
+<td>Subnets route to each other; firewall default denies ingress</td>
+<td>Subnets route to each other; NSG default rule <strong><code>AllowVnetInBound</code> permits it</strong></td>
+</tr>
+</tbody>
+</table>
+<p><strong>The three deltas that reshape a cell blueprint.</strong></p>
+<ol>
+<li><strong>Subnet-per-AZ is an AWS-only tax.</strong> On AWS, an HA cell needs ≥3 subnets per tier (app, data, LB), each with its own route table entry and its own NAT gateway if you want AZ-independent egress. On GCP and Azure, one subnet per tier covers all zones. If your Terraform/CDK module is written as "for each AZ, create a subnet," the GCP implementation is not a port — it is a different module. This is precisely the shape difference Temporal's blog calls out for load balancers, generalized.</li>
+<li><strong>GCP's global VPC eliminates a whole category of work.</strong> Multi-region cells on GCP can share one VPC with regional subnets and no peering, no transit gateway, no route propagation. On AWS and Azure the same topology needs TGW/Virtual WAN or a peering mesh. Do not build an abstraction that forces GCP to pretend it needs peering; that throws away the platform's best property.</li>
+<li><strong>Azure's default-open intra-VNet posture.</strong> The built-in NSG rules allow inbound from <code>VirtualNetwork</code> by default (<a href="https://learn.microsoft.com/en-us/azure/virtual-network/network-security-groups-overview">NSG docs</a>). AWS security groups default to "allow nothing inbound." If your security model is "cells are isolated," you must write explicit deny rules on Azure that have no AWS counterpart, and your policy-as-code needs a per-cloud baseline, not a shared one.</li>
+</ol>
+<h3 id="firewalling-security-groups-vs-firewall-rules-vs-nsgs">Firewalling: security groups vs firewall rules vs NSGs<a class="anchor" href="#firewalling-security-groups-vs-firewall-rules-vs-nsgs">#</a></h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>AWS</th>
+<th>GCP</th>
+<th>Azure</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Primary object</td>
+<td>Security group (stateful, allow-only)</td>
+<td><a href="https://docs.cloud.google.com/firewall/docs/firewalls">VPC firewall rule / firewall policy</a> (stateful, allow <strong>and</strong> deny)</td>
+<td>NSG (stateful, allow and deny, priority-ordered)</td>
+</tr>
+<tr>
+<td>Attach point</td>
+<td>ENI / instance</td>
+<td><strong>The VPC</strong>; selects targets by network tag or service account</td>
+<td>Subnet and/or NIC (both can apply; both must pass)</td>
+</tr>
+<tr>
+<td>Stateless layer</td>
+<td><a href="https://docs.aws.amazon.com/vpc/latest/userguide/vpc-network-acls.html">Network ACLs</a> — stateless, per-subnet, ordered</td>
+<td>none</td>
+<td>none</td>
+</tr>
+<tr>
+<td>Reference other groups</td>
+<td>Yes — SG can be a source</td>
+<td>Indirectly, via service account or tag as source</td>
+<td>Application Security Groups (ASGs) as source/destination</td>
+</tr>
+<tr>
+<td>Hierarchical policy</td>
+<td>Firewall Manager (add-on)</td>
+<td>Hierarchical firewall policies at org/folder + global/regional network firewall policies</td>
+<td>Azure Firewall / Azure Firewall Policy at hub; NSGs remain per-subnet</td>
+</tr>
+<tr>
+<td>Connection tracking nuance</td>
+<td>Stateful; SG changes apply to existing flows</td>
+<td>Stateful; tracking entry is <a href="https://docs.cloud.google.com/firewall/docs/firewalls">active if ≥1 packet per 10 minutes</a>, and tracked-connection count is bounded by machine type</td>
+<td>Stateful; flow-count limits are per-VM SKU</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Deltas.</strong> The mental switch that trips people is that GCP has <strong>no per-instance firewall object</strong>. You cannot "attach a security group"; you write a VPC-level rule whose target is a tag or a service account. That is more scalable (no SG-per-service explosion) and less discoverable (a VM's effective policy is a query, not a field). Using the node pool's <em>service account</em> as the firewall target — rather than tags — makes the firewall rule and the IAM identity the same key, which is a genuinely nice property for a cell: one identity per cell, and the network policy follows automatically.</p>
+<p>AWS is the only cloud with a stateless layer you are likely to trip over; NACLs are per-subnet and require explicit ephemeral-port return rules. They are also the only place where "I allowed it and it still doesn't work" has a fourth possible cause. Most cell designs should leave NACLs at default-allow and do all policy in security groups, reserving NACLs for a coarse emergency kill-switch.</p>
+<p>GCP's connection-tracking idle timeout deserves a specific note for Temporal: long-lived gRPC streams with sparse traffic can fall out of the tracking table if idle beyond the window, after which return packets are dropped. Configure gRPC keepalives well inside that window on GCP; the same config is harmless elsewhere.</p>
+<h3 id="private-connectivity-this-is-how-customers-reach-a-cell">Private connectivity (this is how customers reach a cell)<a class="anchor" href="#private-connectivity-this-is-how-customers-reach-a-cell">#</a></h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>AWS PrivateLink</th>
+<th>GCP Private Service Connect</th>
+<th>Azure Private Link</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Producer object</td>
+<td>VPC endpoint service fronted by an <strong>NLB</strong> or GWLB</td>
+<td><a href="https://docs.cloud.google.com/vpc/docs/about-vpc-hosted-services">Service attachment</a> fronted by an internal LB, plus a <strong>NAT subnet</strong></td>
+<td>Private Link Service fronted by a <strong>Standard internal LB</strong>, plus a NAT subnet</td>
+</tr>
+<tr>
+<td>Consumer object</td>
+<td>Interface VPC endpoint (ENIs in consumer subnets)</td>
+<td>PSC endpoint = forwarding rule with a consumer-side internal IP</td>
+<td>Private Endpoint (NIC in consumer subnet)</td>
+</tr>
+<tr>
+<td>Approval model</td>
+<td>Whitelist consumer principals; auto/manual accept</td>
+<td>Explicit consumer project allowlist; auto/manual accept</td>
+<td>Auto/manual approval on connection request</td>
+</tr>
+<tr>
+<td>Client IP visibility</td>
+<td>PROXY protocol v2 on the NLB target group</td>
+<td><a href="https://docs.cloud.google.com/vpc/docs/about-vpc-hosted-services">PROXY protocol v2</a>, carrying <code>pscConnectionId</code> in a TLV</td>
+<td>TCP PROXY v2 with a <code>LinkIdentifier</code> TLV</td>
+</tr>
+<tr>
+<td>DNS</td>
+<td>Private DNS name on the endpoint service (requires domain verification)</td>
+<td>Consumer creates its own DNS, or uses the service directory / auto-DNS for published services</td>
+<td>Private Endpoint DNS integration via <code>privatelink.*</code> zones</td>
+</tr>
+<tr>
+<td>Direction</td>
+<td>Unidirectional consumer → producer</td>
+<td>Unidirectional, plus PSC <strong>backends</strong> for producer → consumer</td>
+<td>Unidirectional consumer → producer</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Deltas.</strong> All three are structurally the same: producer publishes behind an internal LB, consumer materializes a local IP. The differences are in identity plumbing and in what the producer can see. Temporal's multi-cloud post specifically flags private connectivity as a feature-parity gap on GCP, citing PROXY protocol v2 header limitations — which is the exact class of problem you should expect: the mechanism exists everywhere, but the <em>tenant-identification</em> path differs, and per-customer private endpoints require you to map an opaque connection identifier back to a tenant on every cloud with different opaque identifiers.</p>
+<p>For cell lifecycle this means: publishing a cell is not one operation. It is "create the internal LB, create the publish object, register the tenant's identity in the allowlist, produce the DNS name, and record the connection-ID→tenant mapping" — five steps whose <em>shape</em> is identical and whose <em>arguments</em> are entirely different per cloud. Perfect candidate for the verb-level interface.</p>
+<h3 id="peering-transit-and-hub-and-spoke">Peering, transit, and hub-and-spoke<a class="anchor" href="#peering-transit-and-hub-and-spoke">#</a></h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>AWS</th>
+<th>GCP</th>
+<th>Azure</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Simple peering</td>
+<td>VPC peering — non-transitive, no overlapping CIDRs</td>
+<td><a href="https://docs.cloud.google.com/vpc/docs/vpc-peering">VPC Network Peering</a> — non-transitive, no overlapping subnets, per-VPC peering limits</td>
+<td>VNet peering — non-transitive (but supports gateway transit)</td>
+</tr>
+<tr>
+<td>Transit hub</td>
+<td><a href="https://docs.aws.amazon.com/vpc/latest/tgw/what-is-transit-gateway.html">Transit Gateway</a> — regional, attachment + route tables, TGW peering across regions; Cloud WAN above it</td>
+<td><a href="https://docs.cloud.google.com/network-connectivity/docs/network-connectivity-center/concepts/vpc-spokes-overview">Network Connectivity Center</a> hub with VPC spokes — gives transitivity without a mesh</td>
+<td><a href="https://learn.microsoft.com/en-us/azure/virtual-wan/virtual-wan-about">Virtual WAN</a> with Microsoft-managed hubs, or DIY hub-and-spoke with Azure Firewall / Route Server</td>
+</tr>
+<tr>
+<td>Cross-region</td>
+<td>TGW peering (extra hop, extra cost)</td>
+<td>Native — one global VPC, or NCC</td>
+<td>vWAN hub-to-hub, or global VNet peering</td>
+</tr>
+<tr>
+<td>Who owns routing</td>
+<td>You, explicitly, per TGW route table</td>
+<td>Mostly the platform; NCC exchanges routes</td>
+<td>vWAN hub does it; DIY requires UDRs everywhere</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Deltas.</strong> GCP mostly does not need this layer for intra-organization traffic, because the VPC is already global — NCC exists for the multi-VPC case (shared services, partner networks). AWS gives the most explicit control and therefore the most rope: TGW route tables are a real routing design exercise, and TGW is regional so a multi-region cell fleet needs a peering topology. Azure Virtual WAN is the most managed and the least controllable; you gain built-in transitivity and lose the ability to insert arbitrary NVAs without using vWAN's specific integration points.</p>
+<p>For cells specifically: prefer <strong>not</strong> connecting cells to each other at all. A cell should reach the control plane and its own dependencies, and nothing else. Transit topology is then a control-plane concern, not a cell concern, and stays out of the cell contract.</p>
+<h3 id="egress-and-nat">Egress and NAT<a class="anchor" href="#egress-and-nat">#</a></h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>AWS NAT Gateway</th>
+<th>GCP Cloud NAT</th>
+<th>Azure NAT Gateway</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Nature</td>
+<td>A <strong>zonal resource</strong> you deploy per AZ</td>
+<td><a href="https://docs.cloud.google.com/nat/docs/overview">Not an instance</a> — SDN config on the Cloud Router, regional</td>
+<td>A zonal or regional resource attached to subnets</td>
+</tr>
+<tr>
+<td>HA</td>
+<td>You build it: one NATGW per AZ, per-AZ route tables</td>
+<td>Platform-managed</td>
+<td>Zonal by default; zone-redundant via a zone-redundant public IP prefix</td>
+</tr>
+<tr>
+<td>Port model</td>
+<td>~55,000 ports per unique destination tuple; <code>ErrorPortAllocation</code> on exhaustion</td>
+<td>Min ports per VM (configurable), plus dynamic port allocation</td>
+<td>Ports pre-allocated per public IP (64,512 per IP); scale by adding IPs</td>
+</tr>
+<tr>
+<td>Pricing shape</td>
+<td>Per-gateway-hour <strong>+ per-GB processed</strong> (<a href="https://aws.amazon.com/vpc/pricing/">pricing</a>)</td>
+<td>Per-VM-hour (capped) <strong>+ per-GiB processed</strong> (<a href="https://cloud.google.com/nat/pricing">pricing</a>)</td>
+<td>Per-gateway-hour <strong>+ per-GB processed</strong> (<a href="https://azure.microsoft.com/en-us/pricing/details/azure-nat-gateway/">pricing</a>)</td>
+</tr>
+<tr>
+<td>Default outbound if you do nothing</td>
+<td>None — private subnet has no egress</td>
+<td>None</td>
+<td><strong>Being retired</strong>: <a href="https://learn.microsoft.com/en-us/azure/virtual-network/ip-services/default-outbound-access">default outbound access</a> is going away; new VMs need an explicit method</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Deltas.</strong> The AWS design forces three NAT gateways per cell for AZ independence (or accepts a cross-AZ hop plus cross-AZ data charges). GCP's Cloud NAT is a single regional configuration — there is no per-zone object to forget. Azure sits in between, and additionally has a live migration story: Microsoft is retiring implicit outbound internet access for VMs, so any cell template that relied on "VMs just have internet" is on borrowed time and must declare a NAT Gateway, LB outbound rules, or a public IP.</p>
+<p>Port exhaustion looks different on each and produces different symptoms: AWS surfaces <code>ErrorPortAllocation</code> CloudWatch metrics, GCP surfaces dropped-packet counters and <code>nat_allocation_failed</code>, Azure surfaces SNAT port exhaustion metrics. Any cell that pulls container images, calls S3/GCS/Blob over public endpoints, or scrapes external APIs will find this. The universal fix is the same everywhere and should be in every cell blueprint: <strong>use private endpoints for cloud-provider services so that traffic never hits NAT at all.</strong></p>
+<h3 id="ip-address-planning-and-exhaustion">IP address planning and exhaustion<a class="anchor" href="#ip-address-planning-and-exhaustion">#</a></h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>AWS (EKS + VPC CNI)</th>
+<th>GCP (GKE)</th>
+<th>Azure (AKS)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Pod IP source</td>
+<td><strong>Real VPC IPs</strong> from the node's subnet</td>
+<td>Secondary range ("alias IPs") on the subnet</td>
+<td>Azure CNI: VNet IPs. <strong>Azure CNI Overlay</strong>: private overlay CIDR, not VNet</td>
+</tr>
+<tr>
+<td>Density limiter</td>
+<td>ENIs × IPs-per-ENI per instance type</td>
+<td>Pod CIDR block per node (derived from max-pods-per-node)</td>
+<td>Overlay: essentially unbounded; classic CNI: per-node IP reservation</td>
+</tr>
+<tr>
+<td>Mitigations</td>
+<td><a href="https://docs.aws.amazon.com/eks/latest/best-practices/ip-opt.html">Prefix delegation</a> (/28 per ENI), custom networking with secondary CIDRs (often 100.64.0.0/10)</td>
+<td>Larger secondary ranges; <a href="https://docs.cloud.google.com/kubernetes-engine/docs/concepts/alias-ips">VPC-native clusters</a> with discontiguous ranges</td>
+<td><a href="https://learn.microsoft.com/en-us/azure/aks/azure-cni-overlay">Azure CNI Overlay</a> — pods stop consuming VNet space entirely</td>
+</tr>
+<tr>
+<td>Typical failure</td>
+<td>Pods stuck <code>ContainerCreating</code>, CNI cannot allocate</td>
+<td>Node pool cannot scale because the pod range is exhausted</td>
+<td>Classic CNI: subnet exhausted at scale-out</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Delta that determines your address plan.</strong> AWS is the greediest: every pod burns a routable VPC address, and node scale-out reserves addresses in advance. Azure with overlay is the thriftiest. GCP is in the middle but at least isolates the burn in a secondary range you can size independently. <strong>Plan the cell CIDR against AWS</strong> — the worst case — and let the other two clouds have headroom, rather than sizing for GCP and discovering AWS cannot fit. Concretely: decide max nodes × max pods per node × safety factor, and reserve a per-cell block from a global IPAM that is identical across clouds so a cell's identity implies its address range everywhere. Reusing the same numbering scheme across clouds is one of the few genuinely safe abstractions here.</p>
+<h3 id="dns">DNS<a class="anchor" href="#dns">#</a></h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>AWS Route 53</th>
+<th>GCP Cloud DNS</th>
+<th>Azure DNS</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Public zones</td>
+<td>Public hosted zones</td>
+<td>Public managed zones</td>
+<td>Azure DNS public zones</td>
+</tr>
+<tr>
+<td>Private zones</td>
+<td><a href="https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/hosted-zones-private.html">Private hosted zones</a> associated with VPCs (cross-account association is a two-step CLI dance)</td>
+<td><a href="https://docs.cloud.google.com/dns/docs/zones/zones-overview">Private managed zones</a> bound to VPC networks; <strong>cross-project binding</strong> available</td>
+<td>Private DNS zones <strong>linked</strong> to VNets; only one link per VNet may have auto-registration (<a href="https://learn.microsoft.com/en-us/azure/dns/private-dns-virtual-network-links">docs</a>)</td>
+</tr>
+<tr>
+<td>Forwarding / hybrid</td>
+<td><a href="https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/resolver.html">Resolver inbound/outbound endpoints</a> (ENIs, billed per endpoint-hour + queries), rules shareable via RAM</td>
+<td>Forwarding zones, <strong>DNS peering</strong> (limited to a single transitive hop), response policies</td>
+<td>Azure DNS Private Resolver (inbound/outbound endpoints, rulesets)</td>
+</tr>
+<tr>
+<td>Split-horizon</td>
+<td>PHZ overrides public for associated VPCs</td>
+<td>Private zone shadows public within the bound network</td>
+<td>Private zone shadows public within linked VNets</td>
+</tr>
+<tr>
+<td>Service integration</td>
+<td>VPC endpoint private DNS names</td>
+<td>PSC auto-DNS / Service Directory</td>
+<td><strong><code>privatelink.*</code> zones</strong> — the canonical Azure footgun</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Deltas.</strong> Route 53 and Cloud DNS both bind a zone to <em>networks</em>; Azure binds a zone to VNets via a separate <code>virtualNetworkLink</code> child resource, and the auto-registration restriction (one auto-registering link per VNet) surprises people building per-cell zones. GCP's DNS peering is the cleanest way to let a cell resolve control-plane names without full network peering, but note the single-transitive-hop limit — a chain of more than three VPCs will not resolve.</p>
+<p>The Azure private-endpoint DNS pattern is worth memorizing because it has no AWS/GCP analogue: when you create a Private Endpoint for a PaaS service, the public name CNAMEs to a <code>privatelink.&lt;service&gt;.&lt;suffix&gt;</code> name that only resolves correctly if a private DNS zone with that exact name is linked to your VNet. Miss the link, and the name resolves to the public IP, and the traffic silently leaves the private path — a correctness <em>and</em> compliance bug that produces no error.</p>
+<h3 id="load-balancing-and-the-grpc-problem">Load balancing (and the gRPC problem)<a class="anchor" href="#load-balancing-and-the-grpc-problem">#</a></h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>AWS</th>
+<th>GCP</th>
+<th>Azure</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>L4</td>
+<td>NLB (zonal IPs; cross-zone <strong>off by default</strong>)</td>
+<td>Internal/external <strong>passthrough</strong> Network Load Balancer</td>
+<td>Standard Load Balancer (no TLS termination)</td>
+</tr>
+<tr>
+<td>L7 regional</td>
+<td>ALB</td>
+<td>Regional external/internal Application Load Balancer</td>
+<td>Application Gateway v2 (+ WAF)</td>
+</tr>
+<tr>
+<td>L7 global</td>
+<td>CloudFront / Global Accelerator (separate products)</td>
+<td><strong>Global external Application Load Balancer</strong> with anycast IP</td>
+<td>Front Door (anycast)</td>
+</tr>
+<tr>
+<td>Resource graph</td>
+<td>LB → listener → target group</td>
+<td><a href="https://docs.cloud.google.com/load-balancing/docs/forwarding-rule-concepts">Forwarding rule</a> → target proxy → URL map → <a href="https://docs.cloud.google.com/load-balancing/docs/backend-service">backend service</a> → NEG/MIG</td>
+<td>LB/AppGW → frontend IP → listener → rule → backend pool</td>
+</tr>
+<tr>
+<td>gRPC end-to-end</td>
+<td><strong>ALB with target group protocol version <code>GRPC</code></strong> (<a href="https://docs.aws.amazon.com/elasticloadbalancing/latest/application/load-balancer-target-groups.html">docs</a>); NLB passes it through at L4</td>
+<td>Backend service protocol <code>HTTP2</code> or <code>GRPC</code>; <strong>gRPC backends require gRPC or TCP health checks</strong>, not HTTP (<a href="https://docs.cloud.google.com/load-balancing/docs/health-check-concepts">docs</a>)</td>
+<td>App Gateway v2 talks <strong>HTTP/1.1 to backends</strong>; Front Door likewise (<a href="https://learn.microsoft.com/en-us/azure/frontdoor/front-door-faq">FAQ</a>) — so <strong>no end-to-end gRPC</strong>. <a href="https://learn.microsoft.com/en-us/azure/application-gateway/for-containers/application-gateway-for-containers-components">Application Gateway for Containers</a> does gRPC over HTTP/2 to backends</td>
+</tr>
+<tr>
+<td>Health check ownership</td>
+<td>Target group</td>
+<td>Standalone health check resource, referenced by backend service</td>
+<td>Probe resource on the LB/AppGW</td>
+</tr>
+</tbody>
+</table>
+<p><strong>The gRPC problem, stated precisely.</strong> Temporal's frontend is gRPC, i.e. long-lived HTTP/2 connections carrying many multiplexed streams. An L4 load balancer distributes <em>connections</em>, not <em>requests</em> — so a handful of clients with persistent connections produce badly skewed backend load, and a new frontend pod added by an HPA receives nothing until clients reconnect. You need either (a) an L7 proxy that does per-request HTTP/2 balancing, or (b) client-side load balancing with a resolver that sees all endpoints.</p>
+<p>That constraint lands differently on each cloud:</p>
+<ul>
+<li><strong>AWS</strong>: ALB with <code>ProtocolVersion=GRPC</code> does real per-request gRPC routing, including routing by package/service/method, and needs a gRPC-format health check path. This is the easy cloud.</li>
+<li><strong>GCP</strong>: set the backend service protocol to <code>HTTP2</code> or <code>GRPC</code> and use a gRPC health check; the global ALB then does per-request balancing across regions on an anycast IP. Also easy, but the resource graph is four objects deep, and the health-check protocol mismatch is a common outage cause.</li>
+<li><strong>Azure</strong>: the managed general-purpose L7s do <strong>not</strong> speak HTTP/2 to backends. Your options are Application Gateway for Containers (newer, ALB-controller-driven, Gateway API), or running your own Envoy/NGINX ingress behind a Standard Load Balancer. Practically, on Azure a Temporal-shaped cell will run its own L7 proxy inside the cluster, which is a structural difference from AWS/GCP — different failure modes, different upgrade story, different capacity model.</li>
+</ul>
+<p>Two more asymmetries worth encoding in the cell contract: NLB <strong>cross-zone load balancing is disabled by default</strong> (deliberately, to avoid inter-AZ data-transfer charges) while ALB's is always on and not separately charged; and GCP's global LB is a genuinely different product class — a single anycast IP fronting backends in many regions with no DNS failover involved — that has no AWS/Azure equivalent at the load-balancer layer.</p>
+<p><em>See also: <a href="02-grpc.html#the-biggest-infra-gotcha-l4-load-balancing-pins-grpc">the biggest infra gotcha: L4 load balancing pins gRPC</a> for the client-side half of this — <code>dns:///</code> plus <code>round_robin</code> over a headless Service, <code>MaxConnectionAge</code> to break connection stickiness, and the LB idle timeouts that silently kill long polls.</em></p>
+<h3 id="compute-for-kubernetes-nodes">Compute for Kubernetes nodes<a class="anchor" href="#compute-for-kubernetes-nodes">#</a></h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>AWS EC2</th>
+<th>GCP Compute Engine</th>
+<th>Azure VMs</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Sizing model</td>
+<td>Fixed instance types within families (m/c/r/i/g/p), Nitro platform</td>
+<td>Predefined machine types <strong>plus custom machine types</strong> (arbitrary vCPU/memory within limits)</td>
+<td>Fixed VM SKUs within series (D/E/F/L/N), several generations live at once</td>
+</tr>
+<tr>
+<td>Interruptible</td>
+<td>Spot Instances, per-AZ pricing, 2-minute notice</td>
+<td><a href="https://docs.cloud.google.com/compute/docs/instances/spot">Spot VMs</a> — no max runtime; legacy <a href="https://docs.cloud.google.com/compute/docs/instances/preemptible">preemptible VMs</a> <strong>always stop at 24h</strong></td>
+<td>Spot VMs with eviction policy and max price</td>
+</tr>
+<tr>
+<td>Reservation</td>
+<td>On-Demand Capacity Reservations; <a href="https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-capacity-blocks.html">Capacity Blocks for ML</a> (GPU clusters, 1–64 instances, reservable in advance)</td>
+<td>Reservations (specific or any-project), committed use discounts</td>
+<td>Capacity reservations, reserved instances</td>
+</tr>
+<tr>
+<td>Quota unit</td>
+<td><strong>vCPU-based On-Demand limits, grouped into a handful of family classes</strong> (Standard; F; G; P; X), plus separate Spot limits, per region (<a href="https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-on-demand-instances.html">docs</a>)</td>
+<td>Regional <code>CPUS</code> quota plus <strong>per-family</strong> CPU quotas; Spot/preemptible have their own (<a href="https://docs.cloud.google.com/compute/resource-usage">docs</a>)</td>
+<td><strong>Two-tier</strong>: Total Regional vCPUs <em>and</em> per-VM-family vCPUs; both must pass (<a href="https://learn.microsoft.com/en-us/azure/virtual-machines/quotas">docs</a>)</td>
+</tr>
+<tr>
+<td>Zone identity</td>
+<td>AZ <strong>names are per-account</strong>; AZ <strong>IDs</strong> (<code>use1-az1</code>) are stable across accounts</td>
+<td>Zone names are globally consistent (<code>us-central1-a</code> is the same everywhere)</td>
+<td>Logical zones 1/2/3 are <strong>mapped per subscription</strong> to physical zones (<a href="https://learn.microsoft.com/en-us/azure/reliability/availability-zones-overview">reliability docs</a>)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Deltas.</strong></p>
+<ul>
+<li><strong>Quota shape drives your node-pool strategy.</strong> Azure's two-tier model means a cell that mixes D-series and E-series nodes needs <em>three</em> quota increases (two families plus regional total). AWS's coarse "Standard family class" bucket means most general-purpose changes need no new request. GCP sits between, with per-family quotas on newer families. A multi-cloud capacity planner cannot use one data model for this; it needs three, behind one <code>EnsureCapacity(cell, shape)</code> verb.</li>
+<li><strong>Zone identity is not portable.</strong> <code>us-east-1a</code> in account A and account B are different physical zones — you must use AZ IDs to correlate across accounts. Azure's logical-zone mapping is per subscription, and the physical mapping is exposed through the availability-zone mappings API. GCP is the only cloud where the zone name means the same thing everywhere. If your cell metadata records "zone a," it is meaningless on AWS and Azure across tenancy boundaries. Record the AZ ID / physical zone.</li>
+<li><strong>Preemptible vs Spot on GCP is a real trap.</strong> Legacy preemptible VMs terminate at 24 hours unconditionally. If any node pool template still specifies <code>preemptible: true</code> rather than <code>provisioningModel: SPOT</code>, your nodes churn daily regardless of demand.</li>
+<li><strong>Custom machine types are GCP-only.</strong> They are genuinely useful for right-sizing Temporal history/matching nodes, and they are exactly the kind of per-cloud advantage that a lowest-common-denominator abstraction destroys.</li>
+</ul>
+<h3 id="kubernetes-as-the-cell-substrate-eks-vs-gke-vs-aks">Kubernetes as the cell substrate: EKS vs GKE vs AKS<a class="anchor" href="#kubernetes-as-the-cell-substrate-eks-vs-gke-vs-aks">#</a></h3>
+<p>The cell is a Kubernetes cluster, so the managed-Kubernetes deltas <em>are</em> cell lifecycle deltas.</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>EKS</th>
+<th>GKE</th>
+<th>AKS</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Node abstraction</td>
+<td>Managed node groups, self-managed groups, Karpenter, Fargate</td>
+<td>Node pools; Standard and Autopilot modes; node auto-provisioning</td>
+<td>Node pools backed by VM Scale Sets; <strong>system</strong> and <strong>user</strong> pool distinction</td>
+</tr>
+<tr>
+<td>Default pod networking</td>
+<td>AWS VPC CNI — pods get routable VPC IPs</td>
+<td>Alias IP secondary ranges</td>
+<td>Choice of Azure CNI (VNet IPs) or <a href="https://learn.microsoft.com/en-us/azure/aks/azure-cni-overlay">Azure CNI Overlay</a></td>
+</tr>
+<tr>
+<td>LB provisioning from a Service</td>
+<td>Requires the AWS Load Balancer Controller and <strong>three annotations</strong> for a public NLB</td>
+<td><strong>One annotation</strong> for a backend-service-based passthrough NLB</td>
+<td>Built-in cloud provider; ingress requires your own controller or Application Gateway for Containers</td>
+</tr>
+<tr>
+<td>Upgrade cadence</td>
+<td>Standard support window per version, then a <strong>more expensive extended-support</strong> per-cluster rate (<a href="https://aws.amazon.com/eks/pricing/">pricing</a>)</td>
+<td>Release channels with automatic control-plane and node upgrades</td>
+<td>Auto-upgrade channels; Free tier has no uptime SLA, Standard does (<a href="https://learn.microsoft.com/en-us/azure/aks/free-standard-pricing-tiers">tiers</a>)</td>
+</tr>
+<tr>
+<td>Control-plane cost</td>
+<td>Per cluster-hour</td>
+<td>Per cluster-hour, with a free-tier allowance</td>
+<td>Free tier (no SLA) or Standard tier</td>
+</tr>
+<tr>
+<td>Add-on model</td>
+<td>EKS add-ons (VPC CNI, CoreDNS, kube-proxy, EBS CSI, Pod Identity Agent)</td>
+<td>GKE-managed components, mostly not user-versioned</td>
+<td>AKS add-ons and cluster extensions</td>
+</tr>
+</tbody>
+</table>
+<p>The three-annotations-versus-one-annotation contrast is not a trivia item — it is <a href="https://temporal.io/blog/multi-cloud-thats-one-small-step-for-temporal-one-giant-leap-for-reliability">the exact example Temporal used</a> to explain why Kubernetes standardizes less than people assume. The Service object is portable; the annotations that make it produce a correctly configured load balancer are not, and neither are the IAM permissions the controller needs, nor the health-check semantics, nor the draining behavior on rolling update.</p>
+<p>The upgrade model is the bigger operational delta. GKE's release channels will upgrade your control plane on Google's schedule unless you pin and manage maintenance windows and exclusions; EKS will not upgrade you but will start charging an extended-support premium when your version ages out; AKS sits in between with auto-upgrade channels you opt into. For a fleet of cells this means the <em>pacing</em> of upgrades is partly out of your hands on GCP and entirely in your hands (with a cost clock) on AWS. Your cell upgrade workflow must model "the platform may upgrade this cell for us" as a real state transition on GCP, and must model "this cell's version is aging into a billing cliff" on AWS.</p>
+<p>Two data-plane facts worth pinning down before you design against them. <strong>GKE Dataplane V2</strong> (eBPF, Cilium-based, <code>anetd</code> DaemonSet) is <em>"enabled by default for all new Autopilot clusters"</em> — not for Standard clusters, where you opt in at creation time. The constraint that matters for cell provisioning: <em>"GKE Dataplane V2 can only be enabled when creating a new cluster. Existing clusters cannot be upgraded to use GKE Dataplane V2"</em> (<a href="https://docs.cloud.google.com/kubernetes-engine/docs/concepts/dataplane-v2">Dataplane V2</a>), so the data-plane choice is a cell-creation decision you cannot revisit without a rebuild. On Azure, <strong>kubenet retires on 31 March 2028</strong>, with migration to Azure CNI Overlay required (<a href="https://learn.microsoft.com/en-us/azure/aks/concepts-network-legacy-cni">AKS legacy CNI</a>) — also a rebuild rather than an in-place change.</p>
+<p><em>See also: <a href="04-managed-kubernetes-eks-gke-aks.html#version-and-support-windows-the-big-comparison">version and support windows: the big comparison</a> for the exact months, current supported minors, and cost multipliers behind "the pacing of upgrades is partly out of your hands."</em></p>
+<h3 id="storage-block-and-object">Storage: block and object<a class="anchor" href="#storage-block-and-object">#</a></h3>
+<p><strong>Block:</strong></p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>AWS EBS</th>
+<th>GCP PD / Hyperdisk</th>
+<th>Azure Managed Disks</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Performance model</td>
+<td>gp3 decouples IOPS/throughput from size; io2 for high IOPS</td>
+<td>PD performance scales with <strong>size and vCPU count</strong>; <a href="https://docs.cloud.google.com/compute/docs/disks/hyperdisk-performance">Hyperdisk</a> decouples IOPS/throughput from size</td>
+<td>Premium SSD scales by disk tier; Premium SSD v2 decouples IOPS/throughput (<a href="https://learn.microsoft.com/en-us/azure/virtual-machines/disks-types">docs</a>)</td>
+</tr>
+<tr>
+<td>Attachment limit</td>
+<td>Most Nitro instances: <strong>28 attachments shared</strong> across ENIs, EBS, and instance-store NVMe; newer generations have <strong>dedicated</strong> EBS limits from 32 up to 128 by size (<a href="https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/volume_limits.html">docs</a>)</td>
+<td>Per-machine-type disk limits; aggregate performance capped by the VM's own limit regardless of per-disk provisioning</td>
+<td><strong>Max data disks varies by VM size</strong> — published per SKU in the VM size tables</td>
+</tr>
+<tr>
+<td>Zonality</td>
+<td><strong>Zonal only</strong></td>
+<td>Zonal, plus <strong>Regional PD (synchronous replication across 2 zones)</strong> and Hyperdisk Balanced High Availability</td>
+<td>Zonal, plus <strong>ZRS disks</strong> for some types/regions</td>
+</tr>
+<tr>
+<td>Resize</td>
+<td>Grow online, never shrink</td>
+<td>Grow online, never shrink</td>
+<td>Grow online (some types need a stop), never shrink</td>
+</tr>
+<tr>
+<td>Snapshot scope</td>
+<td>Regional, incremental</td>
+<td><strong>Multi-regional / global</strong> snapshots</td>
+<td>Regional, incremental</td>
+</tr>
+</tbody>
+</table>
+<p>The delta that changes Temporal-shaped architecture: <strong>AWS has no cross-zone block device.</strong> GCP Regional PD and Azure ZRS disks let a stateful pod's volume survive a zone loss and reattach in a surviving zone. On AWS, a Cassandra or Postgres node's data is pinned to one AZ, and the answer must be replication at the database layer plus a rebuild path. If you write the cell's stateful-set recovery logic against GCP's regional disks and then port it, AWS will not have the primitive. Design for the AWS constraint (replicate at the data layer) and treat regional disks as an optimization, not a dependency.</p>
+<p>Also note the AWS shared-attachment limit: on most Nitro instances, ENIs, EBS volumes, and instance-store devices all draw from the same pool of 28. A node with several ENIs (which the VPC CNI creates) has correspondingly fewer EBS slots. On a Kubernetes node running many PVC-backed pods, that is the actual pod-density ceiling and it is invisible until pods hang in <code>ContainerCreating</code>.</p>
+<p><strong>Object:</strong></p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>S3</th>
+<th>Cloud Storage</th>
+<th>Azure Blob</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Namespace</td>
+<td><strong>Global</strong> bucket names</td>
+<td><strong>Global</strong> bucket names</td>
+<td>Names scoped to a <strong>storage account</strong>; the account name is global</td>
+</tr>
+<tr>
+<td>Consistency</td>
+<td><a href="https://aws.amazon.com/about-aws/whats-new/2020/12/amazon-s3-now-delivers-strong-read-after-write-consistency-automatically-for-all-applications">Strong read-after-write since Dec 2020</a></td>
+<td>Strongly consistent</td>
+<td>Strongly consistent</td>
+</tr>
+<tr>
+<td>Authorization</td>
+<td>IAM + bucket policy + Block Public Access + optional ACLs</td>
+<td>IAM (+ uniform bucket-level access, which disables ACLs)</td>
+<td>Azure RBAC data-plane roles, <strong>or</strong> account keys, <strong>or</strong> SAS</td>
+</tr>
+<tr>
+<td>Scoping unit for limits</td>
+<td>Bucket / account request rates</td>
+<td>Bucket</td>
+<td><strong>Storage account</strong> — the throughput and IOPS unit</td>
+</tr>
+</tbody>
+</table>
+<p>Two Azure-specific traps: (1) a storage <strong>account</strong> is the performance and limits unit, so "one container per cell" inside a shared account shares a throughput budget while "one account per cell" hits per-subscription account limits; (2) Azure RBAC <strong>control-plane</strong> roles like Contributor do not grant data access — you need explicit data-plane roles (<code>Storage Blob Data Contributor</code>) or you fall back to account keys, which is exactly the static-credential pattern you are trying to eliminate.</p>
+<h3 id="managed-databases-for-temporal-persistence">Managed databases for Temporal persistence<a class="anchor" href="#managed-databases-for-temporal-persistence">#</a></h3>
+<p>Temporal Server persistence supports <a href="https://docs.temporal.io/temporal-service/persistence">Cassandra, MySQL, and PostgreSQL</a>, with advanced Visibility on MySQL 8.0.17+ / PostgreSQL 12+, and Elasticsearch-compatible search for the visibility store in larger deployments.</p>
+<table>
+<thead>
+<tr>
+<th>Need</th>
+<th>AWS</th>
+<th>GCP</th>
+<th>Azure</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Managed PostgreSQL</td>
+<td>RDS for PostgreSQL; Aurora PostgreSQL (separated storage, fast failover)</td>
+<td>Cloud SQL for PostgreSQL; <a href="https://cloud.google.com/alloydb/docs/overview">AlloyDB</a> for higher throughput</td>
+<td>Azure Database for PostgreSQL <strong>Flexible Server</strong> — Single Server was <a href="https://learn.microsoft.com/en-us/azure/postgresql/migrate/whats-happening-to-postgresql-single-server">retired March 2025</a></td>
+</tr>
+<tr>
+<td>Managed MySQL</td>
+<td>RDS / Aurora MySQL</td>
+<td>Cloud SQL for MySQL</td>
+<td>Azure Database for MySQL Flexible Server</td>
+</tr>
+<tr>
+<td>Managed Cassandra</td>
+<td>Amazon Keyspaces (<strong>API-compatible, not Cassandra</strong>)</td>
+<td><strong>No first-party managed Cassandra</strong></td>
+<td><a href="https://learn.microsoft.com/en-us/azure/managed-instance-apache-cassandra/introduction">Azure Managed Instance for Apache Cassandra</a> — real OSS Cassandra</td>
+</tr>
+<tr>
+<td>Self-managed Cassandra</td>
+<td>EC2 + local NVMe</td>
+<td>GCE + local SSD</td>
+<td>VMs + Premium/Ultra disks</td>
+</tr>
+<tr>
+<td>Visibility (ES-compatible)</td>
+<td>Amazon OpenSearch Service</td>
+<td><strong>No first-party ES-7-compatible service</strong> — Temporal used a third-party vendor</td>
+<td>Elastic Cloud on Azure / self-managed</td>
+</tr>
+<tr>
+<td>Global SQL</td>
+<td>Aurora Global Database</td>
+<td>Spanner (different SQL dialect and semantics — not a Temporal target)</td>
+<td>Cosmos DB (not a Temporal SQL target)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Deltas that matter.</strong></p>
+<ul>
+<li><strong>Amazon Keyspaces is not a drop-in Cassandra.</strong> It has <a href="https://docs.aws.amazon.com/keyspaces/latest/devguide/functional-differences.html">documented functional differences</a> — no materialized views, different secondary-index behavior, different capacity accounting for lightweight transactions (failed LWT condition checks still consume write units). Temporal leans on LWTs; validate against the actual workload before treating Keyspaces as an option rather than assuming CQL compatibility is sufficient.</li>
+<li><strong>Azure is the only cloud with a first-party managed <em>open-source</em> Cassandra.</strong> That is a genuine Azure advantage for a Temporal-shaped workload and an example of why "pick the same database everywhere" is the wrong instinct.</li>
+<li><strong>The visibility store is the real portability gap</strong>, and Temporal's own blog says so: OpenSearch on AWS had no directly ES-7-compatible GCP equivalent, forcing a different vendor and therefore a genuinely different deployment workflow. Expect the same class of problem on Azure. Encode this as an interface method (<code>DeployVisibilityPersistenceStore</code>) whose implementations are allowed to differ radically, including "call a third party's API."</li>
+<li><strong>HA semantics differ.</strong> Aurora's storage-layer replication, Cloud SQL's regional HA with a standby, AlloyDB's cluster model, and Flexible Server's zone-redundant vs same-zone HA all have different failover times and different behavior under zone loss. The cell's SLO math is not portable; measure per cloud.</li>
+</ul>
+<h3 id="kms-secrets-and-what-they-back">KMS, secrets, and what they back<a class="anchor" href="#kms-secrets-and-what-they-back">#</a></h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>AWS</th>
+<th>GCP</th>
+<th>Azure</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Key service</td>
+<td>KMS (CMKs, key policies are authoritative)</td>
+<td>Cloud KMS (key rings are <strong>location-scoped</strong>)</td>
+<td>Key Vault (vault, or Managed HSM)</td>
+</tr>
+<tr>
+<td>Envelope encryption</td>
+<td>Generate data key → encrypt locally → store wrapped DEK</td>
+<td>Same pattern; <code>encrypt</code>/<code>decrypt</code> on a CryptoKey</td>
+<td>Same pattern; wrap/unwrap key operations</td>
+</tr>
+<tr>
+<td>Rotation</td>
+<td><a href="https://docs.aws.amazon.com/kms/latest/developerguide/rotate-keys.html">Automatic rotation, configurable 90–2560 days</a>; default ≈365 days; symmetric keys only</td>
+<td><a href="https://cloud.google.com/kms/docs/key-rotation">Rotation schedule</a> creates a new primary version; old versions retained for decrypt</td>
+<td>Rotation policy on keys; versions retained</td>
+</tr>
+<tr>
+<td>Deletion</td>
+<td>Scheduled deletion with a 7–30 day waiting period</td>
+<td><strong>Key rings and keys cannot be deleted</strong>; only key <em>versions</em> can be destroyed</td>
+<td><strong>Soft delete is on by default</strong>; purge protection can make deletion irreversible for the retention period</td>
+</tr>
+<tr>
+<td>Secrets</td>
+<td>Secrets Manager (rotation Lambdas) / SSM Parameter Store</td>
+<td>Secret Manager (versions, replication policy: automatic or user-managed)</td>
+<td>Key Vault secrets (same vault, same soft-delete semantics)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Deltas that hit cell teardown specifically.</strong> All three clouds make key material deliberately hard to delete, and each does it differently. GCP key rings are permanent — a cell whose key ring is named after the cell can never fully disappear, and recreating a cell with the same name will collide with a live key ring. Azure Key Vault soft-delete means a vault name is reserved for the retention window (commonly 90 days) after deletion, so create-destroy-recreate cycles in CI fail on name collision unless you purge or use generation-suffixed names. AWS's pending-deletion window is the mildest but still means a same-named alias may conflict. <strong>Every cell resource-naming scheme needs a generation counter, and the cell teardown workflow needs an explicit "soft-deleted residue" step</strong> that either purges or records the tombstone.</p>
+<p><strong>How these back the rest of the cell:</strong></p>
+<ul>
+<li><strong>Vault auto-unseal.</strong> HashiCorp Vault's <a href="https://developer.hashicorp.com/vault/docs/configuration/seal">seal configuration</a> supports <code>awskms</code>, <code>gcpckms</code>, and <code>azurekeyvault</code> stanzas. The Vault pods get their cloud credential from the workload-identity mechanism above, then Vault asks the KMS to decrypt its wrapped root key on every start. The portable verb is <code>ProvisionUnsealKey(cell) → seal-config</code>; the implementations differ in stanza name, in the identity binding, and in whether the key is deletable (see above).</li>
+<li><strong>cert-manager.</strong> ACME DNS-01 solvers exist for <a href="https://cert-manager.io/docs/configuration/acme/dns01/">Route 53, Cloud DNS, and Azure DNS</a>. Each needs write permission on the zone, delivered through the same workload-identity path. Note that this is one of the few places where the cell needs <em>write</em> access to a shared, cross-cell resource (the DNS zone), which argues for a per-cell subdomain delegated to a per-cell zone rather than a shared zone with per-cell record permissions — record-level authorization is weak-to-absent on all three.</li>
+</ul>
+<p><em>See also: <a href="10-vault.html#auto-unseal-with-cloud-kms--and-the-bootstrap-dependency-it-creates">auto-unseal with cloud KMS — and the bootstrap dependency it creates</a> for why a regional KMS outage seals every Vault in the region on restart, and why recovery keys are not unseal keys.</em></p>
+<h3 id="observability-plumbing">Observability plumbing<a class="anchor" href="#observability-plumbing">#</a></h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>AWS</th>
+<th>GCP</th>
+<th>Azure</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Logs</td>
+<td>CloudWatch Logs (log groups, subscription filters)</td>
+<td>Cloud Logging (<code>_Default</code>/<code>_Required</code> buckets, <strong>Log Router sinks</strong>)</td>
+<td>Azure Monitor Logs → Log Analytics workspace, via <strong>Data Collection Rules</strong></td>
+</tr>
+<tr>
+<td>Metrics</td>
+<td>CloudWatch Metrics; Managed Prometheus (AMP)</td>
+<td>Cloud Monitoring; Managed Service for Prometheus</td>
+<td>Azure Monitor Metrics; Azure Monitor managed Prometheus</td>
+</tr>
+<tr>
+<td>Cost shape</td>
+<td>Per-GB ingest + storage + per-metric (<a href="https://aws.amazon.com/cloudwatch/pricing/">pricing</a>)</td>
+<td>Per-GiB ingest with a monthly free allowance; storage included for a retention window (<a href="https://cloud.google.com/stackdriver/pricing">pricing</a>)</td>
+<td>Per-GB ingest with <strong>table plans</strong> — Analytics is materially pricier than Basic/Auxiliary (<a href="https://azure.microsoft.com/en-us/pricing/details/monitor/">pricing</a>)</td>
+</tr>
+<tr>
+<td>Why you cannot avoid it</td>
+<td>Control-plane events (ASG, EKS, ELB health) exist only here</td>
+<td>GKE/autoscaler/LB events exist only here</td>
+<td>AKS/VMSS/LB events exist only here</td>
+</tr>
+</tbody>
+</table>
+<p>You will run your own metrics and logging pipeline for the cell's application telemetry. You will <em>also</em> be forced to integrate with each cloud's native stack, because platform-side events — node lifecycle, load balancer health transitions, quota denials, managed-database failovers — are only emitted there. Treat that as a fourth interface method (<code>ExportPlatformEvents</code>) rather than as "we don't use CloudWatch." The one architectural instruction: check Azure's per-GB default tier before you route pod logs into Log Analytics; the default Analytics plan is the most expensive of the three by a wide margin, and it is easy to accidentally 10× a cell's observability bill by using the same shipping config everywhere.</p>
+<h3 id="quotas-limits-and-regional-capacity">Quotas, limits, and regional capacity<a class="anchor" href="#quotas-limits-and-regional-capacity">#</a></h3>
+<p>This is the operational tax nobody budgets for.</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>AWS</th>
+<th>GCP</th>
+<th>Azure</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>API</td>
+<td>Service Quotas</td>
+<td>Cloud Quotas (quota preferences)</td>
+<td>Quota / Usages APIs, per provider</td>
+</tr>
+<tr>
+<td>Granularity</td>
+<td>Per account × region; some quotas not adjustable</td>
+<td>Per project × region; some org-level</td>
+<td>Per subscription × region; two-tier for vCPUs</td>
+</tr>
+<tr>
+<td>Increase workflow</td>
+<td>Automated for many, support case for the rest</td>
+<td>Automated for many, support case for the rest</td>
+<td>Automated for many, support case for the rest</td>
+</tr>
+<tr>
+<td>Capacity ≠ quota</td>
+<td>Yes — <code>InsufficientInstanceCapacity</code> even with quota</td>
+<td>Yes — <code>ZONE_RESOURCE_POOL_EXHAUSTED</code></td>
+<td>Yes — <code>AllocationFailed</code> / <code>ZonalAllocationFailed</code></td>
+</tr>
+</tbody>
+</table>
+<p><strong>The multi-cloud reality.</strong> Your quota surface is (clouds) × (regions) × (tenancy units) × (quota families). A cell-per-account/project/subscription model multiplies the last factor by the number of cells. Three practices are non-negotiable:</p>
+<ol>
+<li><strong>Quota provisioning is a step in the cell-creation workflow, not a prerequisite done by hand.</strong> Request quota programmatically, poll for approval, and let the workflow wait — this is exactly the kind of long-running, human-in-the-loop step Temporal is good at.</li>
+<li><strong>Monitor headroom, not usage.</strong> Alert on "cell X is within 20% of its per-family vCPU quota in region Y," per cloud, continuously.</li>
+<li><strong>Distinguish quota failures from capacity failures in your retry logic.</strong> A quota error should page or open a request; a capacity error should retry in another zone or another instance shape. Conflating them produces either infinite retries or spurious pages. Each cloud's error taxonomy differs, so the classification lives in the per-cloud implementation and the <em>decision</em> lives in the shared workflow.</li>
+</ol>
+<h3 id="control-plane-api-behavior-consistency-idempotency-throttling">Control-plane API behavior: consistency, idempotency, throttling<a class="anchor" href="#control-plane-api-behavior-consistency-idempotency-throttling">#</a></h3>
+<p>Cell lifecycle is mostly a long sequence of cloud API calls executed by workflows. The APIs themselves differ in ways that determine how you write activities.</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>AWS</th>
+<th>GCP</th>
+<th>Azure</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Long-running operations</td>
+<td>Mostly synchronous create + poll a describe call for state</td>
+<td>Explicit <strong>Operation</strong> resources you poll by name</td>
+<td>Explicit <code>Azure-AsyncOperation</code> / <code>Location</code> header polling; ARM deployments as first-class objects</td>
+</tr>
+<tr>
+<td>Consistency</td>
+<td>IAM and some other services are <strong>eventually consistent</strong>; a just-created role may not be usable for seconds</td>
+<td>Generally read-your-writes within a project, but IAM propagation is not instant</td>
+<td>Entra ID → ARM propagation is the slow path; role assignment right after principal creation commonly fails</td>
+</tr>
+<tr>
+<td>Idempotency</td>
+<td>Client tokens on some APIs (<code>ClientToken</code>, <code>Idempotency-Token</code>), not universal</td>
+<td><code>requestId</code> on many mutating calls</td>
+<td>ARM deployments are declarative and re-appliable; raw resource PUTs are idempotent by URI</td>
+</tr>
+<tr>
+<td>Throttling signal</td>
+<td><code>ThrottlingException</code> / <code>RequestLimitExceeded</code>, per-API token buckets</td>
+<td><code>RESOURCE_EXHAUSTED</code> with rate quotas separate from allocation quotas</td>
+<td>HTTP 429 with <code>Retry-After</code>, per-resource-provider limits</td>
+</tr>
+<tr>
+<td>Deletion</td>
+<td>Mostly synchronous with dependency errors</td>
+<td>Operations you poll; some resources are undeletable (KMS)</td>
+<td>Cascading RG delete; soft-deleted services linger</td>
+</tr>
+</tbody>
+</table>
+<p><strong>What this means for workflow design.</strong> Three rules that hold on all three clouds and are worth encoding once in your activity framework:</p>
+<ol>
+<li><strong>Every create is "create-or-adopt," never "create."</strong> Activities are retried; a retried create must find the existing resource and return it rather than failing on conflict. Where a native idempotency token exists, use it; where it does not (which is most of the time), implement adopt-by-name using a deterministic name derived from the cell ID and generation.</li>
+<li><strong>Separate "not ready yet" from "will never be ready."</strong> A <code>PrincipalNotFound</code> right after creating an Azure identity is transient; a <code>PrincipalNotFound</code> for an identity you never created is terminal. Retrying the second forever is how a cell-create workflow silently hangs for hours. Classify errors per cloud in the provider implementation and surface a single retryable/terminal decision to the shared workflow.</li>
+<li><strong>Poll operations, do not sleep.</strong> GCP and Azure hand you an operation handle; use it. On AWS, poll the describe call with backoff. Fixed sleeps are the single most common cause of both flaky provisioning and needlessly slow provisioning, and they are invisible in metrics because the workflow "succeeded."</li>
+</ol>
+<p>The reason this matters more in multi-cloud than single-cloud: the <em>same</em> logical step has different failure vocabularies, so the classification logic cannot live in the shared workflow. If you find yourself writing <code>if err.Contains("PrincipalNotFound")</code> in a cloud-agnostic workflow, the abstraction boundary is in the wrong place.</p>
+<h3 id="cost-model-differences-that-change-architecture">Cost model differences that change architecture<a class="anchor" href="#cost-model-differences-that-change-architecture">#</a></h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>AWS</th>
+<th>GCP</th>
+<th>Azure</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Cross-AZ (intra-region) VM↔VM</td>
+<td><strong>Charged, both directions</strong> (per-GB each way) — see <a href="https://aws.amazon.com/vpc/pricing/">VPC pricing</a></td>
+<td><strong>Charged</strong> inter-zone within a region; same-zone internal-IP traffic free (<a href="https://cloud.google.com/vpc/network-pricing">network pricing</a>)</td>
+<td><strong>Not charged</strong> — Microsoft removed inter-AZ data transfer fees (<a href="https://azure.microsoft.com/en-us/pricing/details/bandwidth/">bandwidth pricing</a>)</td>
+</tr>
+<tr>
+<td>Cross-region</td>
+<td>Charged</td>
+<td>Charged, tier-dependent</td>
+<td>Charged</td>
+</tr>
+<tr>
+<td>Internet egress</td>
+<td>Charged above a free monthly allowance</td>
+<td>Charged; <strong>Premium vs Standard network tier</strong> changes both price and path</td>
+<td>Charged above a free monthly allowance</td>
+</tr>
+<tr>
+<td>NAT</td>
+<td>Hourly + per-GB</td>
+<td>Per-VM-hour (capped) + per-GiB</td>
+<td>Hourly + per-GB</td>
+</tr>
+<tr>
+<td>LB</td>
+<td>LCU-based (dimension maxima)</td>
+<td>Forwarding rules + data processing + tier egress</td>
+<td>LB rules + processed data; App Gateway capacity units</td>
+</tr>
+<tr>
+<td>K8s control plane</td>
+<td><a href="https://aws.amazon.com/eks/pricing/">Per cluster-hour</a></td>
+<td><a href="https://cloud.google.com/kubernetes-engine/pricing">Per cluster-hour</a>, with a free-tier allowance</td>
+<td><a href="https://learn.microsoft.com/en-us/azure/aks/free-standard-pricing-tiers">Free tier without an uptime SLA, or Standard tier with one</a></td>
+</tr>
+<tr>
+<td>Log ingest</td>
+<td>Moderate per-GB</td>
+<td>Moderate per-GB, generous free allowance</td>
+<td>Default Analytics plan is the priciest; Basic/Auxiliary plans much cheaper</td>
+</tr>
+</tbody>
+</table>
+<p>Do not quote exact figures from memory in design docs — link the pricing pages, which change. What <em>is</em> stable enough to design around:</p>
+<ul>
+<li><strong>Zone-aware routing is worth real money on AWS and GCP, and worth nothing on Azure.</strong> Kubernetes topology-aware routing, NLB cross-zone left off, and zone-local Cassandra reads are AWS/GCP optimizations. Applying the same "keep traffic in-zone" pressure on Azure buys you availability-zone fragility for no financial return. This is a case where the <em>right</em> architecture genuinely differs per cloud, and forcing uniformity is the expensive choice.</li>
+<li><strong>NAT gateway shape differs enough to change topology.</strong> AWS charges per gateway-hour and you need one per AZ; three idle NAT gateways per cell is a real fixed cost at fleet scale. GCP's per-VM-hour model caps out and has no per-AZ multiplication. Use private/VPC endpoints aggressively on AWS specifically.</li>
+<li><strong>Cell fixed cost is the number to watch.</strong> Control plane hour + NAT + LB + KMS keys + DNS zones + log workspace = the floor cost of an empty cell. Compute it per cloud before you commit to a cell-per-customer model; the floor differs by more than people expect, and it determines your minimum viable cell size.</li>
+</ul>
+<h3 id="portability-strategy-what-to-abstract-what-to-leave-alone">Portability strategy: what to abstract, what to leave alone<a class="anchor" href="#portability-strategy-what-to-abstract-what-to-leave-alone">#</a></h3>
+<p>This is the section that decides whether the codebase is maintainable in two years.</p>
+<p><strong>Abstract the verbs. Do not abstract the nouns.</strong> A verb is an operation the cell lifecycle needs — "give this cell durable persistence," "expose this cell's frontend," "bind this workload to this capability." A noun is a cloud resource — a load balancer, a subnet, a managed identity. Verbs have stable semantics across clouds. Nouns do not: AWS's load balancer <em>has</em> listeners, GCP's forwarding rule <em>is attached to</em> a proxy that references a URL map that references a backend service. There is no honest shared type.</p>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Abstract it?</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Cell contract (endpoints, identity, persistence handles, telemetry, teardown state)</td>
+<td><strong>Yes</strong> — this is the product</td>
+<td>It is what everything else in the platform depends on; keep it stable and versioned</td>
+</tr>
+<tr>
+<td>Provisioning verbs (<code>DeployPersistenceStore</code>, <code>BindWorkloadIdentity</code>, <code>PublishPrivateEndpoint</code>)</td>
+<td><strong>Yes</strong></td>
+<td>Same semantics everywhere; wildly different implementations</td>
+</tr>
+<tr>
+<td>Naming, tagging/labeling, IPAM allocation, cell ID → resource name derivation</td>
+<td><strong>Yes</strong></td>
+<td>Genuinely cloud-independent, and the highest-value thing to make uniform</td>
+</tr>
+<tr>
+<td>Error classification (retryable / terminal / capacity / quota)</td>
+<td><strong>Interface yes, implementation no</strong></td>
+<td>The decision is shared; the vocabulary is per-cloud</td>
+</tr>
+<tr>
+<td>Conformance tests ("is this cell actually correct?")</td>
+<td><strong>Yes</strong></td>
+<td>One suite, three implementations of the probes; every difference it finds is a real design decision</td>
+</tr>
+<tr>
+<td>Resource graphs (LB topology, network topology, node pool shapes)</td>
+<td><strong>No</strong></td>
+<td>Shapes differ structurally; forcing them together produces the worst of all three</td>
+</tr>
+<tr>
+<td>IAM policy documents</td>
+<td><strong>No</strong></td>
+<td>Trust-inside-the-role vs principal-string vs child-resource are not the same object</td>
+</tr>
+<tr>
+<td>Quota and capacity semantics</td>
+<td><strong>No</strong></td>
+<td>Three different data models; normalize <em>headroom</em> for alerting, not the model itself</td>
+</tr>
+<tr>
+<td>Load balancer feature sets</td>
+<td><strong>No</strong></td>
+<td>Global anycast on GCP, gRPC-to-backend on AWS, in-cluster Envoy on Azure — these are different architectures</td>
+</tr>
+<tr>
+<td>Disk performance and zonality</td>
+<td><strong>No</strong></td>
+<td>Regional PD and ZRS exist on two clouds and not the third; a shared type would erase them</td>
+</tr>
+<tr>
+<td>DNS topology</td>
+<td><strong>No</strong></td>
+<td>Zone-to-network binding models differ enough that the "portable" version is wrong everywhere</td>
+</tr>
+<tr>
+<td>Managed database selection</td>
+<td><strong>No</strong></td>
+<td>Managed OSS Cassandra exists on Azure, not GCP; Keyspaces is not Cassandra</td>
+</tr>
+</tbody>
+</table>
+<p><strong>The standard failure mode of lowest-common-denominator abstractions.</strong> It goes like this, every time:</p>
+<ol>
+<li>Someone builds <code>type CloudLoadBalancer struct { Scheme, Port, TargetGroup }</code> because all three clouds "have load balancers."</li>
+<li>It works, because the first two use cases are simple.</li>
+<li>A requirement arrives that only one cloud supports natively — end-to-end gRPC, or a global anycast IP, or a regional disk. It does not fit the struct.</li>
+<li>An escape hatch appears: <code>ProviderSpecific map[string]string</code>, or an <code>if cloud == "azure"</code> inside the shared code.</li>
+<li>Within a year the shared code has more conditionals than the three separate implementations would have had lines, and the "portable" struct is a lossy union that nobody can reason about.</li>
+<li>During an incident, the abstraction is the thing standing between the on-call engineer and the actual cloud resource, and they bypass it — which means the abstraction is now also <em>wrong</em>, because manual changes have drifted from it.</li>
+</ol>
+<p>The failure is not that the abstraction was leaky. It is that it abstracted at the wrong altitude: over nouns whose models genuinely differ, instead of over verbs whose <em>intent</em> is genuinely shared. Temporal's published approach avoids this by making the interface a list of lifecycle operations and letting each provider implementation be an entirely separate set of workflows — the AWS implementation is allowed to deploy OpenSearch while the GCP implementation calls a third-party vendor's API, and the cloud-agnostic parent workflow neither knows nor cares.</p>
+<p><strong>Practical rules to hold the line.</strong></p>
+<ul>
+<li><strong>Adding a method to the provider interface must break compilation for every cloud.</strong> That is the feature-parity forcing function. Never add a default implementation that silently no-ops.</li>
+<li><strong>Allow capability flags in the cell contract.</strong> Some clouds will lack a feature for a while — that is normal and should be representable, not hidden. The user-facing control plane can then decline to offer the feature rather than failing at provision time.</li>
+<li><strong>Push cloud-specific richness <em>down</em>, not <em>out</em>.</strong> If GCP's global load balancer lets you serve one anycast IP across regions, use it in the GCP implementation. Do not remove it because AWS cannot match it, and do not surface it into the shared contract as an optional field nobody else sets.</li>
+<li><strong>Write the conformance suite before the second cloud.</strong> Otherwise "it works on GCP" means "it passes the tests we wrote while thinking about AWS."</li>
+<li><strong>Let Terraform/Pulumi be per-cloud.</strong> IaC tools intentionally mirror each provider's resource model; trying to write one module for three clouds fights the tool. Share the <em>inputs</em> (cell ID, CIDR, sizing, tags) and the <em>outputs</em> (the cell contract), not the module body.</li>
+</ul>
+<hr />
+<h2 id="hands-on">Hands-on<a class="anchor" href="#hands-on">#</a></h2>
+<p>These labs are deliberately cheap. <strong>Read the cost notes before running anything.</strong> The rule: networks, subnets, firewall rules, IAM, and federation configs are free on all three clouds; gateways, load balancers, managed control planes, and anything with an hourly rate are not.</p>
+<h3 id="setup">Setup<a class="anchor" href="#setup">#</a></h3>
+<div class="codehilite"><pre><span></span><code><span class="c1"># AWS</span>
+aws --version
+aws configure sso            <span class="c1"># or aws configure</span>
+aws sts get-caller-identity
+
+<span class="c1"># GCP</span>
+gcloud version
+gcloud auth login
+gcloud auth application-default login
+gcloud config <span class="nb">set</span> project YOUR_PROJECT
+
+<span class="c1"># Azure</span>
+az version
+az login
+az account <span class="nb">set</span> --subscription YOUR_SUBSCRIPTION_ID
+</code></pre></div>
+
+<p><strong>Cost: free.</strong> Set up budget alerts before anything else:</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># GCP: budgets are on the billing account</span>
+gcloud billing budgets list --billing-account<span class="o">=</span>BILLING_ACCOUNT_ID
+<span class="c1"># Azure</span>
+az consumption budget list
+<span class="c1"># AWS: Budgets console, or</span>
+aws budgets describe-budgets --account-id <span class="s2">&quot;</span><span class="k">$(</span>aws sts get-caller-identity --query Account --output text<span class="k">)</span><span class="s2">&quot;</span>
+</code></pre></div>
+
+<h3 id="lab-1--read-the-hierarchy-three-ways">Lab 1 — Read the hierarchy three ways<a class="anchor" href="#lab-1--read-the-hierarchy-three-ways">#</a></h3>
+<div class="codehilite"><pre><span></span><code><span class="c1"># AWS: org tree</span>
+aws organizations list-roots
+aws organizations list-organizational-units-for-parent --parent-id r-xxxx
+aws organizations list-accounts
+
+<span class="c1"># GCP: org tree</span>
+gcloud organizations list
+gcloud resource-manager folders list --organization<span class="o">=</span>ORG_ID
+gcloud projects list --filter<span class="o">=</span><span class="s2">&quot;parent.id=FOLDER_ID&quot;</span>
+
+<span class="c1"># Azure: MG tree + subscriptions</span>
+az account management-group list -o table
+az account management-group show --name MG_NAME --expand --recurse
+az account list -o table
+</code></pre></div>
+
+<p><strong>Cost: free.</strong> What to notice: AWS gives you accounts with no sub-container; GCP gives you projects with an immutable ID; Azure gives you subscriptions <em>plus</em> resource groups, and the resource group has a <code>location</code> that is not where its contents necessarily live.</p>
+<h3 id="lab-2--the-same-network-three-ways-the-subnet-scope-lesson">Lab 2 — The same network, three ways (the subnet-scope lesson)<a class="anchor" href="#lab-2--the-same-network-three-ways-the-subnet-scope-lesson">#</a></h3>
+<div class="codehilite"><pre><span></span><code><span class="c1"># --- AWS: one VPC, THREE subnets (one per AZ) ---</span>
+<span class="nv">VPC</span><span class="o">=</span><span class="k">$(</span>aws ec2 create-vpc --cidr-block <span class="m">10</span>.10.0.0/16 <span class="se">\</span>
+  --query Vpc.VpcId --output text<span class="k">)</span>
+<span class="k">for</span> i <span class="k">in</span> <span class="m">0</span> <span class="m">1</span> <span class="m">2</span><span class="p">;</span> <span class="k">do</span>
+  <span class="nv">AZ</span><span class="o">=</span><span class="k">$(</span>aws ec2 describe-availability-zones <span class="se">\</span>
+        --query <span class="s2">&quot;AvailabilityZones[</span><span class="nv">$i</span><span class="s2">].ZoneName&quot;</span> --output text<span class="k">)</span>
+  aws ec2 create-subnet --vpc-id <span class="s2">&quot;</span><span class="nv">$VPC</span><span class="s2">&quot;</span> <span class="se">\</span>
+    --cidr-block <span class="s2">&quot;10.10.</span><span class="nv">$i</span><span class="s2">.0/24&quot;</span> --availability-zone <span class="s2">&quot;</span><span class="nv">$AZ</span><span class="s2">&quot;</span>
+<span class="k">done</span>
+<span class="c1"># Note the AZ *ID*, not the name — names are per-account aliases:</span>
+aws ec2 describe-availability-zones <span class="se">\</span>
+  --query <span class="s2">&quot;AvailabilityZones[].{Name:ZoneName,Id:ZoneId}&quot;</span> --output table
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="c1"># --- GCP: one GLOBAL VPC, ONE regional subnet that spans all zones ---</span>
+gcloud compute networks create cell-lab --subnet-mode<span class="o">=</span>custom
+gcloud compute networks subnets create cell-lab-usc1 <span class="se">\</span>
+  --network<span class="o">=</span>cell-lab --region<span class="o">=</span>us-central1 --range<span class="o">=</span><span class="m">10</span>.20.0.0/20 <span class="se">\</span>
+  --secondary-range<span class="o">=</span><span class="nv">pods</span><span class="o">=</span><span class="m">10</span>.24.0.0/14,services<span class="o">=</span><span class="m">10</span>.28.0.0/20
+gcloud compute networks subnets describe cell-lab-usc1 --region<span class="o">=</span>us-central1
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="c1"># --- Azure: one regional VNet, ONE subnet that spans all zones ---</span>
+az group create -n rg-cell-lab -l eastus2
+az network vnet create -g rg-cell-lab -n vnet-cell-lab <span class="se">\</span>
+  --address-prefix <span class="m">10</span>.30.0.0/16 <span class="se">\</span>
+  --subnet-name snet-nodes --subnet-prefix <span class="m">10</span>.30.0.0/20
+<span class="c1"># Logical zone 1 is NOT the same physical zone across subscriptions:</span>
+az rest --method get --url <span class="se">\</span>
+  <span class="s2">&quot;https://management.azure.com/subscriptions/</span><span class="k">$(</span>az account show --query id -o tsv<span class="k">)</span><span class="s2">/locations?api-version=2022-12-01&quot;</span> <span class="se">\</span>
+  --query <span class="s2">&quot;value[?name==&#39;eastus2&#39;].availabilityZoneMappings&quot;</span>
+</code></pre></div>
+
+<p><strong>Cost: free</strong> (VPCs, VNets, subnets, and resource groups carry no charge). <strong>Do not</strong> create a NAT gateway, load balancer, or managed cluster in this lab — those bill hourly.</p>
+<p><strong>Teardown</strong> — run this <em>after</em> Lab 3, which reuses <code>$VPC</code>, <code>cell-lab</code>, and <code>rg-cell-lab</code>. AWS refuses to delete a VPC while subnets or non-default security groups still reference it, so unwind in order:</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># Subnets, then the security group Lab 3 created, then the VPC.</span>
+<span class="k">for</span> S <span class="k">in</span> <span class="k">$(</span>aws ec2 describe-subnets --filters <span class="s2">&quot;Name=vpc-id,Values=</span><span class="nv">$VPC</span><span class="s2">&quot;</span> <span class="se">\</span>
+             --query <span class="s1">&#39;Subnets[].SubnetId&#39;</span> --output text<span class="k">)</span><span class="p">;</span> <span class="k">do</span>
+  aws ec2 delete-subnet --subnet-id <span class="s2">&quot;</span><span class="nv">$S</span><span class="s2">&quot;</span>
+<span class="k">done</span>
+aws ec2 delete-security-group --group-name lab-sg --group-id <span class="se">\</span>
+  <span class="s2">&quot;</span><span class="k">$(</span>aws ec2 describe-security-groups --filters <span class="s2">&quot;Name=vpc-id,Values=</span><span class="nv">$VPC</span><span class="s2">&quot;</span> <span class="se">\</span>
+       <span class="s2">&quot;Name=group-name,Values=lab-sg&quot;</span> --query <span class="s1">&#39;SecurityGroups[0].GroupId&#39;</span> <span class="se">\</span>
+       --output text<span class="k">)</span><span class="s2">&quot;</span> <span class="m">2</span>&gt;/dev/null <span class="o">||</span> <span class="nb">true</span>
+aws ec2 delete-vpc --vpc-id <span class="s2">&quot;</span><span class="nv">$VPC</span><span class="s2">&quot;</span>
+
+gcloud compute firewall-rules delete cell-lab-allow-internal -q <span class="m">2</span>&gt;/dev/null <span class="o">||</span> <span class="nb">true</span>
+gcloud compute networks subnets delete cell-lab-usc1 --region<span class="o">=</span>us-central1 -q
+gcloud compute networks delete cell-lab -q
+az group delete -n rg-cell-lab --yes --no-wait
+</code></pre></div>
+
+<h3 id="lab-3--firewall-semantics-three-ways">Lab 3 — Firewall semantics three ways<a class="anchor" href="#lab-3--firewall-semantics-three-ways">#</a></h3>
+<div class="codehilite"><pre><span></span><code><span class="c1"># AWS: stateful SG (allow-only) + stateless NACL</span>
+aws ec2 create-security-group --group-name lab-sg --description lab --vpc-id <span class="s2">&quot;</span><span class="nv">$VPC</span><span class="s2">&quot;</span>
+aws ec2 describe-network-acls --filters <span class="s2">&quot;Name=vpc-id,Values=</span><span class="nv">$VPC</span><span class="s2">&quot;</span> <span class="se">\</span>
+  --query <span class="s2">&quot;NetworkAcls[].Entries&quot;</span>
+
+<span class="c1"># GCP: rule lives on the NETWORK, targets a service account</span>
+gcloud compute firewall-rules create cell-lab-allow-internal <span class="se">\</span>
+  --network<span class="o">=</span>cell-lab --direction<span class="o">=</span>INGRESS --action<span class="o">=</span>ALLOW <span class="se">\</span>
+  --rules<span class="o">=</span>tcp:7233,tcp:7235 <span class="se">\</span>
+  --target-service-accounts<span class="o">=</span>NODE_SA@PROJECT.iam.gserviceaccount.com <span class="se">\</span>
+  --source-ranges<span class="o">=</span><span class="m">10</span>.20.0.0/20
+
+<span class="c1"># Azure: NSG, and look at the DEFAULT rules</span>
+az network nsg create -g rg-cell-lab -n nsg-lab
+az network nsg rule list -g rg-cell-lab --nsg-name nsg-lab --include-default <span class="se">\</span>
+  -o table
+</code></pre></div>
+
+<p><strong>Cost: free.</strong> What to notice: the Azure default rule list includes <code>AllowVnetInBound</code> — Azure is default-open inside the VNet where AWS is default-closed between security groups. Your baseline policy cannot be shared.</p>
+<h3 id="lab-4--cross-cloud-federation-without-a-single-stored-key">Lab 4 — Cross-cloud federation without a single stored key<a class="anchor" href="#lab-4--cross-cloud-federation-without-a-single-stored-key">#</a></h3>
+<p>This is the highest-value lab and it is entirely free (identity objects and STS calls carry no charge).</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># GCP trusting AWS: workload identity pool with an AWS provider</span>
+gcloud iam workload-identity-pools create aws-cp-pool <span class="se">\</span>
+  --location<span class="o">=</span>global --display-name<span class="o">=</span><span class="s2">&quot;AWS control plane&quot;</span>
+gcloud iam workload-identity-pools providers create-aws aws-provider <span class="se">\</span>
+  --location<span class="o">=</span>global --workload-identity-pool<span class="o">=</span>aws-cp-pool <span class="se">\</span>
+  --account-id<span class="o">=</span>YOUR_AWS_ACCOUNT_ID <span class="se">\</span>
+  --attribute-condition<span class="o">=</span><span class="s2">&quot;assertion.arn.startsWith(&#39;arn:aws:sts::YOUR_AWS_ACCOUNT_ID:assumed-role/InfraCP&#39;)&quot;</span>
+<span class="c1"># Then grant the federated principal a role directly:</span>
+<span class="nv">PROJECT_NUMBER</span><span class="o">=</span><span class="k">$(</span>gcloud projects describe <span class="s2">&quot;</span><span class="k">$(</span>gcloud config get-value project<span class="k">)</span><span class="s2">&quot;</span> <span class="se">\</span>
+  --format<span class="o">=</span><span class="s1">&#39;value(projectNumber)&#39;</span><span class="k">)</span>
+gcloud projects add-iam-policy-binding <span class="s2">&quot;</span><span class="k">$(</span>gcloud config get-value project<span class="k">)</span><span class="s2">&quot;</span> <span class="se">\</span>
+  --role<span class="o">=</span>roles/compute.networkViewer <span class="se">\</span>
+  --member<span class="o">=</span><span class="s2">&quot;principalSet://iam.googleapis.com/projects/</span><span class="si">${</span><span class="nv">PROJECT_NUMBER</span><span class="si">}</span><span class="s2">/locations/global/workloadIdentityPools/aws-cp-pool/attribute.aws_role/arn:aws:sts::YOUR_AWS_ACCOUNT_ID:assumed-role/InfraCP&quot;</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="c1"># Azure trusting an external OIDC issuer (e.g. a GitHub Actions repo, free to test)</span>
+az identity create -g rg-cell-lab -n uami-cell-provisioner
+az identity federated-credential create <span class="se">\</span>
+  --name gha-main --identity-name uami-cell-provisioner -g rg-cell-lab <span class="se">\</span>
+  --issuer <span class="s2">&quot;https://token.actions.githubusercontent.com&quot;</span> <span class="se">\</span>
+  --subject <span class="s2">&quot;repo:YOUR_ORG/YOUR_REPO:ref:refs/heads/main&quot;</span> <span class="se">\</span>
+  --audiences <span class="s2">&quot;api://AzureADTokenExchange&quot;</span>
+<span class="c1"># Now count them — the ceiling is 20 per identity:</span>
+az identity federated-credential list <span class="se">\</span>
+  --identity-name uami-cell-provisioner -g rg-cell-lab --query <span class="s2">&quot;length(@)&quot;</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="c1"># AWS trusting an external OIDC issuer</span>
+aws iam create-open-id-connect-provider <span class="se">\</span>
+  --url https://token.actions.githubusercontent.com <span class="se">\</span>
+  --client-id-list sts.amazonaws.com
+<span class="c1"># Then a role whose trust policy conditions on sub/aud — inspect an existing one:</span>
+aws iam get-role --role-name SOME_ROLE --query <span class="s1">&#39;Role.AssumeRolePolicyDocument&#39;</span>
+</code></pre></div>
+
+<p><strong>Cost: free.</strong> Delete the identity pool/provider, the UAMI, and the OIDC provider afterward. Note that GCP workload identity pools are soft-deleted for 30 days and the name is reserved — a preview of the naming problem in Gotcha 13.</p>
+<h3 id="lab-5--quota-introspection-three-ways">Lab 5 — Quota introspection three ways<a class="anchor" href="#lab-5--quota-introspection-three-ways">#</a></h3>
+<div class="codehilite"><pre><span></span><code><span class="c1"># AWS: the five On-Demand vCPU family buckets</span>
+aws service-quotas list-service-quotas --service-code ec2 <span class="se">\</span>
+  --query <span class="s2">&quot;Quotas[?contains(QuotaName, &#39;On-Demand&#39;)].{Name:QuotaName,Value:Value}&quot;</span> <span class="se">\</span>
+  --output table
+
+<span class="c1"># GCP: regional CPU + per-family quotas</span>
+gcloud compute regions describe us-central1 <span class="se">\</span>
+  --format<span class="o">=</span><span class="s2">&quot;table(quotas.metric,quotas.limit,quotas.usage)&quot;</span>
+
+<span class="c1"># Azure: the two-tier model, visible in one call</span>
+az vm list-usage -l eastus2 -o table
+</code></pre></div>
+
+<p><strong>Cost: free.</strong> What to notice: the three outputs are not the same data model. AWS buckets many instance families into one quota; Azure enforces both a regional total and a per-family limit; GCP has an aggregate plus per-family entries. Any "quota headroom" abstraction has to normalize three different shapes.</p>
+<h3 id="lab-6--kms-envelope-encryption-three-ways">Lab 6 — KMS envelope encryption three ways<a class="anchor" href="#lab-6--kms-envelope-encryption-three-ways">#</a></h3>
+<div class="codehilite"><pre><span></span><code><span class="c1"># AWS  (~$1/key/month; keys cannot be deleted immediately)</span>
+<span class="nv">KEYID</span><span class="o">=</span><span class="k">$(</span>aws kms create-key --description lab --query KeyMetadata.KeyId --output text<span class="k">)</span>
+aws kms generate-data-key --key-id <span class="s2">&quot;</span><span class="nv">$KEYID</span><span class="s2">&quot;</span> --key-spec AES_256
+aws kms schedule-key-deletion --key-id <span class="s2">&quot;</span><span class="nv">$KEYID</span><span class="s2">&quot;</span> --pending-window-in-days <span class="m">7</span>
+
+<span class="c1"># GCP  (billed per active key version; key rings can NEVER be deleted)</span>
+gcloud kms keyrings create lab-ring --location<span class="o">=</span>us-central1
+gcloud kms keys create lab-key --location<span class="o">=</span>us-central1 <span class="se">\</span>
+  --keyring<span class="o">=</span>lab-ring --purpose<span class="o">=</span>encryption
+<span class="nb">echo</span> <span class="s2">&quot;hello&quot;</span> <span class="p">|</span> gcloud kms encrypt --location<span class="o">=</span>us-central1 --keyring<span class="o">=</span>lab-ring <span class="se">\</span>
+  --key<span class="o">=</span>lab-key --plaintext-file<span class="o">=</span>- --ciphertext-file<span class="o">=</span>- <span class="p">|</span> base64
+
+<span class="c1"># Azure  (per-operation; soft delete reserves the vault NAME)</span>
+az keyvault create -g rg-cell-lab -n kv-cell-lab-0001 -l eastus2
+az keyvault key create --vault-name kv-cell-lab-0001 -n lab-key --kty RSA
+az keyvault delete -n kv-cell-lab-0001            <span class="c1"># soft delete</span>
+az keyvault list-deleted -o table                  <span class="c1"># it is still holding the name</span>
+az keyvault purge -n kv-cell-lab-0001              <span class="c1"># required to reuse the name</span>
+</code></pre></div>
+
+<p><strong>Cost: small but nonzero.</strong> AWS KMS keys carry a monthly charge and a mandatory deletion waiting period. GCP key rings are permanent — use a scratch project you are willing to abandon. Azure vault names are reserved by soft delete until purged; this lab is the cheapest way to feel Gotcha 13 in your hands.</p>
+<h3 id="lab-7--optional-and-it-costs-money-one-real-cluster">Lab 7 — Optional, and it costs money: one real cluster<a class="anchor" href="#lab-7--optional-and-it-costs-money-one-real-cluster">#</a></h3>
+<p>If you want end-to-end workload identity, spin up exactly one cluster in one cloud, do the binding, and destroy it the same day.</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># Cheapest of the three for a short-lived test is typically a single-zone GKE cluster</span>
+<span class="c1"># (PROJECT_NUMBER is set in Lab 4; repeat it here if you skipped that lab.)</span>
+<span class="nv">PROJECT_NUMBER</span><span class="o">=</span><span class="k">$(</span>gcloud projects describe <span class="s2">&quot;</span><span class="k">$(</span>gcloud config get-value project<span class="k">)</span><span class="s2">&quot;</span> <span class="se">\</span>
+  --format<span class="o">=</span><span class="s1">&#39;value(projectNumber)&#39;</span><span class="k">)</span>
+gcloud container clusters create-auto cell-lab --region<span class="o">=</span>us-central1 <span class="se">\</span>
+  --workload-pool<span class="o">=</span><span class="s2">&quot;</span><span class="k">$(</span>gcloud config get-value project<span class="k">)</span><span class="s2">.svc.id.goog&quot;</span>
+<span class="c1"># Bind a KSA directly to a role (no intermediate service account):</span>
+gcloud projects add-iam-policy-binding <span class="s2">&quot;</span><span class="k">$(</span>gcloud config get-value project<span class="k">)</span><span class="s2">&quot;</span> <span class="se">\</span>
+  --role<span class="o">=</span>roles/storage.objectViewer <span class="se">\</span>
+  --member<span class="o">=</span><span class="s2">&quot;principal://iam.googleapis.com/projects/</span><span class="si">${</span><span class="nv">PROJECT_NUMBER</span><span class="si">}</span><span class="s2">/locations/global/workloadIdentityPools/</span><span class="k">$(</span>gcloud config get-value project<span class="k">)</span><span class="s2">.svc.id.goog/subject/ns/default/sa/demo&quot;</span>
+gcloud container clusters delete cell-lab --region<span class="o">=</span>us-central1 -q
+</code></pre></div>
+
+<p><strong>Cost: real.</strong> Managed control planes bill per cluster-hour on EKS and GKE (AKS has a free tier without an uptime SLA), plus nodes, plus any load balancer or NAT the cluster creates on your behalf. Set a calendar reminder to destroy it. The most common surprise bill from this lab is a leftover load balancer or public IP created by a <code>Service type=LoadBalancer</code> that outlived the cluster delete.</p>
+<hr />
+<h2 id="production-gotchas">Production gotchas<a class="anchor" href="#production-gotchas">#</a></h2>
+<ol>
+<li>
+<p><strong>GCP subnets are regional, so "one subnet per AZ" silently collapses.</strong> A Terraform module that loops over zones creating subnets produces three subnets on AWS and either an error or three redundant subnets on GCP, where <a href="https://docs.cloud.google.com/vpc/docs/subnets">one subnet already spans every zone in the region</a>. The corollary bites harder: your AWS zonal-subnet routing, per-AZ NAT, and AZ-affinity logic have no GCP counterpart, and code that assumes "subnet implies zone" will mis-place workloads.</p>
+</li>
+<li>
+<p><strong>AZ identity is not portable across tenancy boundaries.</strong> <code>us-east-1a</code> is an account-local alias; use AZ IDs (<code>use1-az1</code>) to correlate zones across AWS accounts. Azure logical zones 1/2/3 are <a href="https://learn.microsoft.com/en-us/azure/reliability/availability-zones-overview">mapped per subscription</a> to physical zones. Only GCP zone names mean the same thing everywhere. A cell-per-account/subscription model with "spread across zones a, b, c" hard-coded will unknowingly co-locate cells in the same physical zone.</p>
+</li>
+<li>
+<p><strong>Azure NSGs default to allowing intra-VNet inbound.</strong> The built-in <code>AllowVnetInBound</code> rule (<a href="https://learn.microsoft.com/en-us/azure/virtual-network/network-security-groups-overview">NSG docs</a>) means an Azure cell is open to its VNet neighbors unless you write explicit denies. Porting an AWS security-group baseline gives you a <em>less</em> secure Azure deployment than you think.</p>
+</li>
+<li>
+<p><strong>Azure's identity and resource planes are separate and eventually consistent.</strong> Creating a service principal via Microsoft Graph and immediately assigning it an ARM role frequently fails with <code>PrincipalNotFound</code>. This is expected behavior, not a transient bug; it needs a retry policy, and <a href="https://learn.microsoft.com/en-us/azure/role-based-access-control/rbac-and-directory-admin-roles">Entra roles are not Azure RBAC roles</a> so "I'm Global Administrator" does not imply you can create resources.</p>
+</li>
+<li>
+<p><strong>GCP service accounts need a two-sided grant.</strong> Permission to <a href="https://docs.cloud.google.com/iam/docs/service-account-impersonation">impersonate</a> lives on the service account <em>resource</em>; permission to do the work lives on the <em>target</em> resource. Missing the first produces a denial that names the service account, not the operation you were attempting, and sends people debugging the wrong policy.</p>
+</li>
+<li>
+<p><strong>The GKE metadata server is not ready the instant a pod starts.</strong> Google documents that <a href="https://docs.cloud.google.com/kubernetes-engine/docs/concepts/workload-identity">Workload Identity Federation for GKE</a> auth attempts in a pod's first seconds may fail and must be retried. Init containers and fast-failing entrypoints that authenticate immediately will flake at exactly the rate your cluster churns pods.</p>
+</li>
+<li>
+<p><strong>Azure caps you at 20 federated identity credentials per identity.</strong> <a href="https://learn.microsoft.com/en-us/entra/workload-id/workload-identity-federation-considerations">Documented limit</a>. A "one FIC per cell" design hits the ceiling at cell 21. Use one identity per <em>capability</em> with <a href="https://learn.microsoft.com/en-us/entra/workload-id/workload-identities-flexible-federated-identity-credentials">flexible FICs</a> and subject matching, or one identity per cell (which then multiplies your Entra object count instead).</p>
+</li>
+<li>
+<p><strong>AAD Pod Identity is dead; do not build on it.</strong> The <a href="https://github.com/Azure/aad-pod-identity">OSS project is archived</a> and the AKS managed add-on was supported only through September 2025. Any inherited <code>AzureIdentityBinding</code> CRD is a migration item, and the <a href="https://learn.microsoft.com/en-us/azure/aks/workload-identity-migrate-from-pod-identity">documented path</a> is Entra Workload ID.</p>
+</li>
+<li>
+<p><strong>IRSA requires one IAM OIDC provider per cluster.</strong> Fleet-scale EKS with IRSA means editing role trust policies every time a cluster is created or replaced — an IAM write on the cell-creation critical path, subject to IAM's eventual consistency. <a href="https://docs.aws.amazon.com/eks/latest/userguide/pod-identity.html">EKS Pod Identity</a> removes that coupling, and <a href="https://aws.amazon.com/about-aws/whats-new/2025/06/amazon-eks-pod-identity-cross-account-access">gained cross-account support in June 2025</a>, but its agent is a DaemonSet, so it does not work on Fargate.</p>
+</li>
+<li>
+<p><strong>Azure's general-purpose L7 load balancers cannot do end-to-end gRPC.</strong> Application Gateway v2 and Front Door speak HTTP/1.1 to backends (<a href="https://learn.microsoft.com/en-us/azure/frontdoor/front-door-faq">Front Door FAQ</a>). For a gRPC service like Temporal's frontend, Azure ingress is structurally different: <a href="https://learn.microsoft.com/en-us/azure/application-gateway/for-containers/application-gateway-for-containers-components">Application Gateway for Containers</a> or your own Envoy. Do not discover this after committing to an ingress abstraction.</p>
+</li>
+<li>
+<p><strong>GCP gRPC backends need gRPC or TCP health checks.</strong> Google's <a href="https://docs.cloud.google.com/load-balancing/docs/health-check-concepts">health check docs</a> are explicit: do not use HTTP(S) or HTTP/2 health checks against a <code>GRPC</code> backend service, and your server must implement the gRPC health checking protocol. An HTTP health check against a gRPC backend produces a permanently unhealthy backend service with no obvious error.</p>
+</li>
+<li>
+<p><strong>NLB cross-zone load balancing is off by default and ALB's is on.</strong> That default exists to avoid inter-AZ data transfer charges. If you flip it on for "better balancing," you have just opted every byte into cross-AZ pricing; if you leave it off, an AZ with fewer targets gets proportionally more load per target. Neither is wrong, but the choice must be deliberate, and it does not transfer to Azure where inter-AZ transfer is not charged.</p>
+</li>
+<li>
+<p><strong>Key material and vault names outlive the cell.</strong> GCP key rings and keys <a href="https://cloud.google.com/kms/docs/key-rotation">cannot be deleted at all</a> — only versions can be destroyed. Azure Key Vault soft-delete reserves the vault name for the retention period unless you purge. AWS KMS enforces a 7–30 day <a href="https://docs.aws.amazon.com/kms/latest/developerguide/rotate-keys.html">pending-deletion window</a>. Combined with GCP's permanently-burned project IDs, this means <strong>cell names must carry a generation suffix</strong> and teardown must have an explicit residue-handling step, or create-destroy-recreate will collide.</p>
+</li>
+<li>
+<p><strong>Azure private endpoints fail silently without the <code>privatelink.*</code> DNS zone link.</strong> If the zone is not linked to the VNet, the public name resolves to the public IP and traffic leaves the private path with no error, no metric, and no log entry that says "you are not private." Make the zone link an assertion in the cell's post-provision conformance test, not an assumption.</p>
+</li>
+<li>
+<p><strong>Azure default outbound internet access is being retired.</strong> Per <a href="https://learn.microsoft.com/en-us/azure/virtual-network/ip-services/default-outbound-access">Microsoft's documentation</a>, new VMs will need an explicit outbound method — NAT Gateway, load balancer outbound rules, or an attached public IP. Cell templates that relied on implicit egress will break on new deployments while existing ones keep working, which is the worst possible failure mode: it only manifests on the next fresh cell.</p>
+</li>
+<li>
+<p><strong>EKS burns real VPC IPs for every pod.</strong> The VPC CNI gives each pod a routable address and pre-warms addresses per node. Without <a href="https://docs.aws.amazon.com/eks/latest/best-practices/ip-opt.html">prefix delegation or custom networking</a> you will exhaust subnets long before you exhaust compute. Azure CNI Overlay avoids this entirely and GKE isolates it in a secondary range — so an address plan sized for GCP or Azure will not fit on AWS.</p>
+</li>
+<li>
+<p><strong>Nitro instances share one attachment budget across ENIs, EBS, and instance store.</strong> Most Nitro types allow <a href="https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/volume_limits.html">28 total attachments</a>; newer generations have dedicated EBS limits from 32 to 128. Because the VPC CNI attaches ENIs, a busy node has fewer EBS slots than the raw number suggests, and PVC-heavy pods hang in <code>ContainerCreating</code> with a message that does not mention ENIs.</p>
+</li>
+<li>
+<p><strong>Legacy GCP preemptible VMs stop at 24 hours, unconditionally.</strong> <a href="https://docs.cloud.google.com/compute/docs/instances/spot">Spot VMs</a> have no such cap. A node pool still specifying <code>preemptible</code> rather than the Spot provisioning model will cycle every node daily forever, which looks like a mysterious daily churn pattern rather than a config error.</p>
+</li>
+<li>
+<p><strong>Amazon Keyspaces is CQL-compatible, not Cassandra.</strong> The <a href="https://docs.aws.amazon.com/keyspaces/latest/devguide/functional-differences.html">functional differences page</a> lists materialized views, secondary-index behavior, and lightweight-transaction capacity accounting (failed LWT condition checks still consume write units) among the divergences. Temporal's persistence layer leans on LWTs; treat Keyspaces as a candidate requiring validation, not a substitute.</p>
+</li>
+<li>
+<p><strong>Azure Monitor's default log plan is materially more expensive per GB than CloudWatch or Cloud Logging.</strong> Shipping the same pod-log volume to Log Analytics on the Analytics table plan, rather than Basic or Auxiliary, can multiply a cell's observability bill. Check the <a href="https://azure.microsoft.com/en-us/pricing/details/monitor/">pricing page</a> and pick the table plan deliberately per data type.</p>
+</li>
+<li>
+<p><strong>Quota is not capacity.</strong> All three clouds will accept your quota increase and still refuse to launch: <code>InsufficientInstanceCapacity</code> (AWS), <code>ZONE_RESOURCE_POOL_EXHAUSTED</code> (GCP), <code>ZonalAllocationFailed</code> (Azure). A cell-creation workflow needs different handling for each class — retry-elsewhere for capacity, request-and-wait for quota — and the error taxonomies are cloud-specific, so classification belongs in the per-cloud implementation.</p>
+</li>
+<li>
+<p><strong>Azure Storage control-plane roles do not grant data access.</strong> <code>Contributor</code> on a storage account lets you delete it but not read a blob; you need data-plane roles like <code>Storage Blob Data Contributor</code>. Teams discover this, reach for account keys, and reintroduce the static credential they eliminated everywhere else.</p>
+</li>
+<li>
+<p><strong>Not every Azure region has availability zones.</strong> Zone support is region-dependent (<a href="https://learn.microsoft.com/en-us/azure/reliability/availability-zones-overview">reliability docs</a>), so a cell template that pins <code>zones: [1,2,3]</code> will either fail outright or, worse, be silently accepted in a degraded form depending on the resource type. Make "does this region have zones?" an explicit precondition of cell placement rather than a template assumption — it is the one input where AWS and GCP let you be lazy and Azure does not.</p>
+</li>
+<li>
+<p><strong>GKE release channels will upgrade your control plane without you.</strong> Enrolling a cluster in a channel means Google decides when the control plane moves, subject to your maintenance windows and exclusions. That is usually what you want at fleet scale, but a cell-upgrade workflow that assumes it is the only actor mutating cluster version will observe "impossible" state transitions. Model platform-initiated upgrades as a legitimate state change, and reconcile rather than assert.</p>
+</li>
+<li>
+<p><strong>EKS version aging is a billing cliff, not an error.</strong> When a Kubernetes version leaves standard support, the cluster keeps running and the per-cluster hourly rate goes up for extended support (<a href="https://aws.amazon.com/eks/pricing/">EKS pricing</a>). Nothing breaks, no alarm fires, and the cost shows up a month later multiplied by the number of cells. Track version-age as a first-class fleet metric alongside health.</p>
+</li>
+<li>
+<p><strong>A retried create must adopt, not fail — and a fixed sleep hides as success.</strong> Cell provisioning activities get retried; a create that returns <code>AlreadyExists</code> on retry must resolve to the existing resource. Equally, replacing operation polling with <code>sleep 30</code> produces workflows that "succeed" while racing, then fail three steps later against a resource that was not actually ready. GCP and Azure hand you an operation handle; AWS gives you a describe call. Use them.</p>
+</li>
+</ol>
+<hr />
+<h2 id="how-this-shows-up-in-cell-lifecycle">How this shows up in cell lifecycle<a class="anchor" href="#how-this-shows-up-in-cell-lifecycle">#</a></h2>
+<p><strong>Provisioning.</strong> A cell-create workflow is roughly: ensure tenancy container (account/project/subscription + resource group) → ensure quota → allocate CIDR from global IPAM → create network + subnets (1 on GCP/Azure, N on AWS) → create egress (Cloud NAT config vs N NAT gateways vs NAT Gateway resource) → create the managed K8s control plane → create node pools with per-cloud shapes and capacity strategy → enable the workload identity mechanism → provision KMS key and Vault seal config → provision persistence (managed Postgres or Cassandra, cloud-specific) → provision visibility store (cloud-specific, possibly third-party) → create the ingress surface (ALB / GCP forwarding-rule graph / in-cluster Envoy behind a Standard LB) → publish private connectivity → write DNS → register with the control plane. Every arrow in that chain has a different resource graph per cloud and the <em>same</em> verb. That is the interface.</p>
+<p>Networking is often shared with a separate networking team precisely because steps 3–6 and 11–13 straddle the boundary: you cannot bring a cell up without addressing, egress, and an ingress surface, and none of those are cell-local decisions. The practical implication is that the cell contract must pin down exactly which network facts the cell <em>receives</em> (its CIDR, its DNS delegation, its private-link publication target) versus which it <em>creates</em>. Anything the cell creates that another team also touches is a future incident.</p>
+<p><strong>Upgrading.</strong> Cell upgrades exercise the parts of each cloud that are least uniform: control-plane version skew policies differ per cloud, node pool replacement mechanics differ (managed node groups vs node pools vs VMSS), load balancer target draining differs, and disk reattachment across zones is possible on GCP and Azure but not AWS. Surge capacity during an upgrade doubles the vCPU footprint temporarily, which means the upgrade workflow must check quota headroom — on three differently-shaped quota models — before it starts, not halfway through.</p>
+<p><strong>Teardown.</strong> This is where the cloud differences do the most damage, because deletion is the least-tested path. Soft-deleted Key Vaults, undeletable GCP key rings, permanently-burned project IDs, 30-day workload-identity-pool name reservations, load balancers and public IPs orphaned by Kubernetes services, DNS records left dangling, and private-endpoint connections left in a pending state on the consumer side. A correct teardown workflow enumerates residue explicitly per cloud and either purges it or records a tombstone that blocks name reuse. Test teardown as often as you test creation.</p>
+<p><strong>Multi-cloud parity as a first-class concern.</strong> Temporal's blog is candid that GCP shipped without private connectivity, API keys, export, Nexus, and multi-region namespaces at parity with AWS. That is the normal state of a multi-cloud platform: capability sets differ per cloud, and the control plane needs a feature-availability model, not an assumption of uniformity. Bake capability flags into the cell metadata so the user-facing control plane can refuse to offer a feature in a cloud where the cell cannot provide it, rather than failing at provision time.</p>
+<hr />
+<h2 id="learning-path">Learning path<a class="anchor" href="#learning-path">#</a></h2>
+<p><strong>Day 1 — get oriented, do not go deep.</strong></p>
+<ul>
+<li>Read the three hierarchy docs back to back: <a href="https://docs.aws.amazon.com/organizations/latest/userguide/orgs_getting-started_concepts.html">AWS Organizations concepts</a>, <a href="https://docs.cloud.google.com/resource-manager/docs/cloud-platform-resource-hierarchy">GCP resource hierarchy</a>, <a href="https://learn.microsoft.com/en-us/azure/governance/management-groups/overview">Azure management groups</a>. Draw all three on one page.</li>
+<li>Do Labs 1 and 2. The subnet-scope difference is the single highest-leverage fact in this guide.</li>
+<li>Read Temporal's <a href="https://temporal.io/blog/multi-cloud-thats-one-small-step-for-temporal-one-giant-leap-for-reliability">multi-cloud blog post</a> end to end and note which of its problems are still open.</li>
+<li>Skim the three workload-identity docs (<a href="https://docs.aws.amazon.com/eks/latest/userguide/iam-roles-for-service-accounts.html">IRSA</a>, <a href="https://docs.cloud.google.com/kubernetes-engine/docs/concepts/workload-identity">GKE WIF</a>, <a href="https://learn.microsoft.com/en-us/azure/aks/workload-identity-overview">Entra Workload ID</a>) for shape, not detail.</li>
+</ul>
+<p><strong>Week 1 — build the mental table.</strong></p>
+<ul>
+<li>Do Labs 3, 4, 5, and 6. Lab 4 (cross-cloud federation) is the one that changes how you think.</li>
+<li>For each of the twelve capability sections above, write your own three-column table from memory, then check it against this guide. The gaps are your study list.</li>
+<li>Read the load-balancing docs for all three properly, including <a href="https://docs.cloud.google.com/load-balancing/docs/backend-service">GCP's forwarding rule / backend service / health check triple</a> — it is the least AWS-like model and the one most likely to trip you.</li>
+<li>Read the three quota docs and write a script that prints normalized headroom across all three clouds for one region each. This will be genuinely useful later.</li>
+<li>Read <a href="https://docs.aws.amazon.com/wellarchitected/latest/reducing-scope-of-impact-with-cell-based-architecture/reducing-scope-of-impact-with-cell-based-architecture.html">AWS's cell-based architecture whitepaper</a> and map its vocabulary onto Temporal's cells.</li>
+</ul>
+<p><strong>Month 1 — earn opinions.</strong></p>
+<ul>
+<li>Trace one real cell end to end in each cloud in your team's codebase: which resources exist, in what order, owned by which workflow, torn down by what.</li>
+<li>Build (or read, if it exists) the conformance test suite: given a provisioned cell, assert every property in the cell contract — DNS resolves privately, workload identity mints a token, KMS decrypt works, the ingress does per-request gRPC balancing, egress goes through the intended NAT, quota headroom exceeds N%. Run it on all three clouds. Every difference it exposes is a portability decision someone made implicitly.</li>
+<li>Own one cross-cutting improvement: normalize quota headroom monitoring, or add generation suffixes to cell naming, or write the teardown residue enumerator. All three are real, all three are cloud-shaped, and all three teach you more than reading does.</li>
+<li>Read the pricing pages for NAT, load balancing, cross-AZ transfer, and log ingest in all three clouds, and compute your team's empty-cell floor cost per cloud. Then argue about it with someone.</li>
+</ul>
+<hr />
+<h2 id="references">References<a class="anchor" href="#references">#</a></h2>
+<ol>
+<li><a href="https://docs.aws.amazon.com/organizations/latest/userguide/orgs_getting-started_concepts.html">Terminology and concepts for AWS Organizations — AWS</a> — the account/OU/root model and how SCPs attach.</li>
+<li><a href="https://docs.aws.amazon.com/organizations/latest/userguide/orgs_reference_limits.html">Quotas and service limits for AWS Organizations — AWS</a> — OU nesting depth and the default account limit.</li>
+<li><a href="https://docs.cloud.google.com/resource-manager/docs/cloud-platform-resource-hierarchy">Google Cloud resource hierarchy — Google</a> — organization/folder/project and policy inheritance.</li>
+<li><a href="https://docs.cloud.google.com/resource-manager/docs/limits">Resource Manager quotas and limits — Google</a> — folder nesting depth, folders per parent, project creation quota.</li>
+<li><a href="https://learn.microsoft.com/en-us/azure/governance/management-groups/overview">Organize your resources with management groups — Microsoft</a> — MG depth limit and subscription placement.</li>
+<li><a href="https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_terms-and-concepts.html">IAM roles terms and concepts — AWS</a> — trust policies and role assumption.</li>
+<li><a href="https://docs.cloud.google.com/iam/docs/overview">IAM overview — Google</a> — allow policies bound to resources, inheritance semantics.</li>
+<li><a href="https://docs.cloud.google.com/iam/docs/service-account-impersonation">Service account impersonation — Google</a> — why the two-sided grant exists.</li>
+<li><a href="https://learn.microsoft.com/en-us/azure/role-based-access-control/overview">What is Azure RBAC — Microsoft</a> — role assignments as ARM resources at MG/sub/RG/resource scope.</li>
+<li><a href="https://learn.microsoft.com/en-us/azure/role-based-access-control/rbac-and-directory-admin-roles">Microsoft Entra roles vs Azure roles — Microsoft</a> — the identity-plane/control-plane split, in one page.</li>
+<li><a href="https://docs.aws.amazon.com/eks/latest/userguide/iam-roles-for-service-accounts.html">IAM roles for service accounts (IRSA) — AWS</a> — per-cluster OIDC provider and trust policy conditions.</li>
+<li><a href="https://docs.aws.amazon.com/eks/latest/userguide/pod-identity.html">EKS Pod Identity — AWS</a> — association API, agent DaemonSet, cluster-agnostic trust policies.</li>
+<li><a href="https://aws.amazon.com/about-aws/whats-new/2025/06/amazon-eks-pod-identity-cross-account-access">EKS Pod Identity cross-account access — AWS</a> — June 2025 announcement of cross-account associations.</li>
+<li><a href="https://docs.cloud.google.com/kubernetes-engine/docs/concepts/workload-identity">About Workload Identity Federation for GKE — Google</a> — metadata server, STS exchange, startup timing caveat.</li>
+<li><a href="https://docs.cloud.google.com/iam/docs/workload-identities">Identities for workloads — Google</a> — the <code>principal://</code> identifier syntax for direct resource access.</li>
+<li><a href="https://learn.microsoft.com/en-us/azure/aks/workload-identity-overview">Microsoft Entra Workload ID on AKS — Microsoft</a> — OIDC issuer, mutating webhook, projected token flow.</li>
+<li><a href="https://learn.microsoft.com/en-us/azure/aks/workload-identity-migrate-from-pod-identity">Migrate AKS pods from pod-managed identity to Workload ID — Microsoft</a> — the official deprecation and migration path.</li>
+<li><a href="https://docs.cloud.google.com/iam/docs/workload-identity-federation">Workload Identity Federation — Google</a> — pools, providers, attribute mapping and conditions.</li>
+<li><a href="https://docs.cloud.google.com/iam/docs/workload-identity-federation-with-other-clouds">Configure Workload Identity Federation with AWS or Azure — Google</a> — the AWS provider type that validates a signed <code>GetCallerIdentity</code>.</li>
+<li><a href="https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_providers_create_oidc.html">Create OIDC identity providers in IAM — AWS</a> — the inbound federation primitive for AWS.</li>
+<li><a href="https://learn.microsoft.com/en-us/entra/workload-id/workload-identity-federation-considerations">Workload identity federation considerations — Microsoft</a> — the 20-federated-credential ceiling and other limits.</li>
+<li><a href="https://docs.cloud.google.com/vpc/docs/vpc">VPC networks — Google</a> — VPC networks are global resources.</li>
+<li><a href="https://docs.cloud.google.com/vpc/docs/subnets">Subnets — Google</a> — subnets are regional and span all zones; secondary ranges.</li>
+<li><a href="https://docs.aws.amazon.com/vpc/latest/userguide/configure-subnets.html">Configure subnets — AWS</a> — subnets are bound to a single Availability Zone.</li>
+<li><a href="https://learn.microsoft.com/en-us/azure/virtual-network/virtual-networks-overview">Azure virtual network overview — Microsoft</a> — VNet and subnet scoping.</li>
+<li><a href="https://docs.aws.amazon.com/vpc/latest/userguide/vpc-security-groups.html">Security groups — AWS</a> — stateful, allow-only, attached to ENIs.</li>
+<li><a href="https://docs.cloud.google.com/firewall/docs/firewalls">VPC firewall rules — Google</a> — stateful connection tracking, the 10-minute idle rule, tag/service-account targeting.</li>
+<li><a href="https://learn.microsoft.com/en-us/azure/virtual-network/network-security-groups-overview">Network security groups — Microsoft</a> — stateful NSGs and the default <code>AllowVnetInBound</code> rule.</li>
+<li><a href="https://docs.aws.amazon.com/vpc/latest/privatelink/what-is-privatelink.html">What is AWS PrivateLink — AWS</a> — endpoint services, interface endpoints, the NLB requirement.</li>
+<li><a href="https://docs.cloud.google.com/vpc/docs/private-service-connect">Private Service Connect — Google</a> — endpoints, backends, and the consumer/producer split.</li>
+<li><a href="https://learn.microsoft.com/en-us/azure/private-link/private-link-overview">What is Azure Private Link — Microsoft</a> — Private Link Service, Private Endpoints, and DNS integration.</li>
+<li><a href="https://docs.aws.amazon.com/vpc/latest/tgw/what-is-transit-gateway.html">What is a transit gateway — AWS</a> — regional hub, attachments, route tables, TGW peering.</li>
+<li><a href="https://docs.cloud.google.com/vpc/docs/vpc-peering">VPC Network Peering — Google</a> — non-transitivity and CIDR overlap rules.</li>
+<li><a href="https://docs.cloud.google.com/network-connectivity/docs/network-connectivity-center/concepts/vpc-spokes-overview">VPC spokes overview (Network Connectivity Center) — Google</a> — transitive VPC connectivity without a peering mesh.</li>
+<li><a href="https://learn.microsoft.com/en-us/azure/virtual-wan/virtual-wan-about">Azure Virtual WAN — Microsoft</a> — managed hubs with built-in transit, versus DIY hub-and-spoke.</li>
+<li><a href="https://learn.microsoft.com/en-us/azure/virtual-network/ip-services/default-outbound-access">Default outbound access — Microsoft</a> — the retirement of implicit VM internet egress and the explicit alternatives.</li>
+<li><a href="https://docs.aws.amazon.com/vpc/latest/userguide/vpc-nat-gateway.html">NAT gateways — AWS</a> — zonal resource, port allocation, <code>ErrorPortAllocation</code>.</li>
+<li><a href="https://docs.cloud.google.com/nat/docs/overview">Cloud NAT overview — Google</a> — SDN-based regional NAT with per-VM port allocation.</li>
+<li><a href="https://learn.microsoft.com/en-us/azure/nat-gateway/nat-overview">What is Azure NAT Gateway — Microsoft</a> — SNAT port model and zone behavior.</li>
+<li><a href="https://docs.aws.amazon.com/eks/latest/best-practices/ip-opt.html">Optimizing IP address utilization — AWS EKS best practices</a> — prefix delegation and custom networking for pod IP exhaustion.</li>
+<li><a href="https://docs.cloud.google.com/kubernetes-engine/docs/concepts/alias-ips">VPC-native clusters and alias IP ranges — Google</a> — how GKE consumes secondary ranges for pods and services.</li>
+<li><a href="https://learn.microsoft.com/en-us/azure/aks/azure-cni-overlay">Azure CNI Overlay — Microsoft</a> — pod IPs outside the VNet address space.</li>
+<li><a href="https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/hosted-zones-private.html">Private hosted zones — AWS</a> — VPC association model, including cross-account.</li>
+<li><a href="https://docs.cloud.google.com/dns/docs/zones/zones-overview">DNS zones overview — Google</a> — private zones, DNS peering (single transitive hop), cross-project binding.</li>
+<li><a href="https://learn.microsoft.com/en-us/azure/dns/private-dns-virtual-network-links">Virtual network links for Azure DNS private zones — Microsoft</a> — the link model and the one-auto-registration-link rule.</li>
+<li><a href="https://docs.aws.amazon.com/elasticloadbalancing/latest/application/load-balancer-target-groups.html">Target groups for Application Load Balancers — AWS</a> — HTTP/1, HTTP/2, and gRPC protocol versions and gRPC health checks.</li>
+<li><a href="https://docs.cloud.google.com/load-balancing/docs/backend-service">Backend services overview — Google</a> — backend service protocols including HTTP2 and GRPC, and NEG attachment.</li>
+<li><a href="https://docs.cloud.google.com/load-balancing/docs/health-check-concepts">Health checks overview — Google</a> — why gRPC backends need gRPC or TCP health checks.</li>
+<li><a href="https://learn.microsoft.com/en-us/azure/frontdoor/front-door-faq">Azure Front Door FAQ — Microsoft</a> — HTTP/2 to clients, HTTP/1.1 to origins.</li>
+<li><a href="https://learn.microsoft.com/en-us/azure/application-gateway/for-containers/application-gateway-for-containers-components">Application Gateway for Containers components — Microsoft</a> — the Azure L7 that does speak HTTP/2 to backends for gRPC.</li>
+<li><a href="https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-on-demand-instances.html">Purchasing On-Demand Instances — AWS</a> — vCPU-based On-Demand limits grouped by instance family class.</li>
+<li><a href="https://docs.cloud.google.com/compute/resource-usage">Compute Engine allocation quotas — Google</a> — regional CPU quota, per-family quotas, separate preemptible/Spot quota.</li>
+<li><a href="https://docs.cloud.google.com/compute/docs/instances/spot">Spot VMs — Google</a> — Spot VMs have no maximum runtime; the 24-hour cap applies only to legacy preemptible VMs.</li>
+<li><a href="https://learn.microsoft.com/en-us/azure/virtual-machines/quotas">vCPU quotas — Microsoft</a> — the two-tier regional-total plus per-family model.</li>
+<li><a href="https://learn.microsoft.com/en-us/azure/reliability/availability-zones-overview">Availability zones overview — Microsoft</a> — logical-to-physical zone mapping is per subscription.</li>
+<li><a href="https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/volume_limits.html">Amazon EBS volume limits for EC2 instances — AWS</a> — shared 28-attachment budget on most Nitro types; dedicated limits on newer generations.</li>
+<li><a href="https://docs.cloud.google.com/compute/docs/disks">Choose a disk type — Google</a> — Persistent Disk vs Hyperdisk, and regional (two-zone synchronous) options.</li>
+<li><a href="https://learn.microsoft.com/en-us/azure/virtual-machines/disks-types">Azure managed disk types — Microsoft</a> — Premium SSD v2, Ultra, and zone-redundant storage options.</li>
+<li><a href="https://aws.amazon.com/about-aws/whats-new/2020/12/amazon-s3-now-delivers-strong-read-after-write-consistency-automatically-for-all-applications">S3 strong read-after-write consistency — AWS</a> — the December 2020 change that ended the eventual-consistency era.</li>
+<li><a href="https://docs.temporal.io/temporal-service/persistence">Temporal Service persistence — Temporal</a> — supported databases and minimum versions for advanced Visibility.</li>
+<li><a href="https://docs.aws.amazon.com/keyspaces/latest/devguide/functional-differences.html">Functional differences: Amazon Keyspaces vs Apache Cassandra — AWS</a> — what CQL compatibility does and does not cover.</li>
+<li><a href="https://learn.microsoft.com/en-us/azure/managed-instance-apache-cassandra/introduction">Introduction to Azure Managed Instance for Apache Cassandra — Microsoft</a> — managed open-source Cassandra, not an API emulation.</li>
+<li><a href="https://learn.microsoft.com/en-us/azure/postgresql/single-server/whats-happening-to-postgresql-single-server">What's happening to Azure Database for PostgreSQL Single Server — Microsoft</a> — the March 2025 retirement and Flexible Server migration.</li>
+<li><a href="https://docs.aws.amazon.com/kms/latest/developerguide/rotate-keys.html">Rotating AWS KMS keys — AWS</a> — configurable automatic rotation (90–2560 days) and what is not rotatable.</li>
+<li><a href="https://cloud.google.com/kms/docs/key-rotation">Cloud KMS key rotation — Google</a> — rotation schedules, primary versions, and what can and cannot be deleted.</li>
+<li><a href="https://learn.microsoft.com/en-us/azure/key-vault/general/soft-delete-overview">Azure Key Vault soft-delete overview — Microsoft</a> — name reservation, purge, and purge protection.</li>
+<li><a href="https://developer.hashicorp.com/vault/docs/configuration/seal">Vault seal configuration — HashiCorp</a> — the <code>awskms</code>, <code>gcpckms</code>, and <code>azurekeyvault</code> auto-unseal stanzas.</li>
+<li><a href="https://cert-manager.io/docs/configuration/acme/dns01/">cert-manager ACME DNS01 solvers — cert-manager</a> — Route 53, Cloud DNS, and Azure DNS solver configuration and required permissions.</li>
+<li><a href="https://aws.amazon.com/cloudwatch/pricing/">Amazon CloudWatch pricing — AWS</a> — per-GB log ingest and metric pricing.</li>
+<li><a href="https://cloud.google.com/stackdriver/pricing">Google Cloud Observability pricing — Google</a> — Cloud Logging/Monitoring ingest pricing and free allowances.</li>
+<li><a href="https://azure.microsoft.com/en-us/pricing/details/monitor/">Azure Monitor pricing — Microsoft</a> — the Analytics / Basic / Auxiliary table plans and their very different per-GB rates.</li>
+<li><a href="https://aws.amazon.com/vpc/pricing/">Amazon VPC pricing — AWS</a> — NAT gateway hourly and per-GB charges; cross-AZ data transfer.</li>
+<li><a href="https://cloud.google.com/vpc/network-pricing">All networking pricing — Google</a> — inter-zone and inter-region data transfer, Premium vs Standard tier.</li>
+<li><a href="https://azure.microsoft.com/en-us/pricing/details/bandwidth/">Bandwidth pricing — Microsoft</a> — the authoritative page for Azure inter-AZ and inter-region transfer.</li>
+<li><a href="https://learn.microsoft.com/en-us/azure/aks/free-standard-pricing-tiers">AKS pricing tiers — Microsoft</a> — the Free tier has no uptime SLA; Standard does. Compare against EKS and GKE per-cluster-hour pricing for the empty-cell floor cost.</li>
+<li><a href="https://docs.aws.amazon.com/wellarchitected/latest/reducing-scope-of-impact-with-cell-based-architecture/reducing-scope-of-impact-with-cell-based-architecture.html">Reducing the Scope of Impact with Cell-Based Architecture — AWS Well-Architected</a> — the vocabulary and math of cells, cell routers, and blast radius.</li>
+<li><a href="https://temporal.io/blog/multi-cloud-thats-one-small-step-for-temporal-one-giant-leap-for-reliability">Making Temporal Cloud a Multi-Cloud Platform — Temporal (vendor blog)</a> — the Infra CP / User CP split, the provider-interface + factory pattern, and the concrete AWS→GCP parity gaps.</li>
+</ol><p class="disclaimer"><strong>Disclaimer.</strong> I wrote this library before I joined Temporal, to ramp up on the areas my new role would likely touch. It contains no internal information &mdash; nothing here was sourced from Temporal&rsquo;s internal knowledge. Temporal is open source, so the programming model and server internals come from public code and documentation, and every statement about Temporal Cloud comes from Temporal&rsquo;s public docs and engineering blog, linked inline. Most of the library is general infrastructure technology &mdash; Go, gRPC, Kubernetes, Karpenter, Terraform, Helm, Vault, cert-manager, GitOps, observability &mdash; that has nothing to do with any one company. Where a guide goes beyond public sources, it says so and labels the claim as inference.</p></article><aside class="rail"><div class="rail-label">On this page</div><a href="#the-mental-model">The mental model</a><a class="h3" href="#framing-1-every-cloud-answers-the-same-six-questions-differently">Framing 1: every cloud answers the same six questions, differently</a><a class="h3" href="#framing-2-the-scope-axis-is-the-single-biggest-source-of-surprise">Framing 2: the scope axis is the single biggest source of surprise</a><a class="h3" href="#framing-3-abstract-the-verbs-never-the-nouns">Framing 3: abstract the verbs, never the nouns</a><a href="#core-concepts">Core concepts</a><a class="h3" href="#resource-hierarchy-and-tenancy">Resource hierarchy and tenancy</a><a class="h3" href="#regions-zones-and-what-multi-region-actually-means">Regions, zones, and what &quot;multi-region&quot; actually means</a><a class="h3" href="#identity-and-authorization">Identity and authorization</a><a class="h3" href="#workload-identity-how-a-pod-gets-a-cloud-credential">Workload identity: how a pod gets a cloud credential</a><a class="h3" href="#cross-cloud-federation-control-plane-in-cloud-a-provisioning-cloud-b">Cross-cloud federation (control plane in cloud A provisioning cloud B)</a><a class="h3" href="#networking-vpc-vs-vpc-vs-vnet">Networking: VPC vs VPC vs VNet</a><a class="h3" href="#firewalling-security-groups-vs-firewall-rules-vs-nsgs">Firewalling: security groups vs firewall rules vs NSGs</a><a class="h3" href="#private-connectivity-this-is-how-customers-reach-a-cell">Private connectivity (this is how customers reach a cell)</a><a class="h3" href="#peering-transit-and-hub-and-spoke">Peering, transit, and hub-and-spoke</a><a class="h3" href="#egress-and-nat">Egress and NAT</a><a class="h3" href="#ip-address-planning-and-exhaustion">IP address planning and exhaustion</a><a class="h3" href="#dns">DNS</a><a class="h3" href="#load-balancing-and-the-grpc-problem">Load balancing (and the gRPC problem)</a><a class="h3" href="#compute-for-kubernetes-nodes">Compute for Kubernetes nodes</a><a class="h3" href="#kubernetes-as-the-cell-substrate-eks-vs-gke-vs-aks">Kubernetes as the cell substrate: EKS vs GKE vs AKS</a><a class="h3" href="#storage-block-and-object">Storage: block and object</a><a class="h3" href="#managed-databases-for-temporal-persistence">Managed databases for Temporal persistence</a><a class="h3" href="#kms-secrets-and-what-they-back">KMS, secrets, and what they back</a><a class="h3" href="#observability-plumbing">Observability plumbing</a><a class="h3" href="#quotas-limits-and-regional-capacity">Quotas, limits, and regional capacity</a><a class="h3" href="#control-plane-api-behavior-consistency-idempotency-throttling">Control-plane API behavior: consistency, idempotency, throttling</a><a class="h3" href="#cost-model-differences-that-change-architecture">Cost model differences that change architecture</a><a class="h3" href="#portability-strategy-what-to-abstract-what-to-leave-alone">Portability strategy: what to abstract, what to leave alone</a><a href="#hands-on">Hands-on</a><a class="h3" href="#setup">Setup</a><a class="h3" href="#lab-1--read-the-hierarchy-three-ways">Lab 1 — Read the hierarchy three ways</a><a class="h3" href="#lab-2--the-same-network-three-ways-the-subnet-scope-lesson">Lab 2 — The same network, three ways (the subnet-scope lesson)</a><a class="h3" href="#lab-3--firewall-semantics-three-ways">Lab 3 — Firewall semantics three ways</a><a class="h3" href="#lab-4--cross-cloud-federation-without-a-single-stored-key">Lab 4 — Cross-cloud federation without a single stored key</a><a class="h3" href="#lab-5--quota-introspection-three-ways">Lab 5 — Quota introspection three ways</a><a class="h3" href="#lab-6--kms-envelope-encryption-three-ways">Lab 6 — KMS envelope encryption three ways</a><a class="h3" href="#lab-7--optional-and-it-costs-money-one-real-cluster">Lab 7 — Optional, and it costs money: one real cluster</a><a href="#production-gotchas">Production gotchas</a><a href="#how-this-shows-up-in-cell-lifecycle">How this shows up in cell lifecycle</a><a href="#learning-path">Learning path</a><a href="#references">References</a></aside></div></div><script>
+document.querySelectorAll('.codehilite').forEach(function(block){
+  var wrap=document.createElement('div'); wrap.className='codewrap';
+  block.parentNode.insertBefore(wrap,block); wrap.appendChild(block);
+  var b=document.createElement('button'); b.className='copybtn'; b.textContent='copy';
+  b.addEventListener('click',function(){
+    var txt=block.innerText;
+    if(navigator.clipboard&&navigator.clipboard.writeText){
+      navigator.clipboard.writeText(txt).then(function(){
+        b.textContent='copied'; setTimeout(function(){b.textContent='copy';},1200);
+      }).catch(function(){b.textContent='select manually';});
+    } else {
+      var ta=document.createElement('textarea'); ta.value=txt; document.body.appendChild(ta);
+      ta.select(); try{document.execCommand('copy'); b.textContent='copied';}catch(e){}
+      document.body.removeChild(ta); setTimeout(function(){b.textContent='copy';},1200);
+    }
+  });
+  wrap.appendChild(b);
+});
+
+document.querySelectorAll('.doc table').forEach(function(t){
+  if(t.parentNode.classList.contains('tablewrap'))return;
+  var w=document.createElement('div'); w.className='tablewrap';
+  t.parentNode.insertBefore(w,t); w.appendChild(t);
+});
+
+(function(){
+  var links=Array.prototype.slice.call(document.querySelectorAll('.rail a'));
+  if(!links.length)return;
+  var map={};
+  links.forEach(function(a){
+    var el=document.getElementById(a.getAttribute('href').slice(1));
+    if(el)map[a.getAttribute('href').slice(1)]=a;
+  });
+  var obs=new IntersectionObserver(function(entries){
+    entries.forEach(function(e){
+      var a=map[e.target.id]; if(!a)return;
+      if(e.isIntersecting){
+        links.forEach(function(x){x.classList.remove('here');});
+        a.classList.add('here');
+      }
+    });
+  },{rootMargin:'0px 0px -78% 0px',threshold:0});
+  Object.keys(map).forEach(function(id){
+    var el=document.getElementById(id); if(el)obs.observe(el);
+  });
+})();
+</script>
+<script>/* open external links in a new tab; links within the library stay in this tab */
+document.addEventListener('click',function(e){var a=e.target.closest&&e.target.closest('a[href]');if(!a)return;var h=a.getAttribute('href');if(!h||h.charAt(0)==='#'||h.indexOf('javascript:')===0||a.hasAttribute('download'))return;if(!/^https?:$/.test(a.protocol)||a.host===location.host)return;a.target='_blank';a.rel='noopener';},true);
+</script>
+</body>
+</html>

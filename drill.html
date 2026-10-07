@@ -1,0 +1,1712 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cell Lifecycle Drill</title>
+<style>
+:root{
+  --bg:#fbfbfd; --bg-elev:#ffffff; --bg-sunk:#f2f3f7;
+  --fg:#1a1c22; --fg-mid:#4b5060; --fg-dim:#7b8194;
+  --line:#e3e5ec; --line-soft:#eef0f5;
+  --accent:#4f46e5; --accent-soft:#eef0ff; --accent-fg:#3730a3;
+  --warn:#b45309; --warn-soft:#fff7ed;
+  --ok:#0f766e; --ok-soft:#effaf7;
+  --bad:#b91c1c; --bad-soft:#fef2f2;
+  --code-bg:#f6f7fa;
+  --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,"Helvetica Neue",Arial,sans-serif;
+}
+@media (prefers-color-scheme:dark){
+  html:not([data-theme="light"]){
+    --bg:#0f1117; --bg-elev:#151821; --bg-sunk:#1b1f2a;
+    --fg:#e6e8ef; --fg-mid:#a8aec0; --fg-dim:#767d92;
+    --line:#252a36; --line-soft:#1e222d;
+    --accent:#8b87f5; --accent-soft:#1e1f38; --accent-fg:#b3b0ff;
+    --warn:#fbbf24; --warn-soft:#2a2113;
+    --ok:#5eead4; --ok-soft:#10241f;
+    --bad:#fca5a5; --bad-soft:#2a1416;
+    --code-bg:#12151d;
+  }
+}
+html[data-theme="dark"]{
+  --bg:#0f1117; --bg-elev:#151821; --bg-sunk:#1b1f2a;
+  --fg:#e6e8ef; --fg-mid:#a8aec0; --fg-dim:#767d92;
+  --line:#252a36; --line-soft:#1e222d;
+  --accent:#8b87f5; --accent-soft:#1e1f38; --accent-fg:#b3b0ff;
+  --warn:#fbbf24; --warn-soft:#2a2113;
+  --ok:#5eead4; --ok-soft:#10241f;
+  --bad:#fca5a5; --bad-soft:#2a1416;
+  --code-bg:#12151d;
+}
+
+*{box-sizing:border-box}
+body{
+  margin:0; background:var(--bg); color:var(--fg);
+  font-family:var(--sans); font-size:16px; line-height:1.6;
+  -webkit-font-smoothing:antialiased;
+}
+a{color:var(--accent); text-decoration:none}
+a:hover{text-decoration:underline; text-underline-offset:2px}
+code{
+  font-family:var(--mono); font-size:.855em; background:var(--code-bg);
+  padding:.1em .35em; border-radius:5px; border:1px solid var(--line-soft);
+  word-break:break-word;
+}
+
+/* ---------- header ---------- */
+.top{
+  position:sticky; top:0; z-index:30; background:var(--bg-elev);
+  border-bottom:1px solid var(--line); padding:.75rem 1rem .55rem;
+}
+.wrap{max-width:56rem; margin:0 auto}
+.bar{display:flex; align-items:center; gap:.7rem; flex-wrap:wrap}
+.brand-t{font-weight:660; font-size:1rem; letter-spacing:-.015em}
+.brand-s{font-size:.72rem; color:var(--fg-dim); display:block; margin-top:.05rem}
+.spacer{flex:1}
+.iconbtn{
+  background:var(--bg-elev); border:1px solid var(--line); color:var(--fg-mid);
+  border-radius:7px; padding:.3rem .6rem; font-size:.75rem; cursor:pointer;
+  font-family:var(--sans);
+}
+.iconbtn:hover{background:var(--bg-sunk); color:var(--fg)}
+.tabs{display:flex; gap:.35rem; flex-wrap:wrap; margin-top:.6rem}
+.tab{
+  padding:.34rem .7rem; border:1px solid var(--line); border-radius:8px;
+  background:var(--bg-sunk); color:var(--fg-mid); cursor:pointer;
+  font-size:.79rem; font-weight:560; font-family:var(--sans); white-space:nowrap;
+}
+.tab:hover{color:var(--fg)}
+.tab.on{background:var(--accent); border-color:var(--accent); color:#fff}
+.statline{font-size:.73rem; color:var(--fg-dim); margin-top:.5rem}
+.statline b{color:var(--fg); font-weight:640}
+.statline .due{color:var(--warn); font-weight:640}
+.statline .mast{color:var(--ok); font-weight:640}
+.boxbar{display:flex; gap:2px; margin-top:.4rem; height:7px; border-radius:4px; overflow:hidden}
+.boxseg{background:var(--accent); opacity:.28}
+.boxseg.b2{opacity:.42} .boxseg.b3{opacity:.58} .boxseg.b4{opacity:.76} .boxseg.b5{opacity:1}
+.boxseg.b0{background:var(--line); opacity:1}
+.boxkey{font-size:.68rem; color:var(--fg-dim); margin-top:.25rem; font-family:var(--mono)}
+
+/* ---------- main ---------- */
+main{max-width:56rem; margin:0 auto; padding:1.4rem 1rem 3rem}
+.hint{color:var(--fg-dim); font-size:.82rem; margin:0 0 1rem}
+.crumb{
+  display:inline-block; font-size:.76rem; color:var(--fg-mid); cursor:pointer;
+  margin-bottom:.9rem; border:1px solid var(--line); border-radius:7px;
+  padding:.25rem .6rem; background:var(--bg-elev);
+}
+.crumb:hover{background:var(--bg-sunk); color:var(--fg)}
+
+/* picker grid */
+.grid{display:grid; grid-template-columns:repeat(auto-fill,minmax(15rem,1fr)); gap:.7rem}
+.pick{
+  background:var(--bg-elev); border:1px solid var(--line); border-radius:11px;
+  padding:.8rem .9rem; cursor:pointer; transition:border-color .12s, transform .12s;
+}
+.pick:hover{border-color:var(--accent); transform:translateY(-1px)}
+.pick .pn{font-family:var(--mono); font-size:.68rem; color:var(--accent); font-weight:600}
+.pick .pt{font-weight:620; font-size:.92rem; margin:.15rem 0 .35rem; line-height:1.35}
+.pick .pm{font-size:.72rem; color:var(--fg-dim)}
+.pick .pm .duen{color:var(--warn); font-weight:640}
+.mini{height:4px; border-radius:3px; background:var(--line); margin-top:.5rem; overflow:hidden}
+.mini > i{display:block; height:100%; background:var(--ok)}
+
+/* card */
+.deck{max-width:40rem; margin:0 auto}
+.meterline{
+  display:flex; justify-content:space-between; align-items:center; gap:.6rem;
+  font-size:.73rem; color:var(--fg-dim); margin-bottom:.55rem; flex-wrap:wrap;
+}
+.pill{
+  display:inline-block; padding:.1rem .45rem; border-radius:999px;
+  background:var(--bg-sunk); color:var(--fg-mid); font-size:.68rem;
+  border:1px solid var(--line-soft); white-space:nowrap;
+}
+.pill.k-number{background:var(--warn-soft); color:var(--warn); border-color:var(--warn-soft)}
+.pill.k-concept{background:var(--ok-soft); color:var(--ok); border-color:var(--ok-soft)}
+.pill.d1{background:var(--accent-soft); color:var(--accent-fg); border-color:var(--accent-soft)}
+.card{
+  background:var(--bg-elev); border:1px solid var(--line); border-radius:14px;
+  padding:1.4rem 1.3rem; min-height:11rem; display:flex; flex-direction:column;
+}
+.card .src{font-size:.7rem; color:var(--fg-dim); margin-bottom:.7rem; font-family:var(--mono)}
+.card .q{font-size:1.12rem; font-weight:620; line-height:1.42; letter-spacing:-.012em}
+.card .a{
+  margin-top:1rem; padding-top:1rem; border-top:1px solid var(--line-soft);
+  font-size:.94rem; color:var(--fg-mid); line-height:1.62;
+}
+.card .a strong{color:var(--fg); font-weight:640}
+.card .a code{font-size:.84em}
+.tagrow{margin-top:1rem; display:flex; gap:.3rem; flex-wrap:wrap}
+.tg{font-size:.66rem; padding:.08rem .4rem; border-radius:5px; background:var(--bg-sunk);
+  color:var(--fg-dim); border:1px solid var(--line-soft)}
+
+.ctrls{display:flex; gap:.5rem; margin-top:1rem; flex-wrap:wrap}
+.btn{
+  padding:.6rem 1rem; border:1px solid var(--line); border-radius:9px;
+  background:var(--bg-elev); color:var(--fg); cursor:pointer;
+  font-size:.86rem; font-weight:580; font-family:var(--sans);
+}
+.btn:hover{border-color:var(--accent)}
+.btn.primary{background:var(--accent); border-color:var(--accent); color:#fff}
+.btn.primary:hover{filter:brightness(1.08)}
+.btn.ghost{color:var(--fg-dim)}
+.rates{display:grid; grid-template-columns:repeat(5,1fr); gap:.4rem; margin-top:1rem}
+.rate{
+  padding:.55rem .3rem; border:1px solid var(--line); border-radius:9px;
+  background:var(--bg-elev); cursor:pointer; text-align:center;
+  font-size:.78rem; font-weight:600; font-family:var(--sans); color:var(--fg);
+  line-height:1.25;
+}
+.rate small{display:block; font-size:.62rem; font-weight:500; color:var(--fg-dim); margin-top:.15rem}
+.rate.r1,.rate.r2{border-color:var(--bad); color:var(--bad)}
+.rate.r3{border-color:var(--warn); color:var(--warn)}
+.rate.r4,.rate.r5{border-color:var(--ok); color:var(--ok)}
+.rate:hover{filter:brightness(1.06); background:var(--bg-sunk)}
+
+.empty{
+  text-align:center; color:var(--fg-mid); padding:2.6rem 1rem;
+  background:var(--bg-elev); border:1px solid var(--line); border-radius:14px;
+}
+.empty h2{font-size:1.1rem; margin:0 0 .5rem; color:var(--fg)}
+.empty p{margin:.3rem 0 1rem; font-size:.88rem}
+
+/* self test */
+.setup{background:var(--bg-elev); border:1px solid var(--line); border-radius:14px; padding:1.3rem}
+.setup h2{margin:0 0 .5rem; font-size:1.05rem}
+.setup p{margin:0 0 1rem; font-size:.86rem; color:var(--fg-mid)}
+.row{display:flex; gap:.5rem; flex-wrap:wrap; align-items:center}
+.timer{font-family:var(--mono); font-size:.76rem; color:var(--fg-dim)}
+.score{font-size:2.4rem; font-weight:700; letter-spacing:-.03em; line-height:1.1}
+.score small{display:block; font-size:.76rem; font-weight:500; color:var(--fg-dim); letter-spacing:0}
+.review{margin-top:1.2rem}
+.review h3{font-size:.85rem; text-transform:uppercase; letter-spacing:.07em; color:var(--fg-dim); margin:0 0 .6rem}
+.rev{
+  border:1px solid var(--line); border-left:3px solid var(--bad); border-radius:0 9px 9px 0;
+  background:var(--bg-elev); padding:.7rem .9rem; margin-bottom:.55rem; font-size:.87rem;
+}
+.rev .rq{font-weight:600}
+.rev .rl{font-size:.72rem; color:var(--fg-dim); margin-top:.3rem; font-family:var(--mono)}
+
+/* footer */
+.foot{
+  border-top:1px solid var(--line); margin-top:2rem; padding:1.2rem 1rem 2.5rem;
+  font-size:.76rem; color:var(--fg-dim);
+}
+.foot .wrap > div{margin-bottom:.7rem}
+kbd{
+  background:var(--bg-sunk); border:1px solid var(--line); border-bottom-width:2px;
+  border-radius:5px; padding:.05rem .32rem; font-size:.72em; font-family:var(--mono); color:var(--fg-mid);
+}
+.keys{display:flex; gap:1.1rem; flex-wrap:wrap}
+#importFile{display:none}
+.msg{color:var(--ok); font-weight:600}
+
+@media (max-width:560px){
+  body{font-size:15.5px}
+  .card{padding:1.15rem 1rem}
+  .card .q{font-size:1.04rem}
+  .rates{grid-template-columns:repeat(5,1fr); gap:.3rem}
+  .rate{font-size:.72rem; padding:.5rem .15rem}
+  .rate small{display:none}
+  main{padding:1.1rem .8rem 2.5rem}
+  .top{padding:.6rem .8rem .5rem}
+}
+</style>
+</head>
+<body>
+
+<header class="top">
+  <div class="wrap">
+    <div class="bar">
+      <div>
+        <span class="brand-t">Cell Lifecycle Drill</span>
+        <span class="brand-s">Spaced repetition over the 16-guide ramp-up library</span>
+      </div>
+      <div class="spacer"></div>
+      <button class="iconbtn" id="themeBtn" title="Toggle light / dark">Theme</button>
+    </div>
+    <nav class="tabs" id="tabs">
+      <button class="tab on" data-mode="due">Due today</button>
+      <button class="tab" data-mode="all">All cards</button>
+      <button class="tab" data-mode="guide">By guide</button>
+      <button class="tab" data-mode="topic">By topic</button>
+      <button class="tab" data-mode="d1">Before day 1</button>
+      <button class="tab" data-mode="test">Self-test</button>
+    </nav>
+    <div class="statline" id="stats"></div>
+    <div class="boxbar" id="boxbar"></div>
+    <div class="boxkey" id="boxkey"></div>
+  </div>
+</header>
+
+<main id="app"></main>
+
+<footer class="foot">
+  <div class="wrap">
+    <div class="keys">
+      <span><kbd>space</kbd> flip</span>
+      <span><kbd>1</kbd>-<kbd>5</kbd> grade</span>
+      <span><kbd>j</kbd> missed / <kbd>k</kbd> got it</span>
+      <span><kbd>&larr;</kbd> back <kbd>&rarr;</kbd> skip</span>
+    </div>
+    <div>
+      Leitner boxes 1-5, intervals 1 / 2 / 4 / 8 / 16 days. Grades <b>1</b> and <b>2</b> send a card back to box 1,
+      <b>3</b> holds it, <b>4</b> promotes one box, <b>5</b> promotes two. Progress lives in this browser only.
+    </div>
+    <div class="row">
+      <button class="iconbtn" id="exportBtn">Export progress</button>
+      <button class="iconbtn" id="importBtn">Import progress</button>
+      <input type="file" id="importFile" accept="application/json,.json">
+      <button class="iconbtn" id="resetBtn">Reset progress</button>
+      <span id="msg"></span>
+    </div>
+    <div><a href="index.html">&larr; Back to the guide library</a></div>
+  </div>
+</footer>
+
+<script>
+/* ==========================================================================
+   Card data. Every fact is lifted from the guides in ./guides/.
+   kind: gotcha | number | concept.  d1: true = "Before day 1" subset.
+   ========================================================================== */
+const GUIDES = {
+  "01-golang":                         {n:1,  t:"Go for Infrastructure Engineers"},
+  "02-grpc":                           {n:2,  t:"gRPC and Protocol Buffers"},
+  "03-multicloud-aws-gcp-azure":       {n:3,  t:"AWS / GCP / Azure Foundations"},
+  "04-managed-kubernetes-eks-gke-aks": {n:4,  t:"Managed Kubernetes: EKS / GKE / AKS"},
+  "05-cni-and-host-networking":        {n:5,  t:"CNI and Host-Level Networking"},
+  "06-karpenter":                      {n:6,  t:"Karpenter — Node Lifecycle"},
+  "07-kyverno":                        {n:7,  t:"Kyverno — Policy as Code"},
+  "08-terraform":                      {n:8,  t:"Terraform at Platform Scale"},
+  "09-helm":                           {n:9,  t:"Helm as a Templating Engine"},
+  "10-vault":                          {n:10, t:"HashiCorp Vault for a Platform Team"},
+  "11-cert-manager-and-pki":           {n:11, t:"cert-manager and PKI for Cells"},
+  "12-cell-lifecycle-synthesis":       {n:12, t:"The Cell as a System"},
+  "13-gitops-argocd-flux":             {n:13, t:"GitOps — Argo CD and Flux"},
+  "14-observability-for-cells":        {n:14, t:"Observability for Cells"},
+  "15-temporal-programming-model":     {n:15, t:"The Temporal Programming Model"},
+  "16-temporal-server-internals":      {n:16, t:"Temporal Server Internals"}
+};
+
+const CARDS = [
+
+/* ---------------- 01 Go ---------------- */
+{id:"go-gomaxprocs", kind:"number", d1:false, guide:"01-golang", guideNum:1, topic:"Runtime and cgroups", tags:["go","kubernetes","tuning"],
+ q:"On Kubernetes, when does Go actually set <code>GOMAXPROCS</code> from the container rather than the whole machine?",
+ a:"Only when <code>go.mod</code> declares <code>go 1.25.0</code> or later <strong>and</strong> the pod sets CPU <strong>limits</strong>. Container-aware GOMAXPROCS reads the cgroup CPU <em>bandwidth</em> limit, and the release notes are explicit that the runtime does not consider CPU <em>requests</em>. Requests-only pods — the common convention — get the old whole-machine default. Set it from the request via the Downward API, and note that setting the env var at all disables the periodic re-read. (<a href='https://go.dev/doc/go1.25#container-aware-gomaxprocs'>Go 1.25 notes</a>)"},
+
+{id:"go-nil-iface", kind:"gotcha", d1:false, guide:"01-golang", guideNum:1, topic:"Interfaces", tags:["go"],
+ q:"A helper returns a typed nil pointer, assigned to an <code>error</code>. Is <code>err != nil</code> true?",
+ a:"<strong>Yes.</strong> An interface value is a (type, value) pair and is nil only when both halves are, so a nil <code>*QuotaError</code> held in an <code>error</code> is non-nil and your error branch runs. This is the concrete reason behind &quot;return structs, not interfaces&quot; and behind declaring <code>var err error</code> and assigning rather than returning a typed nil. (<a href='https://go.dev/doc/faq#nil_error'>Go FAQ</a>)"},
+
+{id:"go-cancel-leak", kind:"gotcha", d1:false, guide:"01-golang", guideNum:1, topic:"Context", tags:["go"],
+ q:"What leaks when you skip <code>cancel()</code> from <code>context.WithCancel</code> or <code>WithTimeout</code>?",
+ a:"The child stays attached to its parent until the parent is cancelled. In a server rooted at <code>context.Background()</code> that is forever: a growing linked list of children plus one timer per <code>WithTimeout</code>. <code>defer cancel()</code> immediately after the call, every time, including on the success path. <code>go vet</code>'s <code>lostcancel</code> catches the obvious shapes but not all of them."},
+
+{id:"go-defaultclient", kind:"number", d1:false, guide:"01-golang", guideNum:1, topic:"net/http defaults", tags:["go","networking"],
+ q:"What are the two dangerous defaults in <code>http.DefaultClient</code> / <code>http.DefaultTransport</code>?",
+ a:"<strong>No request timeout</strong>, and <strong><code>MaxIdleConnsPerHost: 2</code></strong>. The first means one hung TLS handshake to a cloud API pins a goroutine indefinitely; the second means a client hitting one host hard opens and closes connections constantly. Construct your own <code>http.Client</code> with a <code>Timeout</code> and a tuned <code>Transport</code>, and share one instance."},
+
+{id:"go-gomemlimit", kind:"number", d1:false, guide:"01-golang", guideNum:1, topic:"Memory limits", tags:["go","kubernetes","tuning"],
+ q:"Why does a Go pod get OOM-killed even though the GC is running normally?",
+ a:"<code>GOMEMLIMIT</code> is off by default and <code>GOGC</code> is relative, so nothing stops the heap growing past the container limit — the kernel kills you and the pod restarts into the same burst. Set <code>GOMEMLIMIT</code> to <strong>~85-90% of <code>limits.memory</code></strong>; it is soft and excludes cgo/mmap memory. Also alert on GC CPU fraction: the runtime's 50% GC CPU cap converts the OOM into a slow death instead, which is quieter and worse. (<a href='https://go.dev/doc/gc-guide'>GC guide</a>)"},
+
+{id:"go-cr-cache", kind:"gotcha", d1:true, guide:"01-golang", guideNum:1, topic:"controller-runtime", tags:["go","kubernetes"],
+ q:"Your controller creates an object and immediately reads it back with the default controller-runtime client. What comes back?",
+ a:"Stale data, or <code>NotFound</code>. The default client reads from an <strong>informer cache, not the API server</strong> — that is the entire point of the cache, not a bug. Write reconcilers that tolerate it (level-triggered, idempotent), and reach for an uncached reader only for the one specific read that must be authoritative."},
+
+{id:"go-reconcile-result", kind:"gotcha", d1:false, guide:"01-golang", guideNum:1, topic:"controller-runtime", tags:["go","kubernetes"],
+ q:"A reconciler hits an expected &quot;not ready yet&quot; condition. What does it return?",
+ a:"<code>ctrl.Result{RequeueAfter: 15 * time.Second}, nil</code> — that is the correct expression of &quot;poll again&quot;. Returning <code>ctrl.Result{}, err</code> means &quot;something went wrong&quot;: it triggers exponential backoff, logs, and poisons your error metrics with normal operation. Note <code>Result.Requeue</code> is deprecated in favour of <code>RequeueAfter</code> or returning an error."},
+
+{id:"go-ownerrefs", kind:"gotcha", d1:false, guide:"01-golang", guideNum:1, topic:"Garbage collection", tags:["go","kubernetes","teardown"],
+ q:"Can an owner reference clean up a resource in another namespace, or another cluster?",
+ a:"No to both. Owner references cannot cross namespaces, and cross-cluster cleanup does not exist. Cell teardown spanning namespaces, clusters, or clouds needs a <strong>finalizer plus explicit deletion logic</strong> — and then you own the failure mode where the finalizer blocks deletion forever because the cloud API is down. Every finalizer needs a documented manual-removal escape hatch."},
+
+{id:"go-workflow-determinism", kind:"gotcha", d1:false, guide:"01-golang", guideNum:1, topic:"Temporal SDK in Go", tags:["go","temporal","determinism"],
+ q:"Why are <code>go func</code>, <code>time.Now</code>, <code>time.Sleep</code>, and <code>math/rand</code> banned inside a Temporal workflow?",
+ a:"They are determinism bugs, not style issues: replay after a worker restart diverges and the workflow fails. Use <code>workflow.Go</code>, <code>workflow.Now</code>, <code>workflow.Sleep</code>, and <code>workflow.SideEffect</code>, and run the <code>workflowcheck</code> analyzer in CI. (<a href='https://docs.temporal.io/develop/go/best-practices/multithreading'>Go SDK multithreading</a>)"},
+
+
+{id:"go-chan-leak", kind:"gotcha", d1:false, guide:"01-golang", guideNum:1, topic:"Goroutine leaks", tags:["go"],
+ q:"What is the single most common goroutine leak in infrastructure Go?",
+ a:"An <strong>unbuffered channel send with no cancellation case</strong>. A producer blocked on <code>out &lt;- v</code> after the consumer returned early never exits, and its whole capture set stays reachable. Always pair a channel send with <code>case &lt;-ctx.Done()</code>. The Go 1.26 release notes use exactly this shape as the motivating example for goroutine leak profiles."},
+
+
+{id:"go-concept-artifact", kind:"concept", d1:false, guide:"01-golang", guideNum:1, topic:"Why Go for this job", tags:["go","multicloud"],
+ q:"What is the Go deployment artifact, and why does it matter for a multi-cloud cell platform?",
+ a:"<code>go build</code> emits <strong>one executable</strong> with the runtime, GC, scheduler, and every dependency linked in: no interpreter, no JVM, no site-packages. The image can be <code>FROM scratch</code> plus a binary plus CA certificates, and cross-compiling is <code>GOOS=linux GOARCH=arm64 go build</code> with no cross-toolchain. For a team shipping the same control-plane component to AWS, GCP, and Azure on amd64 and arm64, that is the biggest practical win over Python or Java."},
+
+/* ---------------- 02 gRPC ---------------- */
+{id:"grpc-l4lb", kind:"gotcha", d1:true, guide:"02-grpc", guideNum:2, topic:"Load balancing", tags:["grpc","networking","capacity"],
+ q:"You put an L4 load balancer in front of a gRPC service. Why does scaling up do nothing?",
+ a:"HTTP/2 multiplexes every RPC onto one connection, so the LB's backend choice is made <strong>once, at connection setup</strong>, and never revisited — every client is pinned to one backend. Symptoms: uneven CPU, scaling up changes nothing, restarts &quot;fix&quot; it. Fix with client-side LB over a headless Service, an L7 proxy, or a mesh; mitigate with <code>MaxConnectionAge</code>. (<a href='https://kubernetes.io/blog/2018/11/07/grpc-load-balancing-on-kubernetes-without-tears/'>Kubernetes blog</a>)"},
+
+{id:"grpc-pickfirst", kind:"gotcha", d1:false, guide:"02-grpc", guideNum:2, topic:"Load balancing", tags:["grpc","networking"],
+ q:"You added every pod IP to DNS and traffic still lands on one backend. What is missing?",
+ a:"The default LB policy is <strong><code>pick_first</code></strong>, not <code>round_robin</code>. You need <code>&quot;loadBalancingConfig&quot;: [{&quot;round_robin&quot;:{}}]</code> in the service config. Temporal uses exactly this mechanism: both the Go SDK and the server's internode dialer pass round-robin as their default service config."},
+
+
+{id:"grpc-4mb", kind:"number", d1:true, guide:"02-grpc", guideNum:2, topic:"Message size", tags:["grpc","limits"],
+ q:"What are gRPC's default max receive and max send message sizes?",
+ a:"Receive is <strong>4 MB</strong>; <strong>send is unbounded</strong>. So a sender will happily transmit a message the receiver refuses with <code>ResourceExhausted</code>. Raise both sides, and only after doing the memory math: 4 MB × concurrency lives on the heap."},
+
+{id:"grpc-keepalive", kind:"number", d1:true, guide:"02-grpc", guideNum:2, topic:"Keepalive", tags:["grpc","networking"],
+ q:"What is the client keepalive default, and what is the server's enforcement minimum?",
+ a:"Client keepalive is <strong>off by default</strong> (<code>Time</code> = infinity); the server's <code>EnforcementPolicy.MinTime</code> is <strong>5 minutes</strong>. Turn on client keepalive without coordinating the server and you earn <code>GOAWAY</code> + <code>ENHANCE_YOUR_CALM</code> + <code>too_many_pings</code> after more than 2 strikes, then a reconnect loop across the fleet. Client keepalive settings are a contract with the service owner, not a local decision — configure both sides in the same change."},
+
+{id:"grpc-lb-idle", kind:"number", d1:false, guide:"02-grpc", guideNum:2, topic:"Cloud LB idle timeouts", tags:["grpc","networking","multicloud"],
+ q:"What are the default idle timeouts on AWS NLB, Azure Load Balancer, and GCP internal passthrough NLB?",
+ a:"<strong>AWS NLB 350 s</strong>, <strong>Azure LB 4 minutes</strong>, <strong>GCP internal passthrough NLB 600 s</strong>. A middlebox that silently drops an idle flow leaves both endpoints believing the connection is fine. Set client keepalive <code>Time</code> comfortably below the smallest value on the path, and set <code>PermitWithoutStream: true</code> — an idle <em>connection</em> carrying an in-flight long-poll still sends zero frames."},
+
+{id:"grpc-deadline", kind:"gotcha", d1:false, guide:"02-grpc", guideNum:2, topic:"Deadlines", tags:["grpc"],
+ q:"What is the default deadline on a gRPC call?",
+ a:"There is none, and an RPC without a deadline is a leak. Set one on every call, derive downstream contexts from the incoming <code>ctx</code>, and never pass <code>context.Background()</code> to a call made on behalf of a request. (<a href='https://grpc.io/docs/guides/deadlines/'>deadlines guide</a>)"},
+
+{id:"grpc-deadline-budget", kind:"gotcha", d1:false, guide:"02-grpc", guideNum:2, topic:"Retries", tags:["grpc"],
+ q:"With <code>maxAttempts: 5</code> and a 1-second deadline, how many attempts do you get?",
+ a:"As many as fit in 1 second. The deadline is a <strong>total budget across retries and hedges</strong>, not a per-attempt timeout. (<a href='https://github.com/grpc/proposal/blob/master/A6-client-retries.md'>gRFC A6</a>)"},
+
+{id:"grpc-retry-throttle", kind:"gotcha", d1:false, guide:"02-grpc", guideNum:2, topic:"Retries", tags:["grpc","capacity"],
+ q:"What must you configure alongside any <code>retryPolicy</code>, and what is its default?",
+ a:"<code>retryThrottling</code> — a per-server token bucket that disables retries once the failure ratio crosses a threshold. <strong>There is no default.</strong> Without it, retries turn a brownout into an outage. Set <code>maxTokens</code>/<code>tokenRatio</code> whenever you set a retry policy."},
+
+{id:"grpc-tls-snapshot", kind:"gotcha", d1:false, guide:"02-grpc", guideNum:2, topic:"TLS reload", tags:["grpc","tls","pki"],
+ q:"cert-manager rotates a certificate on disk. Why does the gRPC server keep serving the old one?",
+ a:"<code>credentials.NewTLS</code> <strong>snapshots the <code>*tls.Config</code> at construction</strong>. Rotated files are not picked up until restart unless you use the <code>GetCertificate</code>/<code>GetClientCertificate</code> callbacks. Everything works for 89 days and then does not."},
+
+{id:"grpc-maxstreams", kind:"number", d1:false, guide:"02-grpc", guideNum:2, topic:"Concurrency", tags:["grpc","capacity","limits"],
+ q:"What does grpc-go's server advertise for <code>MAX_CONCURRENT_STREAMS</code> by default?",
+ a:"Nothing — its default is <code>math.MaxUint32</code>, so it does not advertise a limit at all. Clients then fall back to assuming <strong>100</strong> and self-throttle there while the server accepts unbounded concurrency. Set <code>grpc.MaxConcurrentStreams(n)</code> explicitly so the advertised limit and the handler-count semaphore both reflect real capacity."},
+
+{id:"grpc-longpoll", kind:"gotcha", d1:false, guide:"02-grpc", guideNum:2, topic:"Long polls", tags:["grpc","temporal","observability"],
+ q:"Temporal's matching long poll defaults to 1 minute. What does that break in your ingress path?",
+ a:"Any proxy route timeout, ingress read timeout, or LB request timeout below that severs the poll — long polls look like hung requests to every generic timeout on the path. Also exclude poll methods from latency SLOs and from any &quot;slow request&quot; alerting, or they will dominate your percentiles."},
+
+{id:"grpc-gracefulstop", kind:"gotcha", d1:false, guide:"02-grpc", guideNum:2, topic:"Shutdown", tags:["grpc","upgrades","kubernetes"],
+ q:"Why does <code>GracefulStop</code> matter more than it looks during a rolling upgrade?",
+ a:"The two-phase <code>GOAWAY</code> handshake lets in-flight RPCs finish and lets racing new streams be transparently retried. <code>Stop()</code> — or a SIGKILL after too short a <code>terminationGracePeriodSeconds</code> — turns a clean rolling upgrade into a client-visible error spike. Make the grace period longer than your longest expected RPC, <strong>including long polls</strong>."},
+
+{id:"grpc-concept-http2", kind:"concept", d1:true, guide:"02-grpc", guideNum:2, topic:"What gRPC actually is", tags:["grpc","networking"],
+ q:"Describe gRPC as an HTTP/2 calling convention. Where do the method, deadline, and status live?",
+ a:"One RPC is exactly <strong>one HTTP/2 stream</strong>. The method is the <code>:path</code> (<code>/package.Service/Method</code>), request metadata is HTTP/2 headers, the deadline is the <code>grpc-timeout</code> header, messages are length-prefixed frames in the DATA stream, and the final status is an HTTP/2 <strong>trailer</strong> (<code>grpc-status</code>, <code>grpc-message</code>). That last one is why gRPC needs real trailer support and why naive HTTP/1 proxies cannot carry it."},
+
+
+/* ---------------- 03 Multi-cloud ---------------- */
+{id:"mc-gcp-subnets", kind:"gotcha", d1:false, guide:"03-multicloud-aws-gcp-azure", guideNum:3, topic:"Scope differences", tags:["multicloud","networking"],
+ q:"Your Terraform module loops over zones creating one subnet each. What happens on GCP?",
+ a:"It collapses. <strong>GCP subnets are regional</strong> — one subnet already spans every zone in the region — so the loop errors or produces three redundant subnets. The corollary bites harder: your AWS zonal-subnet routing, per-AZ NAT, and AZ-affinity logic have no GCP counterpart, and code that assumes &quot;subnet implies zone&quot; will mis-place workloads. (<a href='https://docs.cloud.google.com/vpc/docs/subnets'>GCP subnets</a>)"},
+
+
+{id:"mc-azure-nsg", kind:"gotcha", d1:false, guide:"03-multicloud-aws-gcp-azure", guideNum:3, topic:"Firewalls", tags:["multicloud","networking","security"],
+ q:"You port an AWS security-group baseline to Azure NSGs. What did you just weaken?",
+ a:"Intra-VNet inbound. The built-in <code>AllowVnetInBound</code> rule means an Azure cell is <strong>open to its VNet neighbours</strong> unless you write explicit denies. The AWS baseline you copied assumed default-deny, so the Azure deployment is less secure than you think."},
+
+{id:"mc-azure-graph-arm", kind:"gotcha", d1:false, guide:"03-multicloud-aws-gcp-azure", guideNum:3, topic:"Azure identity", tags:["multicloud","identity"],
+ q:"You create a service principal via Microsoft Graph and immediately assign it an ARM role. What happens?",
+ a:"It frequently fails with <code>PrincipalNotFound</code>. Azure's identity and resource planes are <strong>separate and eventually consistent</strong> — this is expected behaviour, not a transient bug, and it needs a retry policy. Related: Entra roles are not Azure RBAC roles, so &quot;I am Global Administrator&quot; does not imply you can create resources."},
+
+
+{id:"mc-azure-fic-20", kind:"number", d1:false, guide:"03-multicloud-aws-gcp-azure", guideNum:3, topic:"Azure workload identity", tags:["multicloud","identity","quotas"],
+ q:"How many federated identity credentials can one Azure managed identity hold?",
+ a:"<strong>20.</strong> A &quot;one FIC per cell&quot; design hits the ceiling at cell 21. Use one identity per <em>capability</em> with flexible FICs and subject matching, or one identity per cell — which multiplies your Entra object count instead."},
+
+{id:"mc-irsa-per-cluster", kind:"gotcha", d1:false, guide:"03-multicloud-aws-gcp-azure", guideNum:3, topic:"AWS workload identity", tags:["multicloud","identity","kubernetes"],
+ q:"Why is IRSA a problem on the cell-creation critical path?",
+ a:"IRSA requires <strong>one IAM OIDC provider per cluster</strong>, so fleet-scale EKS means editing role trust policies every time a cluster is created or replaced — an IAM write on the critical path, subject to IAM's eventual consistency. EKS Pod Identity removes that coupling (and gained cross-account support in June 2025), but its agent is a DaemonSet, so it does not work on Fargate."},
+
+{id:"mc-azure-l7-grpc", kind:"gotcha", d1:false, guide:"03-multicloud-aws-gcp-azure", guideNum:3, topic:"Azure ingress", tags:["multicloud","grpc","networking"],
+ q:"Can Azure Application Gateway v2 or Front Door do end-to-end gRPC?",
+ a:"<strong>No</strong> — both speak HTTP/1.1 to backends. For a gRPC service like Temporal's frontend, Azure ingress is structurally different: Application Gateway for Containers, or your own Envoy. Do not discover this after committing to a single ingress abstraction."},
+
+{id:"mc-gcp-health-checks", kind:"gotcha", d1:false, guide:"03-multicloud-aws-gcp-azure", guideNum:3, topic:"GCP load balancing", tags:["multicloud","grpc","networking"],
+ q:"What health check must a GCP <code>GRPC</code> backend service use?",
+ a:"A <strong>gRPC or TCP</strong> health check, and the server must implement the gRPC health checking protocol. Google's docs are explicit: do not use HTTP(S) or HTTP/2 health checks against a gRPC backend. Doing so produces a permanently unhealthy backend service with no obvious error."},
+
+{id:"mc-key-material", kind:"gotcha", d1:false, guide:"03-multicloud-aws-gcp-azure", guideNum:3, topic:"Teardown residue", tags:["multicloud","teardown","secrets"],
+ q:"Why must cell names carry a generation suffix?",
+ a:"Because key material and vault names outlive the cell. GCP key rings and keys <strong>cannot be deleted at all</strong> — only versions can be destroyed; Azure Key Vault soft-delete reserves the name for the retention period unless purged; AWS KMS enforces a <strong>7-30 day</strong> pending-deletion window; GCP project IDs are permanently burned. Without a generation suffix, create-destroy-recreate collides."},
+
+{id:"mc-azure-privatelink-dns", kind:"gotcha", d1:false, guide:"03-multicloud-aws-gcp-azure", guideNum:3, topic:"Azure private networking", tags:["multicloud","networking","dns","security"],
+ q:"An Azure private endpoint is created but the <code>privatelink.*</code> DNS zone is not linked to the VNet. What do you see?",
+ a:"<strong>Nothing.</strong> The public name resolves to the public IP and traffic leaves the private path with no error, no metric, and no log entry saying you are not private. Make the zone link an assertion in the cell's post-provision conformance test, not an assumption."},
+
+{id:"mc-quota-not-capacity", kind:"gotcha", d1:false, guide:"03-multicloud-aws-gcp-azure", guideNum:3, topic:"Capacity", tags:["multicloud","quotas","capacity"],
+ q:"Your quota increase was approved and the launch still fails. What are the three error names?",
+ a:"<code>InsufficientInstanceCapacity</code> (AWS), <code>ZONE_RESOURCE_POOL_EXHAUSTED</code> (GCP), <code>ZonalAllocationFailed</code> (Azure). <strong>Quota is not capacity.</strong> A cell-creation workflow needs different handling per class — retry-elsewhere for capacity, request-and-wait for quota — and because the taxonomies are cloud-specific, classification belongs in the per-cloud implementation."},
+
+{id:"mc-create-adopt", kind:"gotcha", d1:false, guide:"03-multicloud-aws-gcp-azure", guideNum:3, topic:"Idempotent provisioning", tags:["multicloud","temporal","bootstrap"],
+ q:"A provisioning activity is retried and the create returns <code>AlreadyExists</code>. What must happen?",
+ a:"It must <strong>adopt</strong> the existing resource, not fail. The mirror-image bug: replacing operation polling with <code>sleep 30</code> produces workflows that &quot;succeed&quot; while racing, then fail three steps later against a resource that was never ready. GCP and Azure hand you an operation handle; AWS gives you a describe call. Use them."},
+
+{id:"mc-concept-scope", kind:"concept", d1:true, guide:"03-multicloud-aws-gcp-azure", guideNum:3, topic:"The scope axis", tags:["multicloud","networking"],
+ q:"Give the scope of a VPC/VNet, a subnet, and the identity boundary on each of the three clouds.",
+ a:"<strong>Network:</strong> AWS regional, GCP <em>global</em>, Azure regional. <strong>Subnet:</strong> AWS <em>zonal</em>, GCP regional (spans all zones), Azure regional. <strong>Identity boundary:</strong> AWS account, GCP project, Azure <em>Entra tenant, separate from the ARM subscription</em>. Quota boundary is account/project/subscription × region everywhere. The scope axis is the single biggest source of multi-cloud surprise; the names are noise."},
+
+{id:"mc-concept-verbs", kind:"concept", d1:true, guide:"03-multicloud-aws-gcp-azure", guideNum:3, topic:"Abstraction strategy", tags:["multicloud","temporal"],
+ q:"What is the right multi-cloud abstraction, and what is the failure mode of the wrong one?",
+ a:"<strong>Abstract the verbs, never the nouns.</strong> The failure mode is a <code>CloudLoadBalancer</code> type with a lowest-common-denominator field set. Temporal's published answer is an interface of <em>operations</em> (<code>DeployPersistenceStore</code>, <code>DeployVisibilityPersistenceStore</code>) plus a factory returning a provider-specific implementation, with cloud-agnostic parent workflows spawning cloud-specific children. The stable thing is the <strong>cell contract</strong> — endpoints, identity, persistence handles, telemetry, teardown semantics — not the resource graph."},
+
+/* ---------------- 04 Managed Kubernetes ---------------- */
+{id:"k8s-eks-force-upgrade", kind:"gotcha", d1:true, guide:"04-managed-kubernetes-eks-gke-aks", guideNum:4, topic:"EKS version policy", tags:["kubernetes","upgrades"],
+ q:"What does EKS do when your cluster passes the end of extended support?",
+ a:"It <strong>force-upgrades the control plane at any time, with no advance notice, and does not touch your nodes</strong> — you must update add-ons and EC2 nodes yourself afterwards. The failure shape is an apiserver two minors ahead of your kubelets. Alarm on days-until-EOL per cell and never let a cell approach the cliff."},
+
+{id:"k8s-eks-6x", kind:"number", d1:false, guide:"04-managed-kubernetes-eks-gke-aks", guideNum:4, topic:"EKS pricing", tags:["kubernetes","upgrades","cost"],
+ q:"What does EKS extended support cost, and how is it billed?",
+ a:"<strong>$0.60/hr vs $0.10/hr — 6x, per cluster per hour.</strong> At 300 cells that is roughly $1.3M/year of pure procrastination tax. It is usually the single most persuasive number in an upgrade business case."},
+
+
+{id:"k8s-aks-upgrade-quota", kind:"gotcha", d1:false, guide:"04-managed-kubernetes-eks-gke-aks", guideNum:4, topic:"AKS upgrades", tags:["kubernetes","upgrades","quotas","capacity"],
+ q:"AKS upgrades fail on what, more often than on Kubernetes itself?",
+ a:"<strong>Quota.</strong> Upgrades temporarily consume extra IP addresses and vCPU quota, and Microsoft states the process fails without headroom. Size cell subnets and vCPU quota for peak-during-upgrade — roughly steady state plus <code>maxSurge</code> — not for steady state."},
+
+{id:"k8s-aks-100-clusters", kind:"number", d1:false, guide:"04-managed-kubernetes-eks-gke-aks", guideNum:4, topic:"AKS quotas", tags:["kubernetes","quotas","capacity"],
+ q:"What is the default AKS clusters-per-subscription-per-region quota?",
+ a:"<strong>100</strong> for EA subscriptions, with self-service to <strong>1,000</strong> and support tickets beyond that (and 5,000 per subscription globally). A 300-cell Azure footprint hits this per region. Raise quotas as part of region onboarding, before the first cell."},
+
+{id:"k8s-irsa-100", kind:"number", d1:true, guide:"04-managed-kubernetes-eks-gke-aks", guideNum:4, topic:"EKS identity limits", tags:["kubernetes","identity","quotas","limits"],
+ q:"What two hard numbers stop IRSA from scaling past a few hundred EKS clusters?",
+ a:"<strong>100 IAM OIDC providers per account</strong> and a <strong>2,048-character cap on role trust policies</strong>. That is the ceiling. Use EKS Pod Identity for new cells; it replaces per-cluster trust-policy edits with an association API call."},
+
+{id:"k8s-aws-auth", kind:"gotcha", d1:false, guide:"04-managed-kubernetes-eks-gke-aks", guideNum:4, topic:"EKS access", tags:["kubernetes","identity","security"],
+ q:"What single object has locked more teams out of production EKS clusters than anything else?",
+ a:"<code>aws-auth</code>. It is deprecated and is a single-object cluster lockout risk — one malformed edit and nobody can authenticate. Set new EKS cells to <code>API</code> authentication mode, using access entries only."},
+
+{id:"k8s-dead-apiservice", kind:"gotcha", d1:false, guide:"04-managed-kubernetes-eks-gke-aks", guideNum:4, topic:"Teardown blockers", tags:["kubernetes","teardown"],
+ q:"One aggregated APIService has no healthy backend. What stops working?",
+ a:"<strong>Namespace deletion, cluster-wide.</strong> The namespace controller cannot enumerate resources, so <em>no</em> namespace finishes terminating. Diagnose with <code>kubectl get apiservice | grep False</code>. Make &quot;all APIServices Available&quot; a pre-teardown gate and alert on it continuously."},
+
+{id:"k8s-ns-finalizer", kind:"gotcha", d1:false, guide:"04-managed-kubernetes-eks-gke-aks", guideNum:4, topic:"Teardown blockers", tags:["kubernetes","teardown"],
+ q:"A namespace is stuck Terminating. Why is force-removing the <code>kubernetes</code> finalizer the wrong move?",
+ a:"It orphans cloud load balancers, disks, DNS records, and operator-managed external resources — which then bill forever and collide with the next cell. Fix the blocking controller instead; if you must force, run the cloud-resource sweep immediately afterwards."},
+
+{id:"k8s-zonal-volumes", kind:"gotcha", d1:false, guide:"04-managed-kubernetes-eks-gke-aks", guideNum:4, topic:"Storage", tags:["kubernetes","capacity","upgrades"],
+ q:"What is the latent outage hiding in an inherited block StorageClass?",
+ a:"<code>volumeBindingMode: Immediate</code>. Zonal block volumes plus node draining equals guaranteed stuck StatefulSets, eventually. Set <code>WaitForFirstConsumer</code> on every block StorageClass, and either use regional volumes (GKE regional PD, Azure ZRS) or pin StatefulSet ordinals to zones. Audit inherited StorageClasses on every cell."},
+
+{id:"k8s-136-cidr", kind:"number", d1:false, guide:"04-managed-kubernetes-eks-gke-aks", guideNum:4, topic:"Version-gated breakage", tags:["kubernetes","upgrades","networking"],
+ q:"What do Kubernetes 1.35 and 1.36 reject that older versions accepted?",
+ a:"1.35 drops <strong>cgroup v1</strong> — the kubelet refuses to start by default — and ends containerd 1.x support. 1.36 turns on <code>StrictIPCIDRValidation</code>, rejecting <strong>non-canonical CIDRs and leading-zero IPs</strong> on create/update: <code>192.168.0.5/24</code> and <code>010.0.0.5</code> are refused, with ratcheting only for already-stored objects. Cell templates are full of CIDRs — grep and fix them first."},
+
+{id:"k8s-reconciler-throttle", kind:"gotcha", d1:false, guide:"04-managed-kubernetes-eks-gke-aks", guideNum:4, topic:"Fleet reconciliation", tags:["kubernetes","quotas","capacity"],
+ q:"Who throttles your fleet reconciler first?",
+ a:"You do. AKS publishes <code>PUT ManagedCluster</code> at <strong>1 request per minute per cluster</strong> and returns HTTP 429 with <code>Retry-After</code>; AWS throttles the exact EC2 ENI/IP APIs the VPC CNI depends on during scale-out. Fleet reconcilers need jittered backoff and per-cloud concurrency limits, or a cell rollout becomes a self-inflicted throttling incident."},
+
+{id:"k8s-ingress-nginx", kind:"gotcha", d1:false, guide:"04-managed-kubernetes-eks-gke-aks", guideNum:4, topic:"Ingress", tags:["kubernetes","networking","security"],
+ q:"What is the status of ingress-nginx, and what does that mean for a cell template?",
+ a:"It was <strong>retired by upstream Kubernetes in March 2026</strong> — no more bug fixes or security patches, and no drop-in replacement. If any cell bootstraps it, that is unpatched internet-facing software in your dependency graph. Plan the Gateway API migration as a funded project, not a chore (<code>ingress2gateway</code> helps)."},
+
+{id:"k8s-concept-treadmill", kind:"concept", d1:true, guide:"04-managed-kubernetes-eks-gke-aks", guideNum:4, topic:"Fleet framing", tags:["kubernetes","upgrades"],
+ q:"Why is &quot;we will upgrade in Q3&quot; the wrong shape for a fleet plan?",
+ a:"Because <strong>the version treadmill is the product</strong>. Kubernetes ships roughly three minors a year, each supported about a year upstream, and every managed offering wraps that with its own window, its own paid escape hatch, and its own forcing function. Owning N clusters on three clouds means running a continuous, never-finished upgrade pipeline. Design for that."},
+
+
+/* ---------------- 05 CNI and host networking ---------------- */
+{id:"cni-nftables", kind:"number", d1:true, guide:"05-cni-and-host-networking", guideNum:5, topic:"kube-proxy modes", tags:["networking","kubernetes","upgrades"],
+ q:"When does kube-proxy default to nftables, and what breaks if you have not pinned the mode?",
+ a:"<strong>v1.40</strong> makes <code>nftables</code> the default (v1.37 already warns when the mode is defaulted). If a cell's kube-proxy config omits <code>mode</code>, that upgrade silently swaps the datapath — and on a node with a kernel older than <strong>5.13</strong>, kube-proxy fails to start and the node breaks. Pin <code>mode</code> explicitly in every cell today. (<a href='https://github.com/kubernetes/enhancements/tree/master/keps/sig-network/5343-nftables-to-default'>KEP-5343</a>)"},
+
+{id:"cni-netpol-ignored", kind:"gotcha", d1:false, guide:"05-cni-and-host-networking", guideNum:5, topic:"NetworkPolicy", tags:["networking","kubernetes","security"],
+ q:"A cluster accepts your NetworkPolicy objects. Does it enforce them?",
+ a:"Not necessarily — the API server stores them regardless of whether the CNI implements them. Flannel ignores them entirely; an <strong>EKS cluster ignores them until network policy is explicitly enabled on the VPC CNI add-on</strong>; legacy GKE needs the Calico add-on. No error, no event, no warning. Make &quot;apply deny-all, assert curl fails&quot; a mandatory post-provision conformance test for every cell."},
+
+{id:"cni-deny-egress-dns", kind:"gotcha", d1:false, guide:"05-cni-and-host-networking", guideNum:5, topic:"NetworkPolicy", tags:["networking","dns","security"],
+ q:"You ship a default-deny egress policy. What takes down the whole namespace at once?",
+ a:"The missing DNS allow rule. Every application fails simultaneously with what looks like a DNS outage. Ship <code>allow-dns-egress</code> <strong>in the same commit</strong> as the default-deny, never after it."},
+
+{id:"cni-ndots", kind:"number", d1:false, guide:"05-cni-and-host-networking", guideNum:5, topic:"Cluster DNS", tags:["networking","dns","capacity"],
+ q:"How many DNS queries does one external hostname lookup cost under the default <code>ndots:5</code>?",
+ a:"<strong>Ten</strong> — five search-domain expansions × A and AAAA. This is the dominant load on CoreDNS at scale and a latency tax on every outbound connection. Fix with trailing dots or per-pod <code>dnsConfig</code>; do not globally set <code>ndots:1</code> without auditing for single-dot names like <code>svc.namespace</code>."},
+
+{id:"cni-5s-dns", kind:"gotcha", d1:false, guide:"05-cni-and-host-networking", guideNum:5, topic:"Cluster DNS", tags:["networking","dns"],
+ q:"Requests intermittently take exactly 5 seconds. Will scaling CoreDNS help?",
+ a:"No. It is a <strong>kernel conntrack race</strong>, not a CoreDNS problem: parallel A/AAAA queries collide on conntrack insert and one packet is dropped silently. NodeLocal DNSCache eliminates it by removing the DNAT entirely — but restarting the node-local-dns DaemonSet causes a node-wide DNS outage unless you use the dual-IP configuration. Put that in the upgrade runbook."},
+
+{id:"cni-aws-maxpods", kind:"number", d1:false, guide:"05-cni-and-host-networking", guideNum:5, topic:"AWS pod density", tags:["networking","capacity","quotas"],
+ q:"What is the AWS VPC CNI max-pods formula, and what does enabling custom networking do to it?",
+ a:"<code>maxPods = maxENIs × (IPsPerENI − 1) + 2</code> — pod density is an <strong>ENI property, not a memory property</strong>. Custom networking removes the primary ENI from the pod pool and <em>lowers</em> max-pods; forgetting to recompute <code>--max-pods</code> leaves pods stuck in <code>ContainerCreating</code> with no obvious cause. Prefix delegation raises the ceiling to <strong>110</strong> (≤30 vCPU) or <strong>250</strong> (&gt;30 vCPU), but needs <strong>contiguous /28 blocks</strong> — a fragmented subnet fails allocation while reporting free IPs."},
+
+{id:"cni-gke-2x", kind:"number", d1:false, guide:"05-cni-and-host-networking", guideNum:5, topic:"GKE pod density", tags:["networking","capacity","kubernetes"],
+ q:"How does GKE size a node's pod CIDR, and what does the default cost you?",
+ a:"GKE assigns each node <strong>the smallest CIDR holding 2× max-pods-per-node</strong>. The default of 110 pods therefore burns a <strong>/24 per node</strong>, so a /16 pod range caps the cluster at <strong>256 nodes</strong> and then fails with <code>IP_SPACE_EXHAUSTED</code>. Setting <code>--max-pods-per-node</code> to 32 gives a /26 per node and quadruples the node ceiling — and it is <strong>immutable</strong>, fixed at node-pool creation. Highest-leverage GKE cell decision there is."},
+
+
+{id:"cni-azure-node-subnet", kind:"gotcha", d1:false, guide:"05-cni-and-host-networking", guideNum:5, topic:"Azure CNI", tags:["networking","capacity","upgrades"],
+ q:"Why does Azure CNI Node Subnet mode exhaust a VNet so fast?",
+ a:"It <strong>pre-reserves <code>maxPods</code> addresses per node whether the pods exist or not</strong>. Legacy kubenet also caps cluster size at its 400-route-table limit and retires <strong>31 March 2028</strong>. Azure CNI Overlay is the migration target — and changing a live cluster's network plugin is a rebuild, so this is a cell-recycle project with a fixed deadline."},
+
+{id:"cni-cidr-immutable", kind:"gotcha", d1:true, guide:"05-cni-and-host-networking", guideNum:5, topic:"Address planning", tags:["networking","capacity","teardown"],
+ q:"How changeable are a cluster's pod CIDR and service CIDR?",
+ a:"Effectively <strong>immutable</strong> — changing either requires rebuilding the cluster. Allocate them from a global, non-overlapping plan across every cell in every cloud on day one, even for cells that will &quot;never&quot; talk to each other. Retrofitting non-overlapping CIDRs across a live fleet is the most expensive networking remediation there is, and overlaps permanently rule out Cluster Mesh and plain VPC peering."},
+
+{id:"cni-mtu", kind:"number", d1:false, guide:"05-cni-and-host-networking", guideNum:5, topic:"MTU", tags:["networking"],
+ q:"How many bytes do VXLAN and WireGuard cost, and why does an MTU bug show green health checks?",
+ a:"<strong>VXLAN 50 bytes, WireGuard 80.</strong> Small packets succeed and large transfers hang, so probes pass while applications break. Enabling encryption on a working cluster silently reduces usable MTU and creates the black hole days later. Blocking ICMP — which almost every hardened security group does — disables PMTUD and turns a clean error into a hang. Allow ICMP type 3 code 4 and ICMPv6 type 2 everywhere."},
+
+
+{id:"cni-bootstrap", kind:"gotcha", d1:false, guide:"05-cni-and-host-networking", guideNum:5, topic:"CNI bootstrap", tags:["networking","kubernetes","bootstrap"],
+ q:"A brand-new cell provisions but never converges; nodes are <code>NotReady</code> with <code>cni plugin not initialized</code>. What is wrong?",
+ a:"The CNI DaemonSet must bootstrap the network it depends on. Nodes stay NotReady until a conflist appears in <code>/etc/cni/net.d</code>, so the CNI pods need <code>hostNetwork: true</code> and tolerations for the not-ready taint. Get this wrong and you have the most common brand-new-cell failure. Related: with containerd's <code>max_conf_num = 1</code>, a leftover <code>10-flannel.conflist</code> wins lexically and quietly shadows your CNI — teardown must clean <code>/etc/cni/net.d</code> and <code>/opt/cni/bin</code>."},
+
+
+{id:"cni-nat-snat", kind:"number", d1:false, guide:"05-cni-and-host-networking", guideNum:5, topic:"Egress limits", tags:["networking","capacity","quotas","limits"],
+ q:"Thousands of pods poll one third-party API and connections start failing. What is the limit?",
+ a:"Roughly <strong>55,000 concurrent connections per unique destination endpoint</strong> on an AWS NAT Gateway. Exceeding it surfaces as <code>ErrorPortAllocation</code> and looks like the remote service being down. Use VPC endpoints, connection pooling, and multiple NAT gateways; alarm on the metric."},
+
+
+{id:"cni-concept-primitives", kind:"concept", d1:true, guide:"05-cni-and-host-networking", guideNum:5, topic:"What a container network is", tags:["networking"],
+ q:"Strip away Kubernetes. What three primitives is a container network made of?",
+ a:"<strong>1.</strong> A <em>network namespace</em> — a private copy of the kernel's whole network stack: interfaces, routing tables, ARP, netfilter rules, conntrack, <code>/proc/sys/net</code>. <strong>2.</strong> A <em>virtual wire</em> out of it, almost always a veth pair with one end in the pod and one on the host. <strong>3.</strong> A <em>decision on the host</em> about arriving packets: bridge, route, encapsulate, or hand to eBPF. CNI, kube-proxy, Cilium, and the VPC CNI are automation and policy on top of those three."},
+
+{id:"cni-concept-overlay", kind:"concept", d1:true, guide:"05-cni-and-host-networking", guideNum:5, topic:"Overlay vs native routing", tags:["networking","capacity"],
+ q:"Overlay versus native routing: state the trade in one sentence each, and say when it can be changed.",
+ a:"<strong>Overlays trade CPU and MTU for IP-space freedom</strong> — encap/decap per packet, 50 bytes gone, pod IPs invisible to cloud LBs, flow logs, and security groups, but total independence from VPC address space. <strong>Native routing trades IP-space freedom for line-rate simplicity and cloud-native visibility</strong> — every pod burns a routable VPC IP, density is capped by ENI slots or alias-range size, but there is no encap tax and pod IPs are visible to the fabric. Which one a cell uses is an <strong>irreversible day-0 decision</strong>."},
+
+/* ---------------- 06 Karpenter ---------------- */
+{id:"kp-defaults", kind:"gotcha", d1:false, guide:"06-karpenter", guideNum:6, topic:"Disruption defaults", tags:["autoscaling","kubernetes","capacity"],
+ q:"You omit <code>spec.disruption</code> on a NodePool. What did you just accept?",
+ a:"<code>consolidationPolicy: WhenEmptyOrUnderutilized</code> with <code>consolidateAfter: 0s</code>, and a single budget of <code>nodes: 10%</code>. On a 10-node cell that is one node at a time; on a 200-node cell it is <strong>20 nodes churning simultaneously</strong>. Always write budgets explicitly — silence means you accepted the aggressive default."},
+
+{id:"kp-forceful", kind:"gotcha", d1:false, guide:"06-karpenter", guideNum:6, topic:"Disruption budgets", tags:["autoscaling","kubernetes"],
+ q:"You set <code>budgets: [{nodes: &quot;0&quot;}]</code> to freeze node churn. What still disrupts nodes?",
+ a:"<strong>Expiration, interruption, and node repair</strong> — the forceful methods are not rate-limited by disruption budgets. A fleet built the same week with <code>expireAfter: 720h</code> gets a synchronized fleet-wide expiry. Stagger <code>expireAfter</code> across cells, or set it to <code>Never</code> and roll exclusively via drift, which <em>is</em> budgeted."},
+
+{id:"kp-startuptaint", kind:"gotcha", d1:false, guide:"06-karpenter", guideNum:6, topic:"Node registration", tags:["autoscaling","kubernetes","cost"],
+ q:"Karpenter keeps launching nodes forever and the bill explodes. What is the config error?",
+ a:"A missing <code>startupTaints</code>. A node joins, a DaemonSet adds a taint Karpenter does not know about, Karpenter decides the pending pod still cannot schedule, and provisions <em>another</em> node. Any CNI, security agent, or node-init DaemonSet that taints on boot — Cilium's <code>node.cilium.io/agent-not-ready</code> is the canonical case — must be declared. This bug looks like a cost incident, not a config error."},
+
+{id:"kp-alias-latest", kind:"gotcha", d1:false, guide:"06-karpenter", guideNum:6, topic:"Drift", tags:["autoscaling","upgrades","kubernetes"],
+ q:"What does <code>alias: al2023@latest</code> do the moment AWS publishes a new AMI?",
+ a:"Drifts <strong>every node in the pool</strong> and rolls your fleet, without you touching anything. Drift on <code>amiSelectorTerms</code> is <em>resolved</em>, not hashed, and <code>AMI_REFRESH_INTERVAL</code> defaults to <strong>1 minute</strong>. Pin the alias to a version and bump it as a deliberate, budgeted change — that is the correct primitive for cell node-image upgrades, but only if you drive it."},
+
+{id:"kp-no-drift-gate", kind:"gotcha", d1:false, guide:"06-karpenter", guideNum:6, topic:"Drift", tags:["autoscaling","kubernetes"],
+ q:"How do you turn drift off in Karpenter v1?",
+ a:"You cannot. The <code>Drift</code> feature gate was removed when drift went stable in v1. The only control is a <strong>disruption budget with <code>reasons: [Drifted]</code></strong>. Write that budget before you write your first NodeClass."},
+
+{id:"kp-pdb-and", kind:"gotcha", d1:false, guide:"06-karpenter", guideNum:6, topic:"Pod-level controls", tags:["autoscaling","kubernetes"],
+ q:"A pod matches three PDBs. How do they compose, and what does one bad PDB do?",
+ a:"They compose by <strong>AND</strong> — all of them must allow the disruption. A single blocking PDB can prevent an entire node from being voluntarily disrupted, so a team shipping <code>maxUnavailable: 0</code> &quot;temporarily&quot; can silently pin nodes for months. Audit the fleet for <code>maxUnavailable: 0</code> and <code>minAvailable: 100%</code>; they are almost always mistakes."},
+
+{id:"kp-deadlock", kind:"gotcha", d1:false, guide:"06-karpenter", guideNum:6, topic:"Termination", tags:["autoscaling","kubernetes"],
+ q:"<code>expireAfter</code> fires on a node holding a <code>do-not-disrupt</code> pod and no <code>terminationGracePeriod</code>. What happens?",
+ a:"A <strong>documented deadlock</strong>. Expiration starts a forceful drain, <code>do-not-disrupt</code> blocks eviction, and nothing resolves it — the docs describe partially drained nodes stuck in the cluster, driving up cost and requiring manual intervention. If you allow the annotation anywhere on your platform, mandate <code>terminationGracePeriod</code> on every NodePool and enforce it with policy."},
+
+{id:"kp-limits-eventual", kind:"gotcha", d1:false, guide:"06-karpenter", guideNum:6, topic:"Limits", tags:["autoscaling","capacity","quotas"],
+ q:"Is <code>spec.limits</code> a hard safety boundary against a runaway workload?",
+ a:"No. Karpenter provisioning is highly parallel, so <strong>limit checking is eventually consistent and can be overrun during rapid scale-outs</strong>. Treat limits as a guardrail and back them with cloud-account quotas. Also use string quantities (<code>cpu: &quot;1000&quot;</code>) — the API coerces CPU to a string and integers cause GitOps diff churn."},
+
+{id:"kp-nrh", kind:"gotcha", d1:false, guide:"06-karpenter", guideNum:6, topic:"Observability", tags:["autoscaling","observability","cost"],
+ q:"A NodePool launches instances that never register. Does it go <code>NotReady</code>?",
+ a:"No. <code>NodeRegistrationHealthy: False</code> is explicitly <strong>informational</strong> and does not make the NodePool NotReady, so it looks green in a naive dashboard while burning money. Alert on that condition directly."},
+
+
+{id:"kp-own-node", kind:"gotcha", d1:false, guide:"06-karpenter", guideNum:6, topic:"Bootstrap", tags:["autoscaling","kubernetes","bootstrap"],
+ q:"Where does Karpenter itself run?",
+ a:"Not on a node it manages. Pin it with <code>karpenter.sh/nodepool DoesNotExist</code> node affinity plus hostname anti-affinity, on a bootstrap node group or Fargate. <strong>That bootstrap group becomes a second, un-Karpenter-managed lifecycle you must upgrade per cell.</strong> Design for it explicitly rather than discovering it during a cell upgrade."},
+
+{id:"kp-no-gcp", kind:"gotcha", d1:false, guide:"06-karpenter", guideNum:6, topic:"Provider maturity", tags:["autoscaling","multicloud"],
+ q:"What is Karpenter's provider maturity across AWS, Azure, and GCP?",
+ a:"AWS is mature and LTS-tagged on a <code>v1</code> NodeClass. Azure is production but on a <strong><code>v1beta1</code></strong> NodeClass and effectively AKS-only — so any code assuming one NodeClass API version across clouds is wrong. <strong>GCP has no official provider at all</strong>; the only one is third-party at <code>v1alpha1</code> and needs an existing GKE Standard node pool. GKE ComputeClasses are the native answer. Do not write &quot;Karpenter everywhere&quot; in a design doc without saying this."},
+
+
+{id:"kp-concept-buy", kind:"concept", d1:false, guide:"06-karpenter", guideNum:6, topic:"What Karpenter is", tags:["autoscaling","kubernetes"],
+ q:"How is Karpenter's question different from Cluster Autoscaler's?",
+ a:"Cluster Autoscaler asks &quot;which of my predefined node groups, if made bigger, would let this pod schedule?&quot; Karpenter asks <strong>&quot;what is the cheapest single machine in the cloud's entire catalogue that satisfies the union of these pending pods' requirements?&quot;</strong> It runs a real scheduling simulation over the pending set, bin-packs, and launches an instance shaped to fit. There is no group and no desired count. It is a scheduler that can buy hardware."},
+
+{id:"kp-concept-modes", kind:"concept", d1:true, guide:"06-karpenter", guideNum:6, topic:"Disruption modes", tags:["autoscaling","kubernetes"],
+ q:"Name Karpenter's two disruption modes and which methods fall in each.",
+ a:"<strong>Graceful</strong> — consolidation and drift: pre-spin a replacement, wait for Ready, then drain; rate-limited by NodePool disruption budgets. <strong>Forceful</strong> — expiration, interruption, node repair: drain immediately, no pre-spin, <em>cannot</em> be rate-limited by budgets. Almost every &quot;Karpenter took my cell down&quot; incident is a forceful method meeting a workload that assumed graceful."},
+
+/* ---------------- 07 Kyverno ---------------- */
+{id:"kv-clusterpolicy", kind:"gotcha", d1:false, guide:"07-kyverno", guideNum:7, topic:"API migration", tags:["policy","kubernetes","upgrades"],
+ q:"You write a new guardrail as a <code>kyverno.io/v1</code> <code>ClusterPolicy</code>. What have you just created?",
+ a:"Technical debt with a known due date. <code>ClusterPolicy</code>, <code>Policy</code>, <code>CleanupPolicy</code>, and the legacy <code>PolicyException</code> are <strong>deprecated in v1.19 and removed in v1.20</strong>, on a ~3-month minor cadence. Write CEL. And note <code>kyverno migrate</code> migrates CRD <em>stored versions</em>, not your policies — the conversion is manual, and <code>validate.podSecurity</code> has no CEL equivalent at all."},
+
+{id:"kv-wildcard", kind:"gotcha", d1:false, guide:"07-kyverno", guideNum:7, topic:"Webhook scope", tags:["policy","kubernetes","capacity"],
+ q:"What does one policy with <code>resources: [&quot;*&quot;]</code> do to a large cluster?",
+ a:"Turns Kyverno into a <strong>whole-cluster proxy</strong> — the docs say a single simple policy written that way will have significant impact. Ban wildcard <code>resources</code> and <code>apiGroups</code> in review, and add a <code>kyverno test</code> fixture asserting your own policy set does not produce a wildcard webhook rule."},
+
+{id:"kv-fail-closed", kind:"gotcha", d1:false, guide:"07-kyverno", guideNum:7, topic:"Availability", tags:["policy","kubernetes","bootstrap"],
+ q:"Kyverno is unreachable during a cell bootstrap. What happens?",
+ a:"By default, matching API requests are <strong>blocked</strong> — Kyverno is fail-closed, deliberately. Choose <code>failurePolicy</code> <em>per policy</em>, not globally: anything that could block cell bootstrap should be <code>Ignore</code>, with the invariant backed by a background scan and an alert. &quot;Can a cell bootstrap if Kyverno is down?&quot; needs a written answer."},
+
+{id:"kv-orphan", kind:"gotcha", d1:false, guide:"07-kyverno", guideNum:7, topic:"Generating policies", tags:["policy","kubernetes","teardown"],
+ q:"You delete a <code>GeneratingPolicy</code> that has sync enabled. What goes with it?",
+ a:"<strong>Every resource it ever generated, fleet-wide</strong> — <code>orphanDownstreamOnPolicyDelete</code> defaults to <code>false</code>. Set it to <code>true</code> on every generating policy unless you have explicitly reasoned otherwise."},
+
+{id:"kv-generate-async", kind:"gotcha", d1:false, guide:"07-kyverno", guideNum:7, topic:"Generating policies", tags:["policy","kubernetes","security"],
+ q:"A GeneratingPolicy creates a default-deny NetworkPolicy in every new namespace. Where is the hole?",
+ a:"Generation runs <strong>outside admission and is asynchronous</strong>, so the namespace exists before its NetworkPolicy does. If security posture depends on that object, pair the GeneratingPolicy with a <strong>ValidatingPolicy that rejects workloads in namespaces lacking it</strong>."},
+
+{id:"kv-mutate-rbac", kind:"gotcha", d1:false, guide:"07-kyverno", guideNum:7, topic:"RBAC", tags:["policy","kubernetes","identity"],
+ q:"Why does a mutate-existing policy silently do nothing?",
+ a:"Missing RBAC. Those mutations happen against live resources, not during an AdmissionReview, so Kyverno needs permissions it does not have by default — you must grant the aggregated ClusterRole. The same applies to <code>DeletingPolicy</code> and the cleanup controller."},
+
+
+{id:"kv-scaling", kind:"number", d1:false, guide:"07-kyverno", guideNum:7, topic:"Scaling", tags:["policy","kubernetes","capacity"],
+ q:"Which Kyverno controllers scale horizontally, and what is the HA minimum?",
+ a:"<strong>Only the admission controller.</strong> Reports and background controllers are leader-elected, so extra replicas buy availability, not throughput — slow generate rules are fixed with <code>--genWorkers</code> and CPU. Minimum for admission HA is <strong>3</strong> replicas."},
+
+
+{id:"kv-psa", kind:"gotcha", d1:false, guide:"07-kyverno", guideNum:7, topic:"Interoperability", tags:["policy","kubernetes","observability"],
+ q:"You run Pod Security Admission in enforce mode alongside Kyverno. What is missing from your reports?",
+ a:"Everything PSA blocked. Pods rejected by PSA in enforce mode <strong>never produce an AdmissionReview</strong>, so Kyverno never sees them. Your reports have a blind spot exactly where PSA is strictest."},
+
+{id:"kv-result-error", kind:"gotcha", d1:false, guide:"07-kyverno", guideNum:7, topic:"Policy reports", tags:["policy","observability"],
+ q:"A PolicyReport entry says <code>result: error</code>. Is that a failing resource?",
+ a:"No — it means a <strong>broken policy</strong>. It signals variable substitution failure outside preconditions. Alert on <code>error</code> separately from <code>fail</code>, and treat it as a page-worthy platform bug rather than a workload violation."},
+
+{id:"kv-support-window", kind:"number", d1:false, guide:"07-kyverno", guideNum:7, topic:"Support windows", tags:["policy","upgrades"],
+ q:"How long is a Kyverno release supported, and how wide is its Kubernetes window?",
+ a:"<strong>Roughly 3 months</strong> — &quot;main + 1&quot; since v1.18. And the Kubernetes support window is narrow: v1.19 supports only <strong>v1.33-v1.35</strong>. Cell Kubernetes upgrades and Kyverno upgrades are coupled and must be sequenced together, exactly like Karpenter. Running <code>kyverno test</code> with the next version's CLI pinned is the cheapest dry-run available."},
+
+{id:"kv-concept-shape", kind:"concept", d1:true, guide:"07-kyverno", guideNum:7, topic:"What Kyverno is", tags:["policy","kubernetes"],
+ q:"What are the two halves of Kyverno, and why does the split explain its behaviour?",
+ a:"A pair of <strong>admission webhooks</strong> answering <code>AdmissionReview</code> synchronously, and a set of <strong>controllers acting outside admission</strong> — <code>generate</code>, <code>mutate-existing</code>, background scanning, cleanup — reconciling against the live cluster. That split explains why generate rules are eventually consistent, why the background controller needs extra RBAC, and why some things are enforced at the gate while others are only reported."},
+
+/* ---------------- 08 Terraform ---------------- */
+{id:"tf-foreach", kind:"gotcha", d1:false, guide:"08-terraform", guideNum:8, topic:"State and identity", tags:["terraform","teardown","state"],
+ q:"You remove a key from a <code>for_each</code> map. What is the plan?",
+ a:"A <strong>destroy</strong> — there is no &quot;unmanage&quot; default. The safe removal sequence is: add a <code>removed</code> block with <code>lifecycle { destroy = false }</code>, apply, <em>then</em> delete the config. Getting the order backwards is the most common way to accidentally delete a cell."},
+
+{id:"tf-prevent-destroy", kind:"gotcha", d1:false, guide:"08-terraform", guideNum:8, topic:"Guardrails", tags:["terraform","state","security"],
+ q:"Does <code>prevent_destroy</code> protect a resource from a PR that also deletes the lifecycle block?",
+ a:"No. Except for <code>create_before_destroy</code>, Terraform <strong>does not record lifecycle rules in state</strong>, so deleting the block and applying in the same change bypasses the guard silently. Real protection is IAM plus a plan-JSON policy that rejects deletes on tier-1 addresses."},
+
+{id:"tf-provider-unknown", kind:"gotcha", d1:true, guide:"08-terraform", guideNum:8, topic:"Provider configuration", tags:["terraform","kubernetes","bootstrap"],
+ q:"Why can you not create a Kubernetes cluster and manage its resources in one apply?",
+ a:"Because <strong>provider configuration cannot depend on unknown values</strong> — you may only reference values Terraform knows before it applies. No amount of <code>depends_on</code> fixes it. This one sentence dictates the entire shape of a cell pipeline: stop Terraform at the cluster boundary."},
+
+{id:"tf-kubernetes-manifest", kind:"gotcha", d1:false, guide:"08-terraform", guideNum:8, topic:"Kubernetes provider", tags:["terraform","kubernetes","teardown"],
+ q:"What does <code>kubernetes_manifest</code> require at <em>plan</em> time, and why is that fatal at teardown?",
+ a:"<strong>Cluster reachability</strong> — the resource requires API access during planning. A cell whose control plane is down or already deleted cannot even be planned, so disaster recovery and teardown turn into state surgery. Keep Kubernetes and Helm resources out of the cell's Terraform state."},
+
+{id:"tf-not-atomic", kind:"gotcha", d1:false, guide:"08-terraform", guideNum:8, topic:"Apply semantics", tags:["terraform","state","bootstrap"],
+ q:"Is <code>terraform apply</code> atomic?",
+ a:"No. State is written incrementally as each resource completes, so a killed apply leaves a <strong>partially created cell and a stale lock</strong>. Your orchestrator must treat &quot;resume from partial&quot; as a first-class case, not an exception."},
+
+{id:"tf-refresh", kind:"gotcha", d1:false, guide:"08-terraform", guideNum:8, topic:"Refresh", tags:["terraform","state","security"],
+ q:"How can <code>terraform refresh</code> delete everything?",
+ a:"With misconfigured provider credentials, Terraform can be misled into thinking every managed object has been deleted, and <strong>removes all tracked objects with no confirmation prompt</strong>. Use <code>plan -refresh-only</code> and review it; never <code>apply -refresh-only -auto-approve</code> in automation."},
+
+{id:"tf-lockfile", kind:"gotcha", d1:false, guide:"08-terraform", guideNum:8, topic:"Version pinning", tags:["terraform","upgrades"],
+ q:"What does <code>.terraform.lock.hcl</code> lock, and what does it not?",
+ a:"Providers only — <strong>it does not lock module versions</strong>. A <code>ref=main</code> module source means your 300 cells are not running the same code. Pin module sources to immutable tags. Related: the lock file is per-platform, so run <code>terraform providers lock -platform=linux_amd64 -platform=darwin_arm64</code> or CI breaks the first time a Mac user runs <code>init</code>."},
+
+{id:"tf-plan-secrets", kind:"gotcha", d1:false, guide:"08-terraform", guideNum:8, topic:"Sensitive artifacts", tags:["terraform","secrets","security"],
+ q:"How sensitive is a saved plan file?",
+ a:"As sensitive as state — HashiCorp says to treat saved plans as potentially-sensitive artifacts, and <strong>secrets appear in cleartext</strong>. CI artifact stores are usually more readable than state buckets. Encrypt them or use short retention."},
+
+{id:"tf-sensitive", kind:"gotcha", d1:false, guide:"08-terraform", guideNum:8, topic:"Sensitive values", tags:["terraform","secrets","state"],
+ q:"Does <code>sensitive = true</code> keep a value out of state?",
+ a:"<strong>No.</strong> Terraform still stores sensitive variables in state, and <code>terraform output -json</code> prints them in the clear. Use ephemeral resources (1.10) and write-only arguments (1.11), or OpenTofu state encryption."},
+
+{id:"tf-remote-state", kind:"gotcha", d1:false, guide:"08-terraform", guideNum:8, topic:"Cross-stack reads", tags:["terraform","state","security"],
+ q:"What does <code>terraform_remote_state</code> actually grant the reader?",
+ a:"<strong>Full state read</strong>, not just the outputs — anyone with enough access to read root module outputs also has access to the entire state snapshot by direct network request. Publish values to a parameter store instead."},
+
+
+
+{id:"tf-concept-symbol", kind:"concept", d1:true, guide:"08-terraform", guideNum:8, topic:"What Terraform is", tags:["terraform","state"],
+ q:"Describe Terraform as a compiler. What is the state file in that picture?",
+ a:"It is a <strong>graph compiler with a persistent symbol table</strong>. Config is not a script: Terraform parses every <code>.tf</code> file, builds a DAG from references, and walks it — file order is meaningless. The state file is the symbol table, mapping configuration address to real-world object ID. Everything hard about Terraform is a consequence of that table being persistent, shared, and mutable. State is the source of truth for <em>identity</em>, not for reality."},
+
+{id:"tf-concept-blast", kind:"concept", d1:false, guide:"08-terraform", guideNum:8, topic:"State design", tags:["terraform","state","capacity"],
+ q:"What is the blast radius of a bad Terraform module change?",
+ a:"<strong>Exactly one state file.</strong> One state per cell means a bad change breaks one cell; one state for all cells means a fleet-wide outage and a 40-minute plan. Choose deliberately, and choose <em>before</em> you have 300 cells — splitting state later is manual surgery."},
+
+{id:"tf-concept-rollout", kind:"concept", d1:true, guide:"08-terraform", guideNum:8, topic:"Rollout boundary", tags:["terraform","temporal","upgrades"],
+ q:"Where does &quot;upgrade 5 cells, watch, then 50&quot; belong?",
+ a:"In your orchestrator, never in Terraform. Terraform is a <strong>convergence tool with no notion of rollout</strong> — no canary, no wave, no progressive delivery, no health check that reverts. Building waves out of <code>count</code> and <code>-target</code> produces something unreadable and unresumable. Recognizing that boundary early is what keeps the rollout logic in a workflow engine where it belongs."},
+
+/* ---------------- 09 Helm ---------------- */
+{id:"helm-lookup", kind:"gotcha", d1:false, guide:"09-helm", guideNum:9, topic:"Template-only mode", tags:["helm","gitops"],
+ q:"What does <code>lookup</code> return under <code>helm template</code>?",
+ a:"<strong>Always an empty response</strong> — so your chart silently takes the wrong branch. The classic victim is <code>lookup</code>-then-<code>randAlphaNum</code> secret generation, which regenerates the secret on every render and restarts every pod on every sync. Grep every inherited chart for <code>lookup</code>."},
+
+{id:"helm-capabilities", kind:"gotcha", d1:false, guide:"09-helm", guideNum:9, topic:"Template-only mode", tags:["helm","gitops"],
+ q:"Your chart guards a ServiceMonitor on <code>.Capabilities.APIVersions</code>. What renders?",
+ a:"Nothing — <code>Capabilities.APIVersions</code> is empty without <code>--api-versions</code>, so the conditional resource silently vanishes. No error, no warning. Enumerate the target cluster's API surface in your render command and pin it with a unit test."},
+
+{id:"helm-hooks", kind:"gotcha", d1:false, guide:"09-helm", guideNum:9, topic:"Hooks", tags:["helm","gitops"],
+ q:"What happens to a chart's <code>pre-install</code> migration Job under <code>helm template</code> plus GitOps?",
+ a:"It is <strong>rendered but never run as a hook</strong>, then applied as an ordinary resource with no ordering guarantee — and possibly re-run on every sync. Either strip hooks (<code>--no-hooks</code>) and re-express them as Argo sync waves, or map them deliberately. And note: if you define <em>any</em> Argo CD hook, <strong>all</strong> Helm hooks in the chart are ignored."},
+
+{id:"helm-crds", kind:"gotcha", d1:false, guide:"09-helm", guideNum:9, topic:"CRDs", tags:["helm","gitops","bootstrap"],
+ q:"Why did the CRDs never reach the cluster?",
+ a:"<code>crds/</code> is <strong>not rendered unless you pass <code>--include-crds</code></strong>, and everything depending on them then fails to apply. Bake the flag into your Makefile, not into someone's memory."},
+
+
+
+{id:"helm-prune", kind:"gotcha", d1:false, guide:"09-helm", guideNum:9, topic:"Inventory", tags:["helm","gitops","teardown"],
+ q:"You delete a template from a chart rendered with <code>helm template</code>. What removes the object from the cluster?",
+ a:"<strong>Nothing.</strong> Helm's release record was also its inventory; without it, nothing knows what to delete, and the object stays forever. Argo CD's tracking annotation and Flux's <code>.status.inventory</code> are the two production answers — <code>kubectl apply --prune</code> is still alpha, and ApplySet has been alpha since Kubernetes 1.27 with beta TBD. Do not plan around it."},
+
+{id:"helm-field-manager", kind:"gotcha", d1:false, guide:"09-helm", guideNum:9, topic:"Server-side apply", tags:["helm","gitops","kubernetes"],
+ q:"You rename your <code>--field-manager</code>. What did you just do?",
+ a:"<strong>Orphaned every field it owned.</strong> Server-side apply tracks ownership by manager <em>name</em>. Pick one, put it in a constant, and treat renaming it as a migration with an explicit <code>--force-conflicts</code> pass."},
+
+{id:"helm-annotation-limit", kind:"number", d1:false, guide:"09-helm", guideNum:9, topic:"Apply limits", tags:["helm","kubernetes","limits"],
+ q:"Why does client-side apply fail on a large CRD?",
+ a:"The <code>last-applied-configuration</code> annotation hits the <strong>262,144-byte</strong> limit. Server-side apply does not use that annotation at all, which is why Argo CD documents SSA as the fix."},
+
+{id:"helm-4-latch", kind:"gotcha", d1:false, guide:"09-helm", guideNum:9, topic:"Helm 4 migration", tags:["helm","upgrades"],
+ q:"You upgrade the Helm binary from 3 to 4. Which releases move to server-side apply?",
+ a:"Only <strong>new installs</strong>. Helm 4 latches the apply method per release, so anything created by Helm 3 stays on client-side apply unless you pass <code>--server-side</code>. Mixed estates run two conflict models side by side. Also: <code>--dry-run=client</code> does not simulate SSA correctly — use <code>--dry-run=server</code>."},
+
+{id:"helm-3-eol", kind:"number", d1:false, guide:"09-helm", guideNum:9, topic:"Support windows", tags:["helm","upgrades"],
+ q:"When does Helm 3 support end, and what should CI do about it now?",
+ a:"Final limited feature release <strong>2026-09-09</strong>, security fixes through <strong>2027-02-10</strong>. Pin an explicit Helm 4 binary version in CI now, because &quot;whatever the runner image ships&quot; will change under you. Note the ecosystem lag: <code>chart-testing</code> does not support Helm 4, <code>helm registry login</code> now takes a domain rather than a URL, and <code>--post-renderer</code> takes a plugin name rather than an executable path."},
+
+{id:"helm-concept-two", kind:"concept", d1:true, guide:"09-helm", guideNum:9, topic:"What Helm is", tags:["helm","gitops"],
+ q:"What are the two products inside the Helm binary, and which one does a rendered-manifest workflow use?",
+ a:"A <strong>templating engine</strong> (Go templates + Sprig + values merging, turning a directory into a manifest stream) and a <strong>release manager</strong> (applies that stream, records it in a Secret, and can diff, upgrade, roll back, delete). A rendered-manifest workflow uses only the first — while almost every Helm tutorial is about the second. <code>helm template</code> is a pure function: no cluster, no record, no decisions."},
+
+{id:"helm-concept-ownership", kind:"concept", d1:false, guide:"09-helm", guideNum:9, topic:"What replaces release state", tags:["helm","gitops","kubernetes"],
+ q:"In templating-only mode, what replaces Helm's release record as the conflict model?",
+ a:"<strong>Server-side apply field ownership.</strong> The question &quot;who owns this field?&quot; moves out of Helm's release record and into the API server's <code>managedFields</code>. Where multiple actors touch the same objects — your pipeline, a controller, an operator, a human with <code>kubectl edit</code> — SSA field management <em>is</em> your conflict model. The inventory question relocates too, to Argo CD's tracking annotation or Flux's inventory."},
+
+/* ---------------- 10 Vault ---------------- */
+{id:"vt-audit", kind:"gotcha", d1:false, guide:"10-vault", guideNum:10, topic:"Audit devices", tags:["secrets","security","bootstrap"],
+ q:"Every enabled Vault audit device becomes unwritable. What does Vault do?",
+ a:"It <strong>stops serving</strong> — Vault refuses to service the corresponding API request, and when all enabled audit devices are unavailable, Vault is in effect unavailable. This is documented behaviour, not a bug. Always run at least two devices with independent failure modes. Related: logrotate with <code>copytruncate</code> breaks the file audit device, because Vault holds the descriptor and records go into a hole."},
+
+{id:"vt-768h", kind:"number", d1:false, guide:"10-vault", guideNum:10, topic:"Lease defaults", tags:["secrets","capacity","limits"],
+ q:"What do <code>default_lease_ttl</code> and <code>max_lease_ttl</code> default to?",
+ a:"<strong>768 hours — 32 days.</strong> Leave them alone and the lease table grows for a month before anything expires, and the lease table is what dominates Vault's write traffic. Set them to hours at the server level and tune upward per mount."},
+
+
+{id:"vt-kv2-path", kind:"gotcha", d1:false, guide:"10-vault", guideNum:10, topic:"KV v2 policies", tags:["secrets","identity"],
+ q:"<code>vault kv get secret/foo</code> works but your policy on <code>path &quot;secret/foo&quot;</code> denies. Why?",
+ a:"KV v2 policy paths need the <strong><code>data/</code> segment</strong> that the CLI hides: <code>path &quot;secret/data/foo&quot;</code>. Metadata operations need <code>secret/metadata/foo</code> granted separately."},
+
+
+{id:"vt-sa-token-1yr", kind:"number", d1:false, guide:"10-vault", guideNum:10, topic:"Kubernetes tokens", tags:["secrets","identity","kubernetes","security"],
+ q:"How long do admission-injected Kubernetes service account tokens actually live?",
+ a:"<strong>One year by default</strong> — the kube-apiserver extends them. You think you have short-lived tokens; you do not. Set <code>--service-account-extend-token-expiration=false</code>, or mount your own <code>serviceAccountToken</code> projected volume with an explicit expiry."},
+
+{id:"vt-autopilot", kind:"gotcha", d1:false, guide:"10-vault", guideNum:10, topic:"Raft quorum", tags:["secrets","capacity"],
+ q:"An autoscaler replaces a Vault node. What silently happens to your quorum math?",
+ a:"The replaced node stays counted as a <strong>phantom voter</strong>, because Autopilot dead-server cleanup is <strong>off by default</strong> — a &quot;3-node&quot; cluster becomes a 4-peer cluster that still tolerates only one failure. Enable it explicitly: <code>vault operator raft autopilot set-config -cleanup-dead-servers=true -min-quorum=3</code>. <code>min-quorum</code> has no default and cleanup stays inert without it."},
+
+{id:"vt-auto-unseal", kind:"gotcha", d1:false, guide:"10-vault", guideNum:10, topic:"Seal", tags:["secrets","bootstrap","multicloud"],
+ q:"Why does auto-unseal always fail &quot;right after the rolling restart&quot;?",
+ a:"Auto-unseal makes your cloud KMS a <strong>hard startup dependency, including its network path</strong> — no VPC endpoint / Private Service Connect / Private Link means no unseal. A running Vault survives a KMS outage because the root key is in memory; a restarted one does not. Also protect the key: AWS KMS gives a 7-30 day pending-deletion window, and a key policy should deny <code>kms:ScheduleKeyDeletion</code> to everyone but a break-glass principal."},
+
+{id:"vt-recovery-keys", kind:"gotcha", d1:false, guide:"10-vault", guideNum:10, topic:"Seal", tags:["secrets","security"],
+ q:"With auto-unseal, what are the keys from <code>vault operator init</code> good for?",
+ a:"They are <strong>recovery keys, not unseal keys</strong> — they cannot unseal Vault. They authorize <code>generate-root</code>, rekey, and seal migration. Losing them is not fatal but is permanent: you can never mint another root token on that cluster. Related: <code>rotate</code> changes the encryption key (online, cheap, routine); <code>rekey</code> changes the unseal/recovery shares (a ceremony needing the current threshold)."},
+
+{id:"vt-dynamic-db", kind:"gotcha", d1:false, guide:"10-vault", guideNum:10, topic:"Dynamic credentials", tags:["secrets","persistence","capacity"],
+ q:"What does a 5-minute dynamic database credential TTL across hundreds of pods cost the database?",
+ a:"Real users. Vault issues <strong>real <code>CREATE ROLE</code>/<code>DROP ROLE</code></strong> churn, and the live user count is roughly <code>pods × (max_ttl / ttl)</code>. Watch <code>max_connections</code> and role-table bloat. Worse: <code>DROP ROLE</code> fails if the role owns objects and the lease becomes <strong>irrevocable</strong> — watch <code>vault.expire.num_irrevocable_leases</code> and write <code>revocation_statements</code> that reassign and drop owned objects first."},
+
+{id:"vt-injector-gitops", kind:"gotcha", d1:false, guide:"10-vault", guideNum:10, topic:"GitOps interaction", tags:["secrets","gitops"],
+ q:"Why does the Vault Agent Injector fight your GitOps tool?",
+ a:"It <strong>mutates pods at admission</strong>, so the rendered manifest never matches the running pod and Argo CD or Flux shows permanent drift or needs explicit ignore rules. For rendered-manifest workflows prefer the Vault Secrets Operator or External Secrets Operator."},
+
+{id:"vt-eol", kind:"gotcha", d1:false, guide:"10-vault", guideNum:10, topic:"Support window", tags:["secrets","upgrades"],
+ q:"How long is a Vault Community release supported?",
+ a:"<strong>Exactly one minor — the latest.</strong> A version goes EOL the day its successor ships; the two-release overlap applies only to Enterprise LTS. A fleet of per-cell Vaults on different versions silently accumulates unsupported clusters unless upgrade rollout is part of the cell lifecycle rather than a side project. Note also that Vault has shipped under BUSL 1.1 since August 2023, and the competing-hosted-service clause deserves an actual legal read at a company that sells hosted Temporal."},
+
+{id:"vt-tf-state", kind:"gotcha", d1:false, guide:"10-vault", guideNum:10, topic:"Terraform integration", tags:["secrets","terraform","state","security"],
+ q:"What does the Terraform Vault provider do with every secret it touches?",
+ a:"Writes it into <strong>state in plaintext, forever, including in old state versions</strong>. Use the provider for configuration only. If you must read a secret, encrypt state with a CMK, lock down the backend, and apply a lifecycle policy to historical versions. Related teardown ordering: <code>terraform destroy</code> on a Vault mount revokes leases <em>asynchronously</em>, so revoke, then delete the mount, then delete the database."},
+
+{id:"vt-concept-barrier", kind:"concept", d1:true, guide:"10-vault", guideNum:10, topic:"What Vault is", tags:["secrets","security"],
+ q:"Describe Vault in one sentence, then name its four building blocks.",
+ a:"<strong>A small encrypted key-value store with an authorization layer and a plugin system bolted on.</strong> The <strong>barrier</strong> is the AES-256-GCM-encrypted store and the entire security boundary — the storage backend sees only ciphertext and is explicitly untrusted. <strong>Tokens + policies</strong> are the authz layer: just paths and capabilities, no roles-containing-roles, which is why multi-tenancy is a path-namespacing exercise. <strong>Mounts</strong> are plugins with private storage prefixes — how you get per-cell isolation. <strong>Leases</strong> cover anything Vault <em>generates</em>."},
+
+{id:"vt-concept-props", kind:"concept", d1:false, guide:"10-vault", guideNum:10, topic:"Operational properties", tags:["secrets","capacity","bootstrap"],
+ q:"Name the four Vault properties to hold in your head simultaneously.",
+ a:"<strong>1.</strong> Stateful, with small but hot state — the lease table and token store dominate writes. <strong>2.</strong> <em>Single-writer</em>: one active node handles all writes, standbys forward, so adding nodes does not add write throughput. <strong>3.</strong> A <em>bootstrap dependency</em>: anything Vault needs to start cannot itself need Vault to start. <strong>4.</strong> It <em>fails closed</em> — sealed, quorum-lost, or audit-wedged, it stops serving rather than degrading."},
+
+/* ---------------- 11 cert-manager and PKI ---------------- */
+{id:"pki-cn-san", kind:"gotcha", d1:false, guide:"11-cert-manager-and-pki", guideNum:11, topic:"Certificate content", tags:["pki","tls","go"],
+ q:"A certificate has a Common Name and no SAN. Who accepts it?",
+ a:"Essentially nobody. Go disabled Common Name fallback in <strong>Go 1.15</strong> and removed the <code>GODEBUG=x509ignoreCN=0</code> escape hatch entirely in <strong>Go 1.17</strong>, so such a certificate is invalid to Kubernetes, Temporal, Envoy, and every cloud-native component. Always set <code>dnsNames</code> — and note the error will complain about the hostname, not about the missing SAN."},
+
+{id:"pki-cab-200", kind:"number", d1:true, guide:"11-cert-manager-and-pki", guideNum:11, topic:"Public certificate lifetimes", tags:["pki","tls","upgrades"],
+ q:"What is the current CA/Browser Forum maximum lifetime for public TLS certificates, and what is the schedule?",
+ a:"<strong>200 days</strong>, in force since <strong>2026-03-15</strong>, dropping to <strong>100 days on 2027-03-15</strong> and <strong>47 days on 2029-03-15</strong>, with domain validation reuse falling to 10 days. Anything with a manual renewal step for public certificates is already on borrowed time. (<a href='https://cabforum.org/2025/04/11/ballot-sc081v3-introduce-schedule-of-reducing-validity-and-data-reuse-periods/'>Ballot SC-081v3</a>)"},
+
+{id:"pki-bundle-secret", kind:"gotcha", d1:false, guide:"11-cert-manager-and-pki", guideNum:11, topic:"Trust distribution", tags:["pki","tls"],
+ q:"Your trust-manager <code>Bundle</code> points straight at a cert-manager Secret. What happens at the next root rotation?",
+ a:"Every existing leaf is <strong>instantly distrusted</strong> — the bundle follows the Secret to the new root, and clients reject certificates issued by the old one. Copy roots into a dedicated ConfigMap you control and point the Bundle at that. The trust-manager docs warn about this explicitly."},
+
+{id:"pki-intermediate", kind:"gotcha", d1:false, guide:"11-cert-manager-and-pki", guideNum:11, topic:"Trust stores", tags:["pki","tls"],
+ q:"A chain error appears. Why is adding the intermediate to the trust store the wrong fix?",
+ a:"It makes the intermediate a <strong>de facto root that cannot be rotated</strong> without updating every trust store first — destroying the entire reason intermediates exist. Fix the server's chain instead."},
+
+{id:"pki-subpath", kind:"gotcha", d1:false, guide:"11-cert-manager-and-pki", guideNum:11, topic:"Certificate delivery", tags:["pki","tls","kubernetes"],
+ q:"A cert renews, the Secret updates, and the pod keeps serving the expired one. What is the mount?",
+ a:"A <code>subPath</code> mount. <strong>Secrets mounted with <code>subPath</code> are never updated by the kubelet</strong> — the file on disk stays frozen until the pod restarts. Mount the whole volume."},
+
+{id:"pki-reload", kind:"gotcha", d1:false, guide:"11-cert-manager-and-pki", guideNum:11, topic:"Certificate delivery", tags:["pki","tls","observability"],
+ q:"Where does cert-manager's job end, and what should you monitor as a result?",
+ a:"It ends when it <strong>writes the Secret</strong> — nothing reloads your application. The observable symptom is a Secret with a future <code>notAfter</code> and a wire certificate with a past one. <strong>Monitor the wire, not the Secret</strong>, and implement a <code>GetCertificate</code> callback or use Reloader."},
+
+{id:"pki-clientauth", kind:"gotcha", d1:false, guide:"11-cert-manager-and-pki", guideNum:11, topic:"Extended key usage", tags:["pki","tls","grpc"],
+ q:"Half your service graph works and half does not after enabling mTLS. What is missing from the EKU?",
+ a:"<code>clientAuth</code>. Without it the <em>server</em> half of every handshake works and the <em>client</em> half is rejected, so exactly half the graph looks healthy — a maximally confusing failure. Always set both <code>server auth</code> and <code>client auth</code> on mesh certificates."},
+
+{id:"pki-le-limits", kind:"number", d1:false, guide:"11-cert-manager-and-pki", guideNum:11, topic:"ACME rate limits", tags:["pki","tls","quotas","limits"],
+ q:"What are Let's Encrypt's two rate limits that a cell fleet trips first?",
+ a:"<strong>50 certificates per registered domain per 7 days</strong>, and <strong>5 per exact set of identifiers per 7 days</strong>. Provisioning cells under one apex domain hits the first fast; a CrashLooping test setup hits the second immediately. It also <strong>pauses</strong> an account for an identifier after <strong>1,152</strong> consecutive authorization failures. ARI-coordinated renewals are exempt from all rate limits; use staging for anything experimental."},
+
+{id:"pki-delete-asym", kind:"gotcha", d1:false, guide:"11-cert-manager-and-pki", guideNum:11, topic:"Certificate lifecycle", tags:["pki","tls","teardown"],
+ q:"What is the asymmetry between deleting a <code>Certificate</code> and deleting its Secret?",
+ a:"Deleting the <strong>Secret</strong> triggers immediate reissuance; deleting the <strong>Certificate</strong> does <em>not</em> delete the Secret (unless <code>enableCertificateOwnerRef</code> is set). So a &quot;cleanup&quot; script that deletes Secrets causes a reissuance storm and can hit rate limits, while deleting Certificates leaves orphaned Secrets that nothing renews. Also: a manually created Secret at a Certificate's <code>secretName</code> will be overwritten — cert-manager takes ownership."},
+
+{id:"pki-crd-upgrade", kind:"gotcha", d1:false, guide:"11-cert-manager-and-pki", guideNum:11, topic:"Upgrades", tags:["pki","upgrades","helm"],
+ q:"How do cert-manager CRDs get upgraded, and can you skip a minor?",
+ a:"CRDs are <strong>not</strong> upgraded by <code>helm upgrade</code> unless <code>crds.enabled=true</code> was used at install; if you applied them separately you must upgrade them separately. <strong>Skipping a minor is unsupported</strong> — 1.19 to 1.21 must go through 1.20. Also check the Kubernetes window: cert-manager 1.21 supports only Kubernetes 1.33-1.36."},
+
+{id:"pki-webhook", kind:"gotcha", d1:false, guide:"11-cert-manager-and-pki", guideNum:11, topic:"Availability", tags:["pki","kubernetes","bootstrap"],
+ q:"cert-manager's webhook becomes unreachable in a cell. What stops?",
+ a:"Every <code>kubectl apply</code> of a cert-manager resource — it is a <strong>cluster-wide availability dependency</strong>, and a badly scoped <code>namespaceSelector</code> can affect unrelated resources too. Never let cainjector and the webhook be co-scheduled on a single node in a cell that matters; set PDBs and topology spread."},
+
+{id:"pki-distroless", kind:"gotcha", d1:false, guide:"11-cert-manager-and-pki", guideNum:11, topic:"Container trust stores", tags:["pki","tls","go","bootstrap"],
+ q:"A Go binary in <code>gcr.io/distroless/static</code> fails every outbound TLS call with an opaque error. Why?",
+ a:"There is <strong>no system trust store</strong> — <code>/etc/ssl/certs</code> does not exist in distroless and scratch images. Use the <code>base</code> variant, or mount a trust bundle explicitly. Related: trust-manager's default CA package is a container image you must keep updated, or you keep trusting distrusted roots."},
+
+{id:"pki-inventory", kind:"gotcha", d1:false, guide:"11-cert-manager-and-pki", guideNum:11, topic:"Expiry outages", tags:["pki","tls","observability"],
+ q:"Why do expired-certificate outages keep happening to organizations with mature ops functions?",
+ a:"Because <strong>the certificate that expires is always the one outside the inventory</strong>. Microsoft Teams: ~3 hours down in February 2020 on an expired auth certificate. Spotify: ~1 hour in August 2020 on an expired cert on an <em>internal, non-customer-facing</em> service monitoring did not cover. Ericsson's expired certificate took O2's UK 4G network down for nearly a day in December 2018, affecting around 32 million subscribers. <strong>Build the inventory, and probe the wire.</strong>"},
+
+{id:"pki-concept-three", kind:"concept", d1:true, guide:"11-cert-manager-and-pki", guideNum:11, topic:"The three PKI problems", tags:["pki","tls"],
+ q:"What are the three separate problems inside &quot;PKI&quot;, and what is the one-way rule?",
+ a:"<strong>Issuance</strong> (a workload proves it deserves an identity and a CA signs), <strong>trust distribution</strong> (a workload learns which CAs to believe — the pipeline with no automation by default), and <strong>retirement</strong> (in practice: short lifetimes, because revocation does not work at scale). The governing asymmetry is that issuance is fast and reversible while trust distribution is slow and one-way. Hence: <strong>distribute trust before you use it; remove trust after you stop using it; never the other order.</strong>"},
+
+
+/* ---------------- 12 Cell lifecycle synthesis ---------------- */
+{id:"cell-ready", kind:"gotcha", d1:true, guide:"12-cell-lifecycle-synthesis", guideNum:12, topic:"Readiness", tags:["bootstrap","observability","capacity"],
+ q:"What is the only acceptable readiness gate for a new cell?",
+ a:"An <strong>end-to-end request through the real ingress with real credentials</strong>. A gate that checks pod status marks the cell ready before it can serve. Everything else is a proxy metric that will eventually lie to you."},
+
+{id:"cell-sleeps", kind:"gotcha", d1:false, guide:"12-cell-lifecycle-synthesis", guideNum:12, topic:"Provisioning discipline", tags:["bootstrap","temporal"],
+ q:"What is every <code>sleep 60</code> in a provisioning pipeline?",
+ a:"<strong>A bug with a timer on it.</strong> Too short on a slow day, wasted minutes on every other day. Poll a condition instead — for example <code>NodePool.status.conditions[Ready]</code>, not the clock."},
+
+{id:"cell-coupled-numbers", kind:"gotcha", d1:false, guide:"12-cell-lifecycle-synthesis", guideNum:12, topic:"Config coupling", tags:["bootstrap","networking","grpc"],
+ q:"Name the pairs of numbers that must agree but live in different files.",
+ a:"gRPC server <code>keepAliveEnforcementPolicy.minTime</code> vs client keepalive interval; keepalive interval vs LB idle timeout; proxy route timeout vs long-poll expiration; <code>MaxConnectionAge</code> vs <code>terminationGracePeriodSeconds</code>; pod CIDR size vs max-pods-per-node vs expected pod count. Nothing forces them to agree. <strong>Write CI assertions</strong> — a cheap, high-visibility first-month contribution."},
+
+{id:"cell-shared-dep", kind:"gotcha", d1:true, guide:"12-cell-lifecycle-synthesis", guideNum:12, topic:"Shared dependencies", tags:["capacity","bootstrap"],
+ q:"For each shared dependency across your fleet, what is the one question to answer?",
+ a:"<strong>Is it on the request path, or only on the control path?</strong> Shared registry, shared Vault, shared observability backend, shared DNS zone, shared CI runners — each is a correlated failure domain spanning every cell. Control-path-only is usually acceptable: the cell keeps serving, you just cannot change it. <strong>Request-path shared dependencies quietly convert a cellular architecture back into a monolith.</strong>"},
+
+{id:"cell-teardown", kind:"gotcha", d1:true, guide:"12-cell-lifecycle-synthesis", guideNum:12, topic:"Teardown", tags:["teardown","capacity","networking"],
+ q:"Why does teardown fail more often than creation, and what is the structural fix?",
+ a:"Because every team creates cells constantly and deletes them rarely, so teardown is the less-tested path. Fix it structurally: <strong>create and destroy a scratch cell on a schedule, in CI, on each cloud, and fail the build if the residue enumerator finds anything.</strong> The residue that bites hardest is leaked ENIs and IPs on AWS — the <em>next</em> cell into that VPC fails IPAM for reasons that have nothing to do with it. Sweep by tag; alarm on subnet free-IP percentage."},
+
+{id:"cell-canary", kind:"gotcha", d1:false, guide:"12-cell-lifecycle-synthesis", guideNum:12, topic:"Rollout design", tags:["upgrades","observability"],
+ q:"Which bug classes does a one-hour synthetic canary not catch?",
+ a:"<strong>Memory leaks and race conditions</strong> — the two failure modes Temporal names publicly for its ring rollouts. Neither is visible in a short synthetic run. <strong>Soak time is a feature, not a delay.</strong>"},
+
+{id:"cell-tf-boundary", kind:"gotcha", d1:false, guide:"12-cell-lifecycle-synthesis", guideNum:12, topic:"State boundaries", tags:["terraform","teardown","state"],
+ q:"Why must Terraform stop at the cluster boundary?",
+ a:"Because if Kubernetes or Helm resources live in the cell's Terraform state, <code>terraform destroy</code> needs a <strong>reachable</strong> cluster. If the control plane is already gone, the plan itself fails, and you end up doing state surgery in the middle of a teardown."},
+
+{id:"cell-trust-order", kind:"gotcha", d1:false, guide:"12-cell-lifecycle-synthesis", guideNum:12, topic:"Trust lifetimes", tags:["pki","tls","teardown"],
+ q:"Which half of the trust one-way rule do teams violate without noticing?",
+ a:"The second: <strong>remove trust after you stop using it</strong>. Violating it is subtler than violating the first half and produces the same outage a week later, when the last straggler reconnects. The mirror image: a torn-down cell whose leaves are still valid is a set of live credentials for infrastructure that no longer exists — short lifetimes make that self-correcting within a day."},
+
+{id:"cell-drain-control", kind:"gotcha", d1:false, guide:"12-cell-lifecycle-synthesis", guideNum:12, topic:"Routing and drain", tags:["capacity","teardown"],
+ q:"Two failures of a routing layer: what must it be able to say, and where must the drain control <em>not</em> live?",
+ a:"It must be able to say <strong>&quot;no cell in this region has room&quot;</strong> — capacity exhaustion has to be an explicit, monitored, user-visible state, or placement will pick a cell and fail during provisioning or overload it. And the <strong>drain control must not live inside the thing being drained</strong> — Slack's fourth design goal, and the one most likely to be violated by accident. Test it: can you drain a cell whose Kubernetes API server is unreachable?"},
+
+
+{id:"cell-concept-bill", kind:"concept", d1:true, guide:"12-cell-lifecycle-synthesis", guideNum:12, topic:"What a cell is", tags:["capacity","cost"],
+ q:"What is a cell, and what is the product your team actually ships?",
+ a:"A cell is <strong>a blast radius with a bill attached</strong> — AWS traces the idea to a ship's bulkhead, and puts it numerically: if a workload uses 10 cells to service 100 requests, a failure in one cell leaves 90% of requests unaffected. The cost is that you now operate N copies of everything and every operational task multiplies by N. So the product is not a cell — it is <strong>the automation that makes N cells cost about as much attention as one</strong>."},
+
+{id:"cell-concept-workflow", kind:"concept", d1:true, guide:"12-cell-lifecycle-synthesis", guideNum:12, topic:"Provisioning as a workflow", tags:["temporal","bootstrap"],
+ q:"Why is cell provisioning modelled as a workflow rather than a script?",
+ a:"Because it is a <strong>distributed transaction with no rollback</strong>. Temporal's own framing: control-plane tasks involve complex long-running processes with many interdependent steps, and each cell has an <strong>entity workflow</strong> managing its lifecycle from provisioning through upgrades. The engineering consequence is that every step must be an <strong>idempotent, retryable, individually-timed activity</strong> and the DAG must be deterministic and resumable from any point. That is what makes a half-failed cell recoverable instead of garbage."},
+
+{id:"cell-concept-level", kind:"concept", d1:true, guide:"12-cell-lifecycle-synthesis", guideNum:12, topic:"Level-triggered", tags:["bootstrap","gitops","kubernetes"],
+ q:"Reframe provisioning, upgrade, and teardown as one thing.",
+ a:"<strong>One convergence loop, three names.</strong> There is a desired state for cell <code>usw2-07</code>, an observed state, and something that converges the difference repeatedly, forever, tolerating interruption at any instant. Provisioning is the first pass. Upgrade is a change to desired state. Teardown is setting desired state to empty. Every tool in this library that works well works this way; every tool that works badly has an imperative script bolted on the side."},
+
+{id:"cell-concept-cycles", kind:"concept", d1:true, guide:"12-cell-lifecycle-synthesis", guideNum:12, topic:"Bootstrap ordering", tags:["bootstrap","autoscaling","pki","policy"],
+ q:"Name three genuine cycles in the cell bootstrap dependency graph.",
+ a:"You cannot install the autoscaler without a node; you cannot get a node without the autoscaler. You cannot issue a certificate without a CA; the CA needs a certificate. You cannot run the policy engine without a certificate; the certificate issuer must pass the policy engine. Each is a <strong>real cycle</strong> broken by a specific, deliberate, slightly ugly trick — and knowing those tricks exist and are <em>supposed</em> to be there is most of what separates someone who can debug a stuck cell from someone who cannot."},
+
+{id:"cell-concept-crosscell", kind:"concept", d1:true, guide:"12-cell-lifecycle-synthesis", guideNum:12, topic:"Cell independence", tags:["capacity","multicloud"],
+ q:"What does AWS say about dependencies between cells, and what is the discipline in practice?",
+ a:"Plainly: cells should have <strong>no dependency on each other at all</strong> — no cross-cell API calls, no shared databases or buckets, and even separate accounts are encouraged. In practice some sharing is unavoidable, so the discipline is to <strong>name each shared thing out loud</strong>, decide whether it is on the request path or only the control path, and make sure the cell keeps serving when the shared thing is down."},
+
+/* ---------------- 13 GitOps ---------------- */
+{id:"gd-prune-true", kind:"gotcha", d1:false, guide:"13-gitops-argocd-flux", guideNum:13, topic:"Argo CD sync options", tags:["gitops","teardown"],
+ q:"You set the sync option <code>Prune=true</code>. What gets pruned?",
+ a:"<strong>Nothing.</strong> Only <code>Prune=false</code> and <code>Prune=confirm</code> exist, so <code>Prune=true</code> parses and silently does nothing. Automated pruning is <code>spec.syncPolicy.automated.prune: true</code>."},
+
+{id:"gd-app-finalizer", kind:"gotcha", d1:false, guide:"13-gitops-argocd-flux", guideNum:13, topic:"Application deletion", tags:["gitops","teardown"],
+ q:"You delete an Argo CD Application that has no <code>resources-finalizer.argocd.argoproj.io</code>. What happens to its resources?",
+ a:"They are <strong>orphaned</strong> — left running with nothing managing them. ApplicationSet only adds that finalizer when <code>preserveResourcesOnDeletion</code> is <code>false</code>, and <code>--cascade=orphan</code> does not remove it from already-generated Applications."},
+
+{id:"gd-missingkey", kind:"gotcha", d1:false, guide:"13-gitops-argocd-flux", guideNum:13, topic:"ApplicationSet templating", tags:["gitops","capacity"],
+ q:"You typo a variable in an ApplicationSet Go template. What do you get?",
+ a:"<strong>N wrong Applications and no error anywhere</strong> — the variable renders as empty, because <code>goTemplateOptions: [&quot;missingkey=error&quot;]</code> is <em>not</em> the default (it is kept off for backwards compatibility). Turn it on in every ApplicationSet."},
+
+{id:"gd-sharding", kind:"number", d1:false, guide:"13-gitops-argocd-flux", guideNum:13, topic:"Argo CD scaling", tags:["gitops","capacity"],
+ q:"One cell's Applications are reconciling slowly. Do more controller replicas help?",
+ a:"No — <strong>Argo CD shards by cluster, not by Application</strong>, so every Application targeting one cluster lives on one shard. Tune <code>--status-processors</code> (default <strong>20</strong>) and <code>--operation-processors</code> (default <strong>10</strong>) instead. Note also that <code>legacy</code> is still the default sharding algorithm and both alternatives are experimental."},
+
+
+{id:"gd-flux-wait", kind:"gotcha", d1:false, guide:"13-gitops-argocd-flux", guideNum:13, topic:"Flux health", tags:["gitops","bootstrap"],
+ q:"A Flux Kustomization sets both <code>wait: true</code> and <code>.spec.healthChecks</code>. What runs?",
+ a:"Only <code>wait</code>. They are <strong>mutually exclusive, not additive</strong> — <code>wait: true</code> ignores <code>.spec.healthChecks</code>. Setting both and expecting the specific checks to run is a common misreading."},
+
+{id:"gd-flux-dependson", kind:"gotcha", d1:false, guide:"13-gitops-argocd-flux", guideNum:13, topic:"Flux ordering", tags:["gitops","bootstrap"],
+ q:"Flux <code>dependsOn</code> gates on <code>Ready=True</code>. What does Ready mean by default?",
+ a:"<strong>&quot;Applied&quot;, not &quot;healthy&quot;.</strong> The <em>dependency</em> must set <code>wait</code> or <code>healthChecks</code> for the gate to mean anything. This is exactly how a bootstrap chain appears to work in a lab and races in production."},
+
+{id:"gd-suspend", kind:"gotcha", d1:false, guide:"13-gitops-argocd-flux", guideNum:13, topic:"Incident response", tags:["gitops"],
+ q:"Mid-incident you apply <code>spec.suspend: true</code> in-cluster. How long does it last?",
+ a:"Until the next reconcile — <strong>the manually applied patch is overwritten by the declared state in Git</strong>. Your incident-time suspend evaporates unless you also change Git or suspend the parent."},
+
+{id:"gd-github-rate", kind:"number", d1:false, guide:"13-gitops-argocd-flux", guideNum:13, topic:"Fleet polling", tags:["gitops","capacity","quotas"],
+ q:"300 cells polling Git every 3 minutes. Do the arithmetic.",
+ a:"<strong>6,000 GitHub API requests per hour against a 5,000/hour authenticated limit.</strong> Webhooks plus a raised <code>timeout.reconciliation</code> are a scale requirement, not an optimization."},
+
+{id:"gd-oom-shard", kind:"gotcha", d1:false, guide:"13-gitops-argocd-flux", guideNum:13, topic:"Failure modes", tags:["gitops","observability"],
+ q:"An Argo CD controller shard gets OOM-killed. What takes over?",
+ a:"<strong>Nothing.</strong> A public load test found the shard got stuck, did not recover cleanly, and other controllers did not take over — leaving its Applications silently OutOfSync. Alert on <strong>per-shard reconcile staleness</strong>, not on pod restarts."},
+
+{id:"gd-secrets", kind:"gotcha", d1:false, guide:"13-gitops-argocd-flux", guideNum:13, topic:"Secrets in GitOps", tags:["gitops","secrets","security"],
+ q:"Two secret-handling facts that constrain a rendered-manifest workflow?",
+ a:"<strong>1.</strong> The rendered-manifest pattern is <em>incompatible</em> with SOPS and the Argo CD Vault Plugin — those secrets would be committed to git, so choosing rendered manifests is choosing a runtime secrets operator. <strong>2.</strong> Argo CD stores generated manifests <strong>in plaintext in Redis</strong>, which is why its own docs caution against generation-time secret injection: &quot;Redis is just a cache&quot; is true operationally and false to a security review."},
+
+{id:"gd-concept-inventory", kind:"concept", d1:true, guide:"13-gitops-argocd-flux", guideNum:13, topic:"Inventory", tags:["gitops","teardown","helm"],
+ q:"After you give up Helm's release record, who answers &quot;what did I put here last time?&quot;",
+ a:"The inventory question does not disappear, it <strong>relocates</strong>. Argo CD answers it with a <strong>per-object tracking annotation</strong>; Flux answers it with a <strong><code>.status.inventory</code> list</strong> on the Kustomization. These are genuinely different designs with different failure modes — picking one is picking a garbage-collection strategy."},
+
+{id:"gd-concept-fanout", kind:"concept", d1:false, guide:"13-gitops-argocd-flux", guideNum:13, topic:"Fan-out design", tags:["gitops","capacity"],
+ q:"At 300 cells, what is the interesting GitOps design decision, and how do the two tools answer it?",
+ a:"<strong>The unit of fan-out</strong>: what generates the N×M objects, where that generation runs, and the blast radius of getting it wrong. Argo CD answers with <code>ApplicationSet</code> generators evaluated in a <strong>central hub</strong>; Flux answers with an <strong>agent per cluster</strong> and a thin per-cluster directory. Opposite answers, and they scale differently. For one cluster the tools are near-interchangeable; the difference only appears at fleet scale."},
+
+/* ---------------- 14 Observability ---------------- */
+{id:"ob-absent", kind:"gotcha", d1:false, guide:"14-observability-for-cells", guideNum:14, topic:"Alerting correctness", tags:["observability"],
+ q:"An alert depends on a series that stops being exported. When does it fire?",
+ a:"<strong>Never.</strong> Prometheus returns the newest sample within the lookback period (5 minutes by default), and after a staleness marker the series returns nothing at all — an empty vector produces no alert, indistinguishable from healthy. Every alert depending on a series existing needs a companion <code>absent()</code>, <code>absent_over_time()</code>, or <code>up == 0</code> rule, and every ratio needs <code>or vector(0)</code> on the numerator."},
+
+{id:"ob-sum-rate", kind:"gotcha", d1:false, guide:"14-observability-for-cells", guideNum:14, topic:"PromQL", tags:["observability"],
+ q:"Why is <code>rate(sum(x)[5m:])</code> wrong?",
+ a:"<code>rate()</code> detects counter resets <em>per series</em>; <code>sum()</code> destroys series identity, so a single pod restart inside the sum looks like an enormous negative step that <code>rate()</code> cannot correct. Always <code>sum(rate(x[5m]))</code>. It produces plausible-looking wrong numbers, which is worse than an error."},
+
+{id:"ob-quantiles", kind:"gotcha", d1:false, guide:"14-observability-for-cells", guideNum:14, topic:"Fleet aggregation", tags:["observability","capacity"],
+ q:"How do you compute a fleet p99 from 300 per-cell histograms?",
+ a:"Aggregate <strong>bucket counts, not quantiles</strong>: <code>histogram_quantile(0.99, sum by (le) (rate(x_bucket[5m])))</code>. <code>avg(cell:p99)</code> weights a 100 req/s canary the same as a 1M req/s production cell — wrong answer, wrong sign. And client-side <strong>summaries cannot be aggregated at all</strong>: if a component only exposes summaries, you cannot compute a fleet quantile from it, full stop."},
+
+{id:"ob-bucket-skew", kind:"gotcha", d1:false, guide:"14-observability-for-cells", guideNum:14, topic:"Fleet aggregation", tags:["observability","upgrades"],
+ q:"What breaks silently when you aggregate classic histograms across cells during a staged upgrade?",
+ a:"Bucket boundaries. Summing classic-histogram buckets is only valid when every cell uses <strong>identical <code>le</code> boundaries</strong>; two Temporal builds with different bucket definitions merge into a nonsense distribution with no error. Treat histogram bucket boundaries as a <strong>fleet-wide API with a compatibility policy</strong> until you migrate to native histograms, which reconcile layouts and annotate when they cannot."},
+
+
+{id:"ob-collector-l4", kind:"gotcha", d1:false, guide:"14-observability-for-cells", guideNum:14, topic:"Collector scaling", tags:["observability","grpc","networking"],
+ q:"One Collector pod sits at 100% CPU while the others idle. What is the cause?",
+ a:"The same gRPC problem as everywhere else: OTLP over gRPC uses long-lived HTTP/2 connections, and an <strong>L4 load balancer distributes connections, not requests</strong>, so every agent is pinned to one replica. Fix with client-side load balancing over a headless Service, or an L7 proxy."},
+
+{id:"ob-kube-prometheus", kind:"gotcha", d1:false, guide:"14-observability-for-cells", guideNum:14, topic:"Inherited rules", tags:["observability","kubernetes"],
+ q:"You install the default kube-prometheus rules into a managed-Kubernetes cell template. What happens?",
+ a:"The rule set assumes a self-managed control plane. On EKS/GKE/AKS, <strong>etcd, scheduler, and controller-manager targets do not exist</strong>, so their alerts either fire permanently or — worse — evaluate empty forever and give you false confidence. Fork the rule set per cloud and review it; never install the chart's defaults unread."},
+
+{id:"ob-error-sli", kind:"gotcha", d1:false, guide:"14-observability-for-cells", guideNum:14, topic:"Temporal SLIs", tags:["observability","temporal"],
+ q:"Is <code>service_error_with_type</code> an availability SLI?",
+ a:"<strong>No.</strong> Temporal's error counters include error types that are client-caused and entirely expected — a workflow that already exists, an entity that is not found. Building an SLI on the raw counter produces an error budget that burns during normal operation and teaches everyone to ignore the alert. Filter to server-fault types explicitly, write down which ones you chose, and re-review the list on every server upgrade."},
+
+{id:"ob-shard-readiness", kind:"gotcha", d1:false, guide:"14-observability-for-cells", guideNum:14, topic:"Rollout gating", tags:["observability","temporal","upgrades"],
+ q:"Why does a health gate on pod <code>Ready</code> pass a cell that is not actually healthy after a History rollout?",
+ a:"Because <strong>pod readiness is not shard readiness</strong>. Shard ownership moves when a History pod goes away, and a rollout that outpaces shard reclamation produces a latency spike that looks like a database problem. Roll History slowly and assert shard-ownership re-convergence explicitly, using the metric names from your server version's <code>metric_defs.go</code> rather than names copied from a blog post."},
+
+{id:"ob-groupby", kind:"gotcha", d1:false, guide:"14-observability-for-cells", guideNum:14, topic:"Alert routing", tags:["observability"],
+ q:"Every other mechanism is correct and you still get 300 pages. What is the one line?",
+ a:"<code>group_by</code> including <code>cell</code> in Alertmanager — grouping by cell means <strong>each cell is its own group</strong>, so each gets its own notification. Group by <code>[alertname, severity, slo]</code> and let the notification body enumerate the cells."},
+
+{id:"ob-remote-write", kind:"gotcha", d1:false, guide:"14-observability-for-cells", guideNum:14, topic:"Remote write", tags:["observability","capacity","quotas"],
+ q:"The central metrics store starts throttling. Where does the pressure land?",
+ a:"<strong>Inside every cell, simultaneously.</strong> Remote write auto-scales its shard count when it falls behind and buffers in memory against a WAL, so a throttling receiver — and all three managed services throttle on quota — pushes memory pressure back into every cell at once. Alert on send lag and on <code>prometheus_remote_storage_shards / prometheus_remote_storage_shards_max</code>, and give each cell's Prometheus headroom to absorb a multi-hour central outage."},
+
+{id:"ob-concept-unit", kind:"concept", d1:true, guide:"14-observability-for-cells", guideNum:14, topic:"Unit of observation", tags:["observability","capacity"],
+ q:"What is the unit of observation in a cell fleet, and what is the primary analytical operation?",
+ a:"The <strong>cell</strong>, not the pod — the pod is disposable, the cell is the thing with tenants attached and the thing you can fail away from. Every metric, recording rule, dashboard, and alert carries a <code>cell</code> label and defaults to per-cell aggregation. And the primary operation is <strong>comparison</strong>: with 300 identical units the question stops being &quot;is this number bad?&quot; and becomes &quot;is this cell different from its 299 siblings?&quot; Outlier detection across identical units is dramatically more sensitive than guessed thresholds."},
+
+{id:"ob-concept-cardinality", kind:"concept", d1:false, guide:"14-observability-for-cells", guideNum:14, topic:"Cardinality", tags:["observability","cost","capacity"],
+ q:"What determines a Prometheus series count, and why is cardinality treated as a quota?",
+ a:"A series is uniquely identified by its metric name plus the <strong>full set of label values</strong>, so series count multiplies: <code>metrics × label₁ × label₂ × …</code>. Every unbounded label — a workflow ID, a tenant namespace, a full URL path, a customer identifier — turns a cheap metric into an unbounded one. Cardinality is simultaneously the dominant cost driver, the dominant cause of monitoring outages, and the easiest thing to add by accident in a one-line change."},
+
+{id:"ob-concept-vantage", kind:"concept", d1:true, guide:"14-observability-for-cells", guideNum:14, topic:"Observability paradox", tags:["observability","bootstrap"],
+ q:"State the observability paradox for cells, and its resolution.",
+ a:"If the only way to see that a cell is broken is to query something running <em>inside</em> it, then the failure that matters most — the cell is wedged — is exactly the one you cannot see. The tooling you would use to debug a failing bootstrap is installed <em>during</em> the bootstrap. Resolution: an <strong>external vantage point</strong> — remote-written metrics that keep flowing when the cell's query path is down, synthetic probes from outside, and provisioning events emitted from the control plane rather than from inside the thing being provisioned."},
+
+/* ---------------- 15 Temporal programming model ---------------- */
+{id:"tp-sts", kind:"gotcha", d1:false, guide:"15-temporal-programming-model", guideNum:15, topic:"Activity timeouts", tags:["temporal","limits"],
+ q:"A customer sets Schedule-To-Start defensively. Why does it bite them during a deploy?",
+ a:"Because it is <strong>non-retryable by design</strong> — a retry would put the Activity Task back on the same Task Queue, so it does not trigger retries regardless of the Retry Policy. A deploy or autoscaling lag delays worker availability past the window and Activities fail <em>permanently</em>. Temporal's own advice: leave it unset and alert on <code>temporal_activity_schedule_to_start_latency</code> instead."},
+
+{id:"tp-stc", kind:"gotcha", d1:false, guide:"15-temporal-programming-model", guideNum:15, topic:"Activity timeouts", tags:["temporal","limits"],
+ q:"A worker crashes mid-Activity and no Start-To-Close timeout is set. When does the server notice?",
+ a:"It does not. <strong>The server does not detect a worker losing communication or crashing</strong> — it relies on Start-To-Close to force retries. Without it and without a Heartbeat Timeout, the Activity hangs until Schedule-To-Close, which <strong>defaults to infinity</strong>."},
+
+{id:"tp-nondeterminism", kind:"gotcha", d1:false, guide:"15-temporal-programming-model", guideNum:15, topic:"Determinism failures", tags:["temporal","determinism","capacity"],
+ q:"A bad deploy introduces a non-determinism error across 10,000 executions. What does your cell experience?",
+ a:"<strong>Sustained load, not failures.</strong> A Workflow Task failure is retried automatically with workflow state preserved, so ten thousand executions retry indefinitely against your cell until someone ships a fix or resets them. They wedge, they do not die. Watch <code>temporal_workflow_task_execution_failed{failure_reason=&quot;NonDeterminismError&quot;}</code>."},
+
+{id:"tp-errorf", kind:"gotcha", d1:false, guide:"15-temporal-programming-model", guideNum:15, topic:"Retryability", tags:["temporal","go"],
+ q:"A customer wraps a non-retryable Application Failure with <code>fmt.Errorf(&quot;...: %w&quot;, err)</code>. What changes?",
+ a:"It becomes <strong>retryable</strong>, and you get an infinite retry loop against a permanently broken downstream. The Temporal Service only inspects the <strong>top-level <code>failure_info</code></strong> and does not look at <code>cause</code> to determine retryability. The outermost error type decides."},
+
+{id:"tp-4mb-combined", kind:"number", d1:false, guide:"15-temporal-programming-model", guideNum:15, topic:"Size limits", tags:["temporal","limits","grpc"],
+ q:"Every payload is under the 2 MB limit and the customer still hits the 4 MB gRPC limit. How?",
+ a:"The limit applies to the <strong>combined request</strong>: scheduling several Activities with moderate inputs, or hundreds with tiny inputs, in the same Workflow Task pushes it past 4 MB. On a <em>Workflow</em> Task the Service <strong>terminates</strong> the execution, because replay would produce the same oversized request every attempt. On an <em>Activity</em> Task the Activity gets stuck in a retry loop — succeeding each time and failing to deliver — until Schedule-To-Close expires, or forever if unset."},
+
+{id:"tp-backlog", kind:"gotcha", d1:true, guide:"15-temporal-programming-model", guideNum:15, topic:"Task queues", tags:["temporal","persistence","capacity"],
+ q:"What happens to persistence load the moment a Task Queue builds a backlog?",
+ a:"It steps up. Once there is a backlog, the sync match rate <strong>drops to nearly zero</strong> because the queue dispatches from the backlog first — every task becomes a persisted row plus a read. That transition is a step change in your cell's database load, not a gradual one. Track <code>poll_success_sync</code> against <code>approximate_backlog_count</code>."},
+
+{id:"tp-poller-starvation", kind:"gotcha", d1:false, guide:"15-temporal-programming-model", guideNum:15, topic:"Worker diagnosis", tags:["temporal","observability","capacity"],
+ q:"Schedule-to-start latency is high. Name the two opposite causes and how to tell them apart.",
+ a:"High schedule-to-start with <strong>high worker CPU</strong> means saturation — scale out. High schedule-to-start with <strong>low CPU</strong> means too few pollers or slots. And if the low-CPU case comes with high <code>temporal_long_request_latency</code> or <code>temporal_long_request_failure</code>, the workers are struggling to <em>reach the Service</em> — which is genuinely your problem, not theirs. <strong>Never diagnose from schedule-to-start alone.</strong>"},
+
+{id:"tp-2000-pending", kind:"number", d1:false, guide:"15-temporal-programming-model", guideNum:15, topic:"Pending operation limits", tags:["temporal","limits"],
+ q:"What is the pending-operations limit per Workflow Execution, and how does breaching it present?",
+ a:"<strong>2,000</strong> each for incomplete Activities, Child Workflows, Signals, and cancel requests — and it does not raise a clean error. The Workflow Task <strong>fails and retries</strong> when the next operation is scheduled, so the customer sees an inexplicable stall, not a quota message. The advisory limit is far lower: <strong>500 or fewer</strong> concurrent operations for optimal performance."},
+
+{id:"tp-history-limits", kind:"number", d1:true, guide:"15-temporal-programming-model", guideNum:15, topic:"Size limits", tags:["temporal","limits","persistence"],
+ q:"State Temporal's Event History limits, warning thresholds, and the single-payload cap.",
+ a:"History caps at <strong>51,200 Events or 50 MB</strong>, with warnings starting at <strong>10,240 Events / 10 MB</strong>. A single payload caps at <strong>2 MB</strong> and a gRPC message at <strong>4 MB</strong>. These are precautionary limits that exist because the alternative is your database falling over — and when a customer hits one, it becomes your incident."},
+
+{id:"tp-can", kind:"gotcha", d1:false, guide:"15-temporal-programming-model", guideNum:15, topic:"Continue-As-New", tags:["temporal"],
+ q:"What does Continue-As-New silently drop?",
+ a:"<strong>Ongoing Child Workflow Executions are not retained</strong>, and for scheduled Workflows a run that continues-as-new is marked <code>Continued-As-New</code> rather than <code>Completed</code>, so the next scheduled run cannot read <code>LastCompletionResult</code>. Both are quiet data-loss bugs in customer code."},
+
+
+{id:"tp-search-attrs", kind:"gotcha", d1:false, guide:"15-temporal-programming-model", guideNum:15, topic:"Data encryption", tags:["temporal","security","secrets"],
+ q:"A customer runs a codec server. Are their Search Attributes encrypted?",
+ a:"<strong>No.</strong> Search Attributes are stored unencrypted and are not codec-processed — the Service must read them in plain text to support filtering and ordering, so encryption is impossible without breaking search. The docs flag GDPR/HIPAA/SOC 2 exposure explicitly, and customers reasonably but wrongly assume the codec covers them."},
+
+{id:"tp-catchup", kind:"number", d1:false, guide:"15-temporal-programming-model", guideNum:15, topic:"Schedules", tags:["temporal","capacity"],
+ q:"What is a Schedule's default Catchup Window, and why should it worry you?",
+ a:"<strong>One year</strong> (minimum 10 seconds). After any outage — <em>including yours</em> — Schedules with the default window fire every missed action on recovery. Combined with the <code>BufferAll</code> overlap policy, that is a stampede aimed at your cell. Temporal asks customers to use jitter for exactly this reason."},
+
+{id:"tp-concept-dbrow", kind:"concept", d1:true, guide:"15-temporal-programming-model", guideNum:15, topic:"How workflows work", tags:["temporal","determinism"],
+ q:"Explain a Workflow Execution in one framing, and say why determinism follows from it.",
+ a:"<strong>A Workflow is a function whose call stack is a database row.</strong> The SDK intercepts every call touching the outside world or the passage of time, turns it into a <strong>Command</strong>; the server turns Commands into <strong>Events</strong> appended to Event History. If the process dies, another re-runs the function from the top, feeding it recorded Events instead of redoing work, until it reaches where the old one stopped. Recovery <em>is</em> re-running your function — so the function must emit the same sequence of Commands given the same History. Clocks, randomness, map iteration order, goroutines, and network calls all violate that."},
+
+{id:"tp-concept-airlock", kind:"concept", d1:true, guide:"15-temporal-programming-model", guideNum:15, topic:"Activities", tags:["temporal","determinism"],
+ q:"What is an Activity for, and what is the price of that convenience?",
+ a:"It is <strong>the airlock</strong>: anything non-deterministic goes in an Activity, which runs outside the replay path and is retried by the platform. The price is <strong>at-least-once execution</strong> — the platform will happily run your Activity twice if the first attempt's result never made it back. Idempotency is not a nicety here; it is the contract."},
+
+{id:"tp-concept-nocustomercode", kind:"concept", d1:true, guide:"15-temporal-programming-model", guideNum:15, topic:"What a cell does", tags:["temporal","capacity"],
+ q:"What runs on your cell, and what does that mean for every capacity conversation?",
+ a:"<strong>Never customer code.</strong> The Temporal Service — Cloud included — does not execute Workflow or Activity Definitions on its own machines; Workers live in the customer's infrastructure and <em>poll</em> your cells. Your cells hold state and match tasks. So every capacity conversation is about <strong>state size, task-matching rate, and poll concurrency</strong> — never about CPU spent on business logic."},
+
+{id:"tp-concept-namespace", kind:"concept", d1:true, guide:"15-temporal-programming-model", guideNum:15, topic:"Tenancy", tags:["temporal","capacity"],
+ q:"What is the tenancy unit, and how does it map onto cells?",
+ a:"The <strong>Namespace</strong> — a unit of isolation providing Workflow ID uniqueness, resource isolation, and a configuration boundary. Temporal Cloud's namespace-provisioning path selects a cell within a region, and Same-region Replication explicitly replicates the Namespace across multiple cells in that region. <strong>Namespace is the partition key your cells are partitioned by.</strong>"},
+
+/* ---------------- 16 Temporal server internals ---------------- */
+{id:"ti-numshards-warn", kind:"gotcha", d1:false, guide:"16-temporal-server-internals", guideNum:16, topic:"Shard configuration", tags:["temporal","persistence","observability"],
+ q:"A Helm value drifts <code>numHistoryShards</code> from 512 to 4096. What does the server do?",
+ a:"<strong>Warns and proceeds</strong> with the persisted value. The exact log line is &quot;Supplied configuration key/value mismatches persisted cluster metadata. Continuing with the persisted value as this value cannot be changed once initialized.&quot; <strong>Alert on that string</strong> — otherwise the drift sits silently for a year and then someone &quot;fixes&quot; the persisted record."},
+
+{id:"ti-shard-count", kind:"number", d1:true, guide:"16-temporal-server-internals", guideNum:16, topic:"Shard sizing", tags:["temporal","capacity","persistence"],
+ q:"Shard count: how changeable is it, what is the documented range, and what are the real numbers?",
+ a:"<strong>Permanent</strong> — set at build time, and adding shards requires a rebuild and migration. Documented range is <strong>1 to 128K</strong>, with a recommended ratio of <strong>1 History process per 500 shards</strong>. The commonly quoted <strong>512</strong> (small production) and <strong>4,096</strong> (rare even for large clusters) figures come from Temporal's blog, not the docs. The Docker template default is 4 and the SQLite dev config is 1 — neither is a production value."},
+
+{id:"ti-ambiguous-write", kind:"gotcha", d1:true, guide:"16-temporal-server-internals", guideNum:16, topic:"Failure amplification", tags:["temporal","persistence","capacity"],
+ q:"What is the single most important failure-mode fact about a History host and an ambiguous persistence error?",
+ a:"It <strong>re-acquires the shard</strong>. On any unrecognised error the code cannot know whether the write failed or will eventually land, so it re-acquires in the background. A ten-second database blip therefore produces a <strong>wave of shard reloads across every History host</strong>, each costing a cold Mutable State cache and a queue-state replay. <strong>Persistence latency spikes are amplified, not absorbed.</strong>"},
+
+{id:"ti-cassandra-partition", kind:"gotcha", d1:false, guide:"16-temporal-server-internals", guideNum:16, topic:"Cassandra persistence", tags:["temporal","persistence","capacity"],
+ q:"On Cassandra, what is the partition key of the <code>executions</code> table, and what does that imply?",
+ a:"<strong><code>shard_id</code> alone</strong> — an entire shard lives in one partition, and every workflow-task completion issues a logged batch with three <code>IF</code> predicates against it, i.e. a Paxos round. Too few shards means Paxos contention on a hot partition, which appears as <strong>shard lock latency, not database CPU</strong>. Related: task completion is a <code>DELETE</code> in those same hot partitions, so a queue that falls behind and then catches up in a burst produces a tombstone storm and read amplification on the next scan."},
+
+{id:"ti-partitions-4", kind:"number", d1:false, guide:"16-temporal-server-internals", guideNum:16, topic:"Matching", tags:["temporal","capacity","limits"],
+ q:"A customer has one very hot Task Queue. Does adding Matching pods help?",
+ a:"<strong>No.</strong> <code>matching.numTaskqueueReadPartitions</code> and <code>numTaskqueueWritePartitions</code> both default to <strong>4</strong>, so one Task Queue can use at most 4 Matching hosts. Raise partitions per namespace/task queue; the cost is more <code>task_queues</code> rows, deeper forwarding, and thinner poller spread per partition."},
+
+{id:"ti-sync-vs-async", kind:"number", d1:false, guide:"16-temporal-server-internals", guideNum:16, topic:"Matching", tags:["temporal","persistence","observability"],
+ q:"How many database operations does an async match cost versus a sync match, and what SLI tracks it?",
+ a:"<strong>Four versus zero.</strong> Track the Poll Sync Rate: <code>sum by (task_type)(rate(poll_success_sync[1m])) / sum by (task_type)(rate(poll_success[1m]))</code>, and treat a sustained drop as a <strong>database-load event, not a latency event</strong>."},
+
+
+{id:"ti-sticky-10s", kind:"number", d1:false, guide:"16-temporal-server-internals", guideNum:16, topic:"Sticky execution", tags:["temporal","upgrades","limits"],
+ q:"How long is the sticky-worker unavailable window, and can you tune it?",
+ a:"<strong>10 seconds, hard-coded</strong> (<code>stickyPollerUnavailableWindow</code> in <code>matching_engine.go</code>) — there is no dynamic config key for it. A worker fleet that restarts slower than 10 seconds sees a burst of <code>StickyWorkerUnavailable</code> and <strong>full history replays</strong>."},
+
+{id:"ti-retry-amplify", kind:"gotcha", d1:false, guide:"16-temporal-server-internals", guideNum:16, topic:"Persistence layer", tags:["temporal","persistence","observability"],
+ q:"Why does a degraded database self-amplify inside Temporal, and what does that do to your latency metric?",
+ a:"The persistence decorator order is <strong>retryable → metrics → rate limited → manager</strong>, so <strong>retries consume rate-limiter quota</strong>: more retries, more quota consumed, more throttling of healthy traffic. And because metrics are emitted per attempt, <code>persistence_latency</code> p99 during an incident is <strong>retry latency, not single-call latency</strong>. The adaptive limiter that could damp this ships disabled, with both thresholds at 0.0."},
+
+{id:"ti-history-terminate", kind:"number", d1:true, guide:"16-temporal-server-internals", guideNum:16, topic:"Enforced limits", tags:["temporal","limits","persistence"],
+ q:"Which server-side limits force-terminate a workflow, and at what values?",
+ a:"<code>limit.historySize.error</code> at <strong>50 MB</strong>, <code>limit.historyCount.error</code> at <strong>51,200</strong>, and <code>limit.mutableStateSize.error</code> at <strong>8 MB</strong> — enforced in <code>enforceHistorySizeCheck</code>, terminating with <code>FailureReasonHistorySizeExceedsLimit</code> and friends. Pending-operation limits are <strong>2,000</strong> each for activities, children, signals, and cancels."},
+
+{id:"ti-suggest-4096", kind:"number", d1:false, guide:"16-temporal-server-internals", guideNum:16, topic:"Continue-As-New", tags:["temporal","limits"],
+ q:"At what point does <code>ContinueAsNewSuggested</code> flip, and where is that documented?",
+ a:"<strong>4,096 events or 4 MiB</strong> — and it is <em>undocumented</em>; the docs name the flag but never the threshold. The keys are <code>limit.historyCount.suggestContinueAsNew</code> and <code>limit.historySize.suggestContinueAsNew</code>, and they are <strong>namespace-overridable</strong>, so you can advise a customer to lower them without touching their code."},
+
+{id:"ti-upgrade-order", kind:"gotcha", d1:true, guide:"16-temporal-server-internals", guideNum:16, topic:"Upgrades", tags:["temporal","upgrades","persistence"],
+ q:"State the Temporal Server upgrade rules.",
+ a:"<strong>Schema first, then binary, one minor version at a time.</strong> Before bumping to the next minor, upgrade to the highest patch of your current minor. Backward compatibility is guaranteed only between two <em>successive</em> minors, so skipping minors can make older data formats unreadable. You may skip patches; you may not skip minors. And whether a release needs a schema migration is stated <strong>only in the release notes</strong> — there is no API for it, so your automation must gate on them."},
+
+{id:"ti-10min", kind:"number", d1:false, guide:"16-temporal-server-internals", guideNum:16, topic:"Upgrades", tags:["temporal","upgrades","capacity"],
+ q:"How long does each version hop take, and why?",
+ a:"<strong>About 10 minutes per version.</strong> Every upgrade requires the History Service to <strong>load all shards and update shard metadata</strong>, and the docs say to allow roughly ten minutes on each version before upgrading to the next. Ten minutes per hop times the number of minors you are behind is your real upgrade window."},
+
+{id:"ti-membership", kind:"gotcha", d1:true, guide:"16-temporal-server-internals", guideNum:16, topic:"Cluster membership", tags:["temporal","persistence","bootstrap"],
+ q:"Persistence is down. Can new pods join the ring?",
+ a:"<strong>No.</strong> Ringpop bootstraps from the <code>cluster_membership</code> table, so if the database is unavailable new pods cannot join at all — even though gossip between surviving pods still works. A persistence outage is also a membership outage. <strong>Recovery sequencing must bring persistence back before scaling anything.</strong>"},
+
+{id:"ti-broadcast", kind:"gotcha", d1:false, guide:"16-temporal-server-internals", guideNum:16, topic:"Cluster membership", tags:["temporal","kubernetes","bootstrap"],
+ q:"What is the most common Kubernetes membership misconfiguration, and how does it present?",
+ a:"A missing <code>broadcastAddress</code> when binding to all interfaces. <code>buildBroadcastHostPort()</code> fails with &quot;broadcastAddress required when listening on all interfaces (0.0.0.0/[::])&quot; — and it fails <strong>at startup</strong> rather than at first lookup, which is the merciful version."},
+
+{id:"ti-authorizer", kind:"gotcha", d1:true, guide:"16-temporal-server-internals", guideNum:16, topic:"Security defaults", tags:["temporal","security","identity"],
+ q:"What does a self-hosted Temporal Server do about authorization if you configure nothing?",
+ a:"<strong>Allows everything.</strong> Without an explicit <code>Authorizer</code> it uses the default <code>noopAuthorizer</code>, which permits every API request with no authentication or access control. Self-hosted Temporal also has <strong>no RBAC and no audit logging out of the box</strong>."},
+
+{id:"ti-dynconfig", kind:"gotcha", d1:false, guide:"16-temporal-server-internals", guideNum:16, topic:"Dynamic config", tags:["temporal","observability","tuning"],
+ q:"You push a malformed dynamic config file. What happens, and how do you find out?",
+ a:"It is <strong>silently ignored</strong> — the file-based client does not retry parse errors and keeps serving the last good values. The only signals are the <code>DynamicConfigUpdateFailure</code> gauge and the <em>absence</em> of the &quot;Updated dynamic config&quot; log line. Alert on both."},
+
+{id:"ti-dlq", kind:"number", d1:false, guide:"16-temporal-server-internals", guideNum:16, topic:"DLQ", tags:["temporal","persistence","teardown"],
+ q:"How do tasks reach the Temporal DLQ, and what tool reads it?",
+ a:"After <code>history.TaskDLQUnexpectedErrorAttempts</code> — default <strong>70, about an hour</strong> — or on a non-retryable error class, logging &quot;Task enqueued to DLQ&quot;. It requires <strong><code>tdbg</code></strong>: there is no DLQ command on the <code>temporal</code> CLI or <code>OperatorService</code>. If nobody has <code>tdbg</code> in the incident-response path, those tasks are invisible and permanent."},
+
+{id:"ti-metric-names", kind:"gotcha", d1:false, guide:"16-temporal-server-internals", guideNum:16, topic:"Metric naming", tags:["temporal","observability"],
+ q:"Which Temporal metric names are not what you would guess?",
+ a:"<code>syncmatch_latency</code> not <code>sync_match_latency</code>; <code>numshards_gauge</code> not <code>num_shards_gauge</code>; <code>sharditem_acquisition_latency</code>; <code>pending_tasks</code> not <code>queue_pending_task_count</code>; <code>task_latency_schedule</code> not <code>task_schedule_latency</code>; <code>replication_tasks_lag</code> not <code>replication_task_lag</code>; and the Elasticsearch prefix is <code>elasticsearch_bulk_processor_*</code>. There is also <strong>no separate workflow/activity schedule-to-start metric</strong> — one <code>task_schedule_to_start_latency</code> dimensioned by task type. Copy names from your version's <code>metric_defs.go</code>, never from a blog post."},
+
+
+{id:"ti-concept-shard", kind:"concept", d1:true, guide:"16-temporal-server-internals", guideNum:16, topic:"Shards", tags:["temporal","persistence","capacity"],
+ q:"What is a History Shard, in one line, and what are the three properties that fall out of the architecture?",
+ a:"<strong>A serialization domain.</strong> Every Workflow in shard <em>k</em> shares one owner, one task-ID sequence, and — on Cassandra — one physical partition, so <strong>shard count is your concurrency ceiling</strong>. The three properties: (1) a shard serializes; (2) the <strong>only strongly-consistent write is the one History makes</strong> — Matching, Visibility, Replication, and Archival are all downstream of a durable task row, so everything else is eventually consistent by construction; (3) nothing in the cell runs customer code."},
+
+{id:"ti-concept-outbox", kind:"concept", d1:true, guide:"16-temporal-server-internals", guideNum:16, topic:"The atomic write", tags:["temporal","persistence"],
+ q:"Describe the one atomic write at the heart of the History service.",
+ a:"The <strong>Mutable State update and the Transfer Task row are written in one transaction</strong>, with the shard's own <code>range_id</code> asserted as a <strong>fencing condition</strong> in that same write. This is the transactional-outbox pattern, and Temporal's architecture docs name it as such. Asynchronously, the shard's queue processor reads that task and calls Matching. Everything downstream is a consequence of that one durable row."},
+
+{id:"ti-concept-routing", kind:"concept", d1:true, guide:"16-temporal-server-internals", guideNum:16, topic:"Request routing", tags:["temporal","capacity","networking"],
+ q:"Trace <code>StartWorkflowExecution</code> from the Frontend to a History host.",
+ a:"Frontend is a <strong>stateless gRPC edge</strong>: authenticate, rate-limit, validate, route — it computes nothing about the workflow. It hashes <code>namespaceID + &quot;_&quot; + workflowID</code> to a <strong>History Shard</strong> and forwards to whichever History host currently owns that shard, found via a ringpop lookup on the shard ID. The History host loads or creates the Mutable State, appends <code>WorkflowExecutionStarted</code> and <code>WorkflowTaskScheduled</code>, and writes a Transfer Task — all in one fenced transaction."},
+
+];
+
+/* ==========================================================================
+   Spaced repetition state
+   ========================================================================== */
+const LS_KEY = "tif_drill_v1";
+const INTERVALS = [0, 1, 2, 4, 8, 16];   // days, indexed by box 1..5
+const DAY = 86400000;
+
+function loadState(){
+  try{
+    const raw = localStorage.getItem(LS_KEY);
+    if(!raw) return {v:1, cards:{}};
+    const o = JSON.parse(raw);
+    if(!o || typeof o !== "object") return {v:1, cards:{}};
+    if(!o.cards || typeof o.cards !== "object") o.cards = {};
+    return o;
+  }catch(e){ return {v:1, cards:{}}; }
+}
+function saveState(s){
+  try{ localStorage.setItem(LS_KEY, JSON.stringify(s)); }
+  catch(e){ /* private mode, quota, disabled storage: drill still works in-memory */ }
+}
+let STATE = loadState();
+
+function cardState(id){
+  const s = STATE.cards[id];
+  if(!s) return {box:1, last:0, seen:0, right:0, wrong:0};
+  return {box:s.box||1, last:s.last||0, seen:s.seen||0, right:s.right||0, wrong:s.wrong||0};
+}
+function dueAt(st){ return st.last + INTERVALS[Math.min(Math.max(st.box,1),5)] * DAY; }
+function isDue(id){
+  const st = cardState(id);
+  if(st.seen === 0) return true;
+  return Date.now() >= dueAt(st);
+}
+function applyGrade(id, g){
+  const st = cardState(id);
+  if(g <= 2){ st.box = 1; st.wrong++; }
+  else if(g === 3){ st.right++; }
+  else if(g === 4){ st.box = Math.min(5, st.box + 1); st.right++; }
+  else { st.box = Math.min(5, st.box + 2); st.right++; }
+  st.last = Date.now();
+  st.seen++;
+  STATE.cards[id] = st;
+  saveState(STATE);
+}
+
+/* ==========================================================================
+   Session state
+   ========================================================================== */
+let mode = "due";
+let subKey = null;         // selected guide slug or tag
+let deck = [];
+let idx = 0;
+let flipped = false;
+let test = null;           // {cards, i, flipped, right, missed:[], t0, tick, done}
+
+const app = document.getElementById("app");
+
+function shuffle(a){
+  for(let i=a.length-1; i>0; i--){
+    const j = Math.floor(Math.random()*(i+1));
+    const t = a[i]; a[i] = a[j]; a[j] = t;
+  }
+  return a;
+}
+function allTags(){
+  const m = new Map();
+  for(const c of CARDS) for(const t of c.tags) m.set(t, (m.get(t)||0)+1);
+  return [...m.entries()].sort((a,b)=> b[1]-a[1] || a[0].localeCompare(b[0]));
+}
+function guideHref(c){ return "html/" + c.guide + ".html"; }
+function guideLabel(c){
+  const g = GUIDES[c.guide];
+  return "Guide " + String(g.n).padStart(2,"0") + " — " + g.t;
+}
+
+/* ==========================================================================
+   Header
+   ========================================================================== */
+function renderHeader(){
+  const total = CARDS.length;
+  let due = 0, seen = 0, mastered = 0;
+  const boxes = [0,0,0,0,0,0];   // index 0 = unseen
+  for(const c of CARDS){
+    const st = cardState(c.id);
+    if(isDue(c.id)) due++;
+    if(st.seen > 0){ seen++; boxes[st.box]++; } else { boxes[0]++; }
+    if(st.box >= 5 && st.seen > 0) mastered++;
+  }
+  document.getElementById("stats").innerHTML =
+    "<b>" + total + "</b> cards &middot; due today <span class='due'>" + due +
+    "</span> &middot; studied <b>" + seen + "</b> &middot; box 5 <span class='mast'>" + mastered + "</span>";
+
+  const bar = document.getElementById("boxbar");
+  bar.innerHTML = "";
+  const order = [0,1,2,3,4,5];
+  for(const b of order){
+    if(boxes[b] === 0) continue;
+    const d = document.createElement("div");
+    d.className = "boxseg b" + b;
+    d.style.flex = String(boxes[b]);
+    d.title = (b === 0 ? "new" : "box " + b) + ": " + boxes[b];
+    bar.appendChild(d);
+  }
+  document.getElementById("boxkey").textContent =
+    "new " + boxes[0] + "  |  b1 " + boxes[1] + "  b2 " + boxes[2] +
+    "  b3 " + boxes[3] + "  b4 " + boxes[4] + "  b5 " + boxes[5];
+}
+
+/* ==========================================================================
+   Deck building
+   ========================================================================== */
+function buildDeck(){
+  idx = 0; flipped = false;
+  if(mode === "due"){
+    deck = shuffle(CARDS.filter(c => isDue(c.id)));
+    deck.sort((a,b)=> (b.d1?1:0) - (a.d1?1:0));
+  } else if(mode === "all"){
+    deck = shuffle(CARDS.slice());
+  } else if(mode === "d1"){
+    deck = shuffle(CARDS.filter(c => c.d1));
+  } else if(mode === "guide"){
+    deck = subKey ? CARDS.filter(c => c.guide === subKey) : [];
+  } else if(mode === "topic"){
+    deck = subKey ? shuffle(CARDS.filter(c => c.tags.indexOf(subKey) >= 0)) : [];
+  } else {
+    deck = [];
+  }
+}
+
+/* ==========================================================================
+   Renderers
+   ========================================================================== */
+function esc(s){
+  return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+}
+
+function cardHTML(c, showAnswer, opts){
+  opts = opts || {};
+  const st = cardState(c.id);
+  const kindPill = c.kind === "number" ? "<span class='pill k-number'>number</span>"
+                 : c.kind === "concept" ? "<span class='pill k-concept'>concept</span>"
+                 : "<span class='pill'>gotcha</span>";
+  let h = "";
+  h += "<div class='meterline'>";
+  h += "<span>" + esc(opts.position || "") + "</span>";
+  h += "<span>" + kindPill + " " + (c.d1 ? "<span class='pill d1'>before day 1</span> " : "") +
+       "<span class='pill'>box " + st.box + "</span></span>";
+  h += "</div>";
+  h += "<div class='card'>";
+  h += "<div class='src'>" + esc(c.topic) + "</div>";
+  h += "<div class='q'>" + c.q + "</div>";
+  if(showAnswer){
+    h += "<div class='a'>" + c.a + "</div>";
+    h += "<div class='tagrow'>";
+    h += "<a class='tg' href='" + guideHref(c) + "'>" + esc(guideLabel(c)) + "</a>";
+    for(const t of c.tags) h += "<span class='tg'>" + esc(t) + "</span>";
+    h += "</div>";
+  }
+  h += "</div>";
+  return h;
+}
+
+function renderDeckView(){
+  if(deck.length === 0){
+    app.innerHTML = "<div class='empty'><h2>Nothing queued</h2><p>" +
+      (mode === "due"
+        ? "Every card is scheduled for a later day. Nice."
+        : "No cards match this selection.") +
+      "</p><button class='btn primary' data-act='goall'>Study all cards</button></div>";
+    return;
+  }
+  if(idx >= deck.length){
+    app.innerHTML = "<div class='empty'><h2>Session done</h2><p>" + deck.length +
+      " card" + (deck.length===1?"":"s") + " reviewed.</p>" +
+      "<button class='btn primary' data-act='again'>Run this deck again</button> " +
+      "<button class='btn' data-act='goall'>Study all cards</button></div>";
+    return;
+  }
+  const c = deck[idx];
+  let h = "";
+  if((mode === "guide" || mode === "topic") && subKey){
+    h += "<div class='crumb' data-act='back'>&larr; " +
+         (mode === "guide" ? "All guides" : "All topics") + "</div>";
+  }
+  h += "<div class='deck'>";
+  h += cardHTML(c, flipped, {position: (idx+1) + " of " + deck.length});
+  if(!flipped){
+    h += "<div class='ctrls'><button class='btn primary' data-act='flip'>Show answer</button>" +
+         "<button class='btn ghost' data-act='skip'>Skip</button></div>";
+  } else {
+    h += "<div class='rates'>";
+    h += "<button class='rate r1' data-grade='1'>1<small>blank</small></button>";
+    h += "<button class='rate r2' data-grade='2'>2<small>wrong</small></button>";
+    h += "<button class='rate r3' data-grade='3'>3<small>shaky</small></button>";
+    h += "<button class='rate r4' data-grade='4'>4<small>got it</small></button>";
+    h += "<button class='rate r5' data-grade='5'>5<small>instant</small></button>";
+    h += "</div>";
+  }
+  h += "</div>";
+  app.innerHTML = h;
+}
+
+function renderGuidePicker(){
+  let h = "<p class='hint'>Pick a guide to drill it end to end, in source order.</p><div class='grid'>";
+  const slugs = Object.keys(GUIDES).sort((a,b)=> GUIDES[a].n - GUIDES[b].n);
+  for(const slug of slugs){
+    const cs = CARDS.filter(c => c.guide === slug);
+    if(cs.length === 0) continue;
+    const due = cs.filter(c => isDue(c.id)).length;
+    const mast = cs.filter(c => cardState(c.id).box >= 5 && cardState(c.id).seen > 0).length;
+    const pct = Math.round(100 * mast / cs.length);
+    h += "<div class='pick' data-guide='" + slug + "'>";
+    h += "<div class='pn'>GUIDE " + String(GUIDES[slug].n).padStart(2,"0") + "</div>";
+    h += "<div class='pt'>" + esc(GUIDES[slug].t) + "</div>";
+    h += "<div class='pm'>" + cs.length + " cards &middot; <span class='duen'>" + due + " due</span> &middot; " + mast + " at box 5</div>";
+    h += "<div class='mini'><i style='width:" + pct + "%'></i></div>";
+    h += "</div>";
+  }
+  h += "</div>";
+  app.innerHTML = h;
+}
+
+function renderTopicPicker(){
+  const tags = allTags();
+  let h = "<p class='hint'>Cross-cutting themes. A card can carry several.</p><div class='grid'>";
+  for(const [tag, n] of tags){
+    const cs = CARDS.filter(c => c.tags.indexOf(tag) >= 0);
+    const due = cs.filter(c => isDue(c.id)).length;
+    const mast = cs.filter(c => cardState(c.id).box >= 5 && cardState(c.id).seen > 0).length;
+    const pct = Math.round(100 * mast / cs.length);
+    h += "<div class='pick' data-topic='" + esc(tag) + "'>";
+    h += "<div class='pt'>" + esc(tag) + "</div>";
+    h += "<div class='pm'>" + n + " cards &middot; <span class='duen'>" + due + " due</span></div>";
+    h += "<div class='mini'><i style='width:" + pct + "%'></i></div>";
+    h += "</div>";
+  }
+  h += "</div>";
+  app.innerHTML = h;
+}
+
+/* ---------- self test ---------- */
+function renderTestSetup(){
+  app.innerHTML =
+    "<div class='setup'><h2>Timed self-test</h2>" +
+    "<p>Random cards, no hints, self-graded. Answer out loud before you flip. " +
+    "Results update your Leitner boxes: a miss drops the card to box 1, a hit promotes it.</p>" +
+    "<div class='row'>" +
+    "<button class='btn' data-test='10'>10 cards</button>" +
+    "<button class='btn' data-test='20'>20 cards</button>" +
+    "<button class='btn' data-test='30'>30 cards</button>" +
+    "<button class='btn' data-test='d1'>Before day 1 set</button>" +
+    "</div></div>";
+}
+
+function startTest(kind){
+  let pool;
+  if(kind === "d1") pool = CARDS.filter(c => c.d1);
+  else pool = CARDS.slice();
+  const n = kind === "d1" ? pool.length : Math.min(parseInt(kind,10), pool.length);
+  test = {
+    cards: shuffle(pool).slice(0, n),
+    i: 0, flipped: false, right: 0, missed: [],
+    t0: Date.now(), tick: null, done: false
+  };
+  test.tick = setInterval(function(){
+    const el = document.getElementById("tmr");
+    if(el) el.textContent = fmtTime(Date.now() - test.t0);
+  }, 500);
+  renderTest();
+}
+function fmtTime(ms){
+  const s = Math.floor(ms/1000);
+  const m = Math.floor(s/60);
+  return m + ":" + String(s % 60).padStart(2,"0");
+}
+function endTest(){
+  if(test && test.tick){ clearInterval(test.tick); test.tick = null; }
+  if(test) test.done = true;
+  renderTest();
+}
+function renderTest(){
+  if(!test){ renderTestSetup(); return; }
+  if(test.done || test.i >= test.cards.length){
+    if(test.tick){ clearInterval(test.tick); test.tick = null; }
+    const total = test.i;
+    const pct = total ? Math.round(100 * test.right / total) : 0;
+    let h = "<div class='setup'>";
+    h += "<div class='score'>" + test.right + " / " + total + "<small>" + pct +
+         "% &middot; " + fmtTime(Date.now() - test.t0) + " elapsed</small></div>";
+    if(test.missed.length === 0){
+      h += "<p style='margin-top:1rem'>Nothing to review. Take the win.</p>";
+    } else {
+      h += "<div class='review'><h3>Review these " + test.missed.length + "</h3>";
+      for(const c of test.missed){
+        h += "<div class='rev'><div class='rq'>" + c.q + "</div>" +
+             "<div class='rl'><a href='" + guideHref(c) + "'>" + esc(guideLabel(c)) +
+             "</a> &middot; " + esc(c.topic) + "</div></div>";
+      }
+      h += "</div>";
+    }
+    h += "<div class='row' style='margin-top:1.1rem'>" +
+         "<button class='btn primary' data-act='newtest'>New test</button>" +
+         "<button class='btn' data-act='goall'>Study all cards</button></div>";
+    h += "</div>";
+    app.innerHTML = h;
+    return;
+  }
+  const c = test.cards[test.i];
+  let h = "<div class='deck'>";
+  h += "<div class='meterline'><span class='timer' id='tmr'>" +
+       fmtTime(Date.now() - test.t0) + "</span><span>" + test.right + " correct so far</span></div>";
+  h += cardHTML(c, test.flipped, {position: "Question " + (test.i+1) + " of " + test.cards.length});
+  if(!test.flipped){
+    h += "<div class='ctrls'><button class='btn primary' data-act='tflip'>Show answer</button>" +
+         "<button class='btn ghost' data-act='tstop'>End test</button></div>";
+  } else {
+    h += "<div class='ctrls'>" +
+         "<button class='btn' data-tgrade='0' style='border-color:var(--bad);color:var(--bad)'>Missed it (j)</button>" +
+         "<button class='btn' data-tgrade='1' style='border-color:var(--ok);color:var(--ok)'>Got it (k)</button>" +
+         "</div>";
+  }
+  h += "</div>";
+  app.innerHTML = h;
+}
+function gradeTest(ok){
+  const c = test.cards[test.i];
+  if(ok){ test.right++; applyGrade(c.id, 4); }
+  else { test.missed.push(c); applyGrade(c.id, 2); }
+  test.i++;
+  test.flipped = false;
+  renderHeader();
+  renderTest();
+}
+
+/* ==========================================================================
+   Router
+   ========================================================================== */
+function render(){
+  renderHeader();
+  for(const t of document.querySelectorAll(".tab")) t.classList.toggle("on", t.dataset.mode === mode);
+  if(mode === "test") return renderTest();
+  if(mode === "guide" && !subKey) return renderGuidePicker();
+  if(mode === "topic" && !subKey) return renderTopicPicker();
+  return renderDeckView();
+}
+function switchMode(m){
+  mode = m;
+  subKey = null;
+  if(m === "test"){ test = null; render(); return; }
+  buildDeck();
+  render();
+}
+
+/* ==========================================================================
+   Events
+   ========================================================================== */
+document.getElementById("tabs").addEventListener("click", function(e){
+  const t = e.target.closest(".tab");
+  if(t) switchMode(t.dataset.mode);
+});
+
+app.addEventListener("click", function(e){
+  const pickG = e.target.closest("[data-guide]");
+  if(pickG){ subKey = pickG.dataset.guide; buildDeck(); render(); return; }
+
+  const pickT = e.target.closest("[data-topic]");
+  if(pickT){ subKey = pickT.dataset.topic; buildDeck(); render(); return; }
+
+  const grade = e.target.closest("[data-grade]");
+  if(grade){ doGrade(parseInt(grade.dataset.grade,10)); return; }
+
+  const tg = e.target.closest("[data-tgrade]");
+  if(tg){ gradeTest(tg.dataset.tgrade === "1"); return; }
+
+  const tb = e.target.closest("[data-test]");
+  if(tb){ startTest(tb.dataset.test); return; }
+
+  const act = e.target.closest("[data-act]");
+  if(!act) return;
+  const a = act.dataset.act;
+  if(a === "flip"){ flipped = true; render(); }
+  else if(a === "skip"){ idx++; flipped = false; render(); }
+  else if(a === "back"){ subKey = null; buildDeck(); render(); }
+  else if(a === "again"){ idx = 0; flipped = false; shuffle(deck); render(); }
+  else if(a === "goall"){ switchMode("all"); }
+  else if(a === "tflip"){ test.flipped = true; renderTest(); }
+  else if(a === "tstop"){ endTest(); }
+  else if(a === "newtest"){ test = null; renderTestSetup(); }
+});
+
+function doGrade(g){
+  if(idx >= deck.length) return;
+  applyGrade(deck[idx].id, g);
+  idx++;
+  flipped = false;
+  render();
+}
+
+document.addEventListener("keydown", function(e){
+  if(e.metaKey || e.ctrlKey || e.altKey) return;
+  const tag = (e.target.tagName || "").toLowerCase();
+  if(tag === "input" || tag === "textarea") return;
+
+  if(mode === "test"){
+    if(!test || test.done || test.i >= test.cards.length) return;
+    if(e.code === "Space"){ e.preventDefault(); if(!test.flipped){ test.flipped = true; renderTest(); } return; }
+    if(!test.flipped) return;
+    if(e.key === "j" || e.key === "1"){ gradeTest(false); }
+    else if(e.key === "k" || e.key === "2"){ gradeTest(true); }
+    return;
+  }
+
+  if((mode === "guide" || mode === "topic") && !subKey) return;
+  if(idx >= deck.length || deck.length === 0) return;
+
+  if(e.code === "Space"){
+    e.preventDefault();
+    if(!flipped){ flipped = true; render(); }
+    return;
+  }
+  if(e.key === "ArrowRight"){ e.preventDefault(); idx++; flipped = false; render(); return; }
+  if(e.key === "ArrowLeft"){ e.preventDefault(); if(idx > 0) idx--; flipped = false; render(); return; }
+  if(!flipped) return;
+  if(e.key >= "1" && e.key <= "5"){ doGrade(parseInt(e.key,10)); return; }
+  if(e.key === "j"){ doGrade(2); return; }
+  if(e.key === "k"){ doGrade(4); return; }
+});
+
+/* ---------- theme ---------- */
+function readTheme(){
+  try{ return localStorage.getItem(LS_KEY + "_theme"); }catch(e){ return null; }
+}
+function writeTheme(v){
+  try{ localStorage.setItem(LS_KEY + "_theme", v); }catch(e){}
+}
+function applyTheme(v){
+  if(v === "light" || v === "dark") document.documentElement.setAttribute("data-theme", v);
+  else document.documentElement.removeAttribute("data-theme");
+}
+applyTheme(readTheme());
+document.getElementById("themeBtn").addEventListener("click", function(){
+  const cur = document.documentElement.getAttribute("data-theme");
+  const sysDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+  let next;
+  if(!cur) next = sysDark ? "light" : "dark";
+  else next = cur === "dark" ? "light" : "dark";
+  applyTheme(next);
+  writeTheme(next);
+});
+
+/* ---------- progress import / export / reset ---------- */
+function flash(text){
+  const el = document.getElementById("msg");
+  el.textContent = text;
+  el.className = "msg";
+  setTimeout(function(){ el.textContent = ""; }, 2600);
+}
+document.getElementById("exportBtn").addEventListener("click", function(){
+  try{
+    const blob = new Blob([JSON.stringify(STATE, null, 2)], {type:"application/json"});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "cell-drill-progress.json";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(function(){ URL.revokeObjectURL(url); }, 1500);
+    flash("Exported.");
+  }catch(e){ flash("Export failed."); }
+});
+document.getElementById("importBtn").addEventListener("click", function(){
+  document.getElementById("importFile").click();
+});
+document.getElementById("importFile").addEventListener("change", function(e){
+  const f = e.target.files && e.target.files[0];
+  if(!f) return;
+  const r = new FileReader();
+  r.onload = function(){
+    try{
+      const o = JSON.parse(r.result);
+      if(!o || typeof o !== "object" || !o.cards) throw new Error("shape");
+      STATE = {v:1, cards:o.cards};
+      saveState(STATE);
+      buildDeck();
+      render();
+      flash("Imported " + Object.keys(o.cards).length + " cards.");
+    }catch(err){ flash("That file is not a progress export."); }
+  };
+  r.readAsText(f);
+  e.target.value = "";
+});
+document.getElementById("resetBtn").addEventListener("click", function(){
+  if(!confirm("Erase all box positions and review history?")) return;
+  STATE = {v:1, cards:{}};
+  try{ localStorage.removeItem(LS_KEY); }catch(e){}
+  buildDeck();
+  render();
+  flash("Progress cleared.");
+});
+
+/* ---------- boot ---------- */
+buildDeck();
+render();
+</script>
+<script>/* open external links in a new tab; links within the library stay in this tab */
+document.addEventListener('click',function(e){var a=e.target.closest&&e.target.closest('a[href]');if(!a)return;var h=a.getAttribute('href');if(!h||h.charAt(0)==='#'||h.indexOf('javascript:')===0||a.hasAttribute('download'))return;if(!/^https?:$/.test(a.protocol)||a.host===location.host)return;a.target='_blank';a.rel='noopener';},true);
+</script>
+</body>
+</html>

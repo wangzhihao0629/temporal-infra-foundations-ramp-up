@@ -1,0 +1,1739 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>cert-manager and PKI for Cells - Temporal Cloud Infrastructure Ramp-Up</title>
+<link rel="stylesheet" href="style.css">
+<script>
+(function(){
+  try{
+    var t=localStorage.getItem('rampup-theme');
+    if(t){document.documentElement.setAttribute('data-theme',t);}
+  }catch(e){}
+  window.__toggleTheme=function(){
+    var el=document.documentElement;
+    var cur=el.getAttribute('data-theme');
+    if(!cur){
+      cur=window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';
+    }
+    var next=cur==='dark'?'light':'dark';
+    el.setAttribute('data-theme',next);
+    try{localStorage.setItem('rampup-theme',next);}catch(e){}
+  };
+})();
+</script>
+
+</head>
+<body>
+<div class="shell"><aside class="sidebar">
+  <div class="brand"><a href="../index.html">
+    <div class="brand-title">Temporal Cloud Infrastructure Ramp-Up</div>
+    <div class="brand-sub">New-role ramp-up &middot; public sources only</div>
+  </a></div>
+  <div class="nav-label">Guides</div>
+  <nav class="nav"><a href="01-golang.html"><span class="num">01</span><span>Go</span></a><a href="02-grpc.html"><span class="num">02</span><span>gRPC &amp; Protobuf</span></a><a href="03-multicloud-aws-gcp-azure.html"><span class="num">03</span><span>Multi-Cloud</span></a><a href="04-managed-kubernetes-eks-gke-aks.html"><span class="num">04</span><span>Managed Kubernetes</span></a><a href="05-cni-and-host-networking.html"><span class="num">05</span><span>CNI &amp; Host Networking</span></a><a href="06-karpenter.html"><span class="num">06</span><span>Karpenter</span></a><a href="07-kyverno.html"><span class="num">07</span><span>Kyverno</span></a><a href="08-terraform.html"><span class="num">08</span><span>Terraform</span></a><a href="09-helm.html"><span class="num">09</span><span>Helm</span></a><a href="10-vault.html"><span class="num">10</span><span>Vault</span></a><a href="11-cert-manager-and-pki.html" class="active"><span class="num">11</span><span>cert-manager &amp; PKI</span></a><a href="12-cell-lifecycle-synthesis.html"><span class="num">12</span><span>Cell Lifecycle</span></a><a href="13-gitops-argocd-flux.html"><span class="num">13</span><span>GitOps</span></a><a href="14-observability-for-cells.html"><span class="num">14</span><span>Observability</span></a><a href="15-temporal-programming-model.html"><span class="num">15</span><span>Temporal: Programming Model</span></a><a href="16-temporal-server-internals.html"><span class="num">16</span><span>Temporal Server Internals</span></a><a href="17-cell-based-architecture.html"><span class="num">17</span><span>Cell-Based Architecture</span></a></nav>
+  <div class="nav-label" style="margin-top:1rem">Practice</div>
+  <nav class="nav"><a href="../drill.html"><span class="num">&#9670;</span><span>Drill deck</span></a></nav>
+</aside><div class="main"><article class="doc"><div class="topbar">
+  <div class="crumbs"><span class="pill">Guide 11</span><span class="pill">52 refs</span><span class="pill">14,614 words</span></div>
+  <div style="display:flex;gap:.5rem;align-items:center">
+    <span>~73 min read</span>
+    <button class="iconbtn" onclick="__toggleTheme()">theme</button>
+  </div>
+</div><h1>cert-manager and PKI for Cells</h1>
+<div class="lede"><p><strong>Why this matters.</strong> A Temporal Cloud cell is a mesh of gRPC services — frontend, history, matching, worker — that must authenticate each other, plus an ingress path that must present a certificate a customer's SDK will trust. Every one of those certificates has an expiry, and every expiry is a scheduled outage unless something renews it. cert-manager is the machine that renews them. But cert-manager is the easy half. The hard half is the PKI <em>design</em> underneath it: who is the root, where does the private key live, which chain does each service present, and — the question that has broken more internal PKIs than any other — how do you rotate a root without simultaneously distrusting everything it signed. You are being asked to own "cert-manager and in general PKI for cells," and those are genuinely different disciplines. This guide covers both, with the PKI half weighted heavier because it is the part with no undo button.</p></div>
+<hr />
+<h2 id="the-mental-model">The mental model<a class="anchor" href="#the-mental-model">#</a></h2>
+<p><strong>A certificate is a signed assertion with an expiry date, and a PKI is the machinery for making, distributing, and retiring those assertions.</strong> Three separate problems, and teams that conflate them build PKIs that cannot rotate.</p>
+<ol>
+<li><strong>Issuance</strong> — a workload proves it deserves an identity, and a CA signs a certificate binding a key to that identity. cert-manager owns this in Kubernetes.</li>
+<li><strong>Trust distribution</strong> — a workload learns which CAs to believe. This is a completely separate pipeline, and it is the one that has no automation by default. <code>trust-manager</code>, <code>ClusterTrustBundle</code>, and container CA bundles live here.</li>
+<li><strong>Retirement</strong> — a certificate or a CA stops being valid. In practice this means <em>short lifetimes</em>, because revocation does not work at scale.</li>
+</ol>
+<p>The asymmetry that governs everything: <strong>issuance is fast and reversible; trust distribution is slow and one-way.</strong> You can issue a new leaf in seconds. Getting a new root into every trust store in the fleet takes as long as your slowest deploy. Therefore the invariant:</p>
+<blockquote>
+<p><strong>Distribute trust before you use it. Remove trust after you stop using it. Never in the other order.</strong></p>
+</blockquote>
+<p>Violate that and you get the classic internal-PKI outage: you rotate the root, cert-manager issues leaves from the new root, and every client that has not yet received the new trust bundle rejects them. This is what the "overlapping trust rollover" procedure below exists to prevent.</p>
+<p>The second governing idea: <strong>hierarchy is about blast radius and key storage, not about cryptography.</strong> A root exists to be offline. An intermediate exists to be online and disposable. If your root's private key is sitting in a Kubernetes Secret, you have a one-level PKI with extra steps.</p>
+<p>The third: <strong>a certificate says nothing about authorization.</strong> It says "the holder of this key is named X, according to this CA." Whether X may call your API is your problem. SPIFFE is what happens when you take that seriously and give every workload a structured, verifiable name.</p>
+<hr />
+<h2 id="core-concepts">Core concepts<a class="anchor" href="#core-concepts">#</a></h2>
+<h3 id="what-a-ca-actually-is">What a CA actually is<a class="anchor" href="#what-a-ca-actually-is">#</a></h3>
+<p>Operationally: a private key, a self-signed (or parent-signed) certificate with <code>CA:TRUE</code> in Basic Constraints, a serial number counter, and a policy about what it will sign. That is it. Everything else — HSMs, ceremonies, CP/CPS documents — is process wrapped around protecting the key and constraining the policy.</p>
+<p>The certificate that makes something a CA has two mandatory-ish extensions:</p>
+<ul>
+<li><strong>Basic Constraints</strong>: <code>CA:TRUE</code>, optionally with <code>pathlen:N</code>.</li>
+<li><strong>Key Usage</strong>: must include <code>keyCertSign</code>. Usually also <code>cRLSign</code>. <a href="https://www.rfc-editor.org/rfc/rfc5280#section-4.2.1.3">RFC 5280 §4.2.1.3</a> requires that if <code>keyCertSign</code> is asserted, Basic Constraints <code>cA</code> must be TRUE.</li>
+</ul>
+<p>A CA whose certificate lacks <code>keyCertSign</code> will produce certificates that fail validation in every correct implementation, and the error message will be about the <em>leaf</em>, not the CA. This is a classic half-day debugging session.</p>
+<h3 id="root-vs-intermediate-and-why-you-want-at-least-two-levels">Root vs intermediate, and why you want at least two levels<a class="anchor" href="#root-vs-intermediate-and-why-you-want-at-least-two-levels">#</a></h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Root CA</th>
+<th>Intermediate (issuing) CA</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Private key location</td>
+<td>Offline: HSM, KMS with no online signer, or air-gapped</td>
+<td>Online: Vault PKI, cloud CA, KMS-backed signer</td>
+</tr>
+<tr>
+<td>Lifetime</td>
+<td>10–20 years</td>
+<td>1–5 years</td>
+</tr>
+<tr>
+<td>What it signs</td>
+<td>Only intermediates</td>
+<td>Only leaves</td>
+</tr>
+<tr>
+<td>Distributed to trust stores</td>
+<td>Yes — this is the trust anchor</td>
+<td>No — sent in the chain at handshake time</td>
+</tr>
+<tr>
+<td>Compromise impact</td>
+<td>Rebuild the entire PKI, redistribute trust everywhere</td>
+<td>Revoke it, issue a new one from the root, reissue leaves. Painful but survivable.</td>
+</tr>
+<tr>
+<td>Rotation cadence</td>
+<td>As rarely as possible</td>
+<td>Regularly, ideally boringly</td>
+</tr>
+</tbody>
+</table>
+<p>The reason for the split is not cryptographic strength — it is that <strong>the intermediate is designed to be disposable and the root is designed never to move.</strong> If you have one CA and it is online, an incident means redistributing trust to every workload under time pressure, which is the worst possible moment to be doing the slow one-way operation.</p>
+<p><code>pathlen</code> is how you enforce the shape. <code>pathlen:0</code> on an intermediate means "this CA may sign leaves but not further CAs." Note up front that <strong>cert-manager cannot set it</strong> — there is no <code>pathLen</code> field on <code>Certificate</code> (<a href="https://github.com/cert-manager/cert-manager/issues/2820">cert-manager#2820</a>), so a cert-manager-signed intermediate is unconstrained. Vault PKI (<code>max_path_length</code> on <code>pki/root/generate</code> and <code>pki/intermediate/set-signed</code>) and the cloud private CAs can set it; that asymmetry is one more argument for Vault as the issuing CA.</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># Read a CA cert and check its constraints</span>
+openssl x509 -in intermediate.crt -noout -text <span class="p">|</span> <span class="se">\</span>
+  grep -A1 <span class="s1">&#39;Basic Constraints\|Key Usage&#39;</span>
+<span class="c1">#   X509v3 Basic Constraints: critical</span>
+<span class="c1">#       CA:TRUE, pathlen:0</span>
+<span class="c1">#   X509v3 Key Usage: critical</span>
+<span class="c1">#       Certificate Sign, CRL Sign</span>
+</code></pre></div>
+
+<h3 id="cross-signing-and-the-which-chain-do-i-serve-problem">Cross-signing and the "which chain do I serve" problem<a class="anchor" href="#cross-signing-and-the-which-chain-do-i-serve-problem">#</a></h3>
+<p><strong>Cross-signing</strong> means the same public key + subject is certified by two different parents, producing two certificates. The classic example is Let's Encrypt's ISRG Root X1, which for years was also cross-signed by IdenTrust's DST Root CA X3 so that old Android devices — which had DST but not ISRG — could still validate.</p>
+<p>This creates the operational problem that trips up almost everyone: <strong>a server does not send "the chain." It sends <em>a</em> chain, and the chain it sends determines which clients succeed.</strong></p>
+<ul>
+<li>Send the chain up to the <em>new</em> root: modern clients validate; old clients that only trust the old root fail.</li>
+<li>Send the chain up to the <em>old</em> root via the cross-signed intermediate: old clients validate; modern clients validate too (they can build a path either way, and most will).</li>
+</ul>
+<p>The rule: <strong>serve the chain that maximizes the set of clients who can build a path to a root they trust.</strong> During a cross-signed transition that usually means serving the longer, cross-signed chain until the old clients are gone, then shortening it.</p>
+<p>Modern OpenSSL and Go build paths reasonably well and will often find an alternative if you send a suboptimal chain. Older OpenSSL 1.0.x and many embedded stacks do strict chain-following and will fail. Test with what your clients actually run.</p>
+<p>cert-manager exposes this directly on the ACME issuer via <code>preferredChain</code>:</p>
+<div class="codehilite"><pre><span></span><code><span class="nt">spec</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">acme</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">preferredChain</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;ISRG</span><span class="nv"> </span><span class="s">Root</span><span class="nv"> </span><span class="s">X1&quot;</span><span class="w">   </span><span class="c1"># ask the CA for a specific chain</span><span class="w"></span>
+</code></pre></div>
+
+<p>Never put an intermediate in a trust store to "fix" a chain problem. The <a href="https://cert-manager.io/docs/trust/trust-manager/#bundling-intermediates">trust-manager docs</a> are explicit about why: it makes the intermediate a de facto root, which "means that the intermediate cannot be safely rotated without all trust stores which contain it being updated first" — you have destroyed the entire reason intermediates exist.</p>
+<h3 id="name-constraints">Name constraints<a class="anchor" href="#name-constraints">#</a></h3>
+<p><strong>Name Constraints</strong> (<a href="https://www.rfc-editor.org/rfc/rfc5280#section-4.2.1.10">RFC 5280 §4.2.1.10</a>) let a CA certificate declare "any certificate below me is only valid for names in this set." It is the single most underused control in internal PKI.</p>
+<p>If you cross-sign a partner's CA, or you hand a per-region intermediate to a regional team, name constraints turn "this CA can impersonate anything" into "this CA can only issue for <code>*.usw2.cells.example.internal</code>." Enforcement is client-side, and support is good in Go, OpenSSL 1.1+, and NSS; historically weak in Java and some embedded stacks, so it is defense in depth, not a hard boundary.</p>
+<div class="codehilite"><pre><span></span><code>X509v3 Name Constraints: critical
+    Permitted:
+      DNS:.usw2.cells.example.internal
+      DNS:.usw2.svc.cluster.local
+    Excluded:
+      DNS:.example.com
+</code></pre></div>
+
+<p>Note the leading dot: <code>DNS:.example.com</code> constrains <em>subdomains</em>, and per RFC 5280 the constraint matches by suffix on domain components. A leaf that violates a permitted subtree fails with <code>error 47 at 0 depth lookup: permitted subtree violation</code> under <code>openssl verify</code>.</p>
+<p>In cert-manager this is <code>spec.nameConstraints</code>, but it is an <strong>alpha</strong> field: it does nothing unless <code>--feature-gates=NameConstraints=true</code> is set on <em>both</em> the controller and the webhook. The shape is <code>nameConstraints: {critical, permitted: {dnsDomains, ipRanges, emailAddresses, uriDomains}, excluded: {...}}</code> — not the <code>DNS:</code>-prefixed strings openssl prints. Vault PKI's <code>permitted_dns_domains</code> on the intermediate needs no feature gate and is the easier path.</p>
+<h3 id="eku-ku-and-sans">EKU, KU, and SANs<a class="anchor" href="#eku-ku-and-sans">#</a></h3>
+<p><strong>Key Usage (KU)</strong> describes what the <em>key</em> may do: <code>digitalSignature</code>, <code>keyEncipherment</code>, <code>keyCertSign</code>, <code>cRLSign</code>. <strong>Extended Key Usage (EKU)</strong> describes what the <em>certificate</em> is for: <code>serverAuth</code> (1.3.6.1.5.5.7.3.1), <code>clientAuth</code> (1.3.6.1.5.5.7.3.2), <code>codeSigning</code>, etc.</p>
+<p>For mTLS between cell services, every certificate needs <strong>both</strong> <code>serverAuth</code> and <code>clientAuth</code>, because every service is both. Forgetting <code>clientAuth</code> produces a beautifully confusing failure: the server side of the handshake works, the client side is rejected, and half your service graph is fine.</p>
+<p>In cert-manager:</p>
+<div class="codehilite"><pre><span></span><code><span class="nt">spec</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">usages</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">digital signature</span><span class="w"></span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">key encipherment</span><span class="w"></span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">server auth</span><span class="w"></span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">client auth</span><span class="w"></span>
+</code></pre></div>
+
+<p><strong>SANs and the death of CN.</strong> The Common Name has not been a valid source of hostname identity for years. <a href="https://www.rfc-editor.org/rfc/rfc6125">RFC 6125</a> deprecated CN fallback, the CA/Browser Forum Baseline Requirements forbid public CAs from relying on it, and <strong>Go disabled CN fallback by default in Go 1.15 (behind a temporary <code>GODEBUG=x509ignoreCN=0</code> escape hatch) and removed it entirely in Go 1.17</strong> — which matters enormously here, because Temporal, Kubernetes, and essentially the entire cloud-native stack are written in Go. A certificate with <code>CN=frontend.cell.internal</code> and no SAN simply does not work.</p>
+<p>Always set <code>dnsNames</code>. Treat <code>commonName</code> as a human-readable label, or omit it. Note also that the CN field is limited to 64 characters, which silently truncates long service names — another reason to stop using it.</p>
+<div class="codehilite"><pre><span></span><code><span class="nt">spec</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">commonName</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">temporal-frontend</span><span class="w">        </span><span class="c1"># cosmetic</span><span class="w"></span>
+<span class="w">  </span><span class="nt">dnsNames</span><span class="p">:</span><span class="w">                            </span><span class="c1"># this is what actually matters</span><span class="w"></span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">temporal-frontend.cell-usw2-042.svc.cluster.local</span><span class="w"></span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">temporal-frontend.cell-usw2-042.svc</span><span class="w"></span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">temporal-frontend</span><span class="w"></span>
+<span class="w">  </span><span class="nt">uris</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">spiffe://example.internal/ns/cell-usw2-042/sa/temporal-frontend</span><span class="w"></span>
+</code></pre></div>
+
+<h3 id="key-algorithms-what-actually-works">Key algorithms: what actually works<a class="anchor" href="#key-algorithms-what-actually-works">#</a></h3>
+<table>
+<thead>
+<tr>
+<th>Algorithm</th>
+<th>Size</th>
+<th>Handshake cost</th>
+<th>Support reality</th>
+<th>Verdict</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>RSA</td>
+<td>2048</td>
+<td>Slow sign, fast verify</td>
+<td>Universal</td>
+<td>Safe default when you have unknown clients</td>
+</tr>
+<tr>
+<td>RSA</td>
+<td>4096</td>
+<td>Much slower sign</td>
+<td>Universal</td>
+<td>Roots only; pointless for leaves</td>
+</tr>
+<tr>
+<td>ECDSA</td>
+<td>P-256</td>
+<td>Fast</td>
+<td>Excellent — every modern TLS stack</td>
+<td><strong>Best choice for internal PKI</strong></td>
+</tr>
+<tr>
+<td>ECDSA</td>
+<td>P-384</td>
+<td>Fast</td>
+<td>Excellent</td>
+<td>Roots and intermediates</td>
+</tr>
+<tr>
+<td>Ed25519</td>
+<td>—</td>
+<td>Fastest</td>
+<td><strong>Effectively TLS 1.3 in practice (TLS 1.2 use is specified by RFC 8422 but patchy), and stack support is uneven</strong></td>
+<td>Not yet for a heterogeneous fleet</td>
+</tr>
+</tbody>
+</table>
+<p>The Ed25519 caveat is the one that surprises people. It is the best algorithm on paper, it is supported in Go and OpenSSL 3.x, but it is <strong>not usable in the Web PKI</strong> (the CA/Browser Forum Baseline Requirements do not permit it for publicly trusted TLS), and support in Java, .NET, and older load balancers is patchy. cert-manager supports <code>Ed25519</code> in <code>spec.privateKey.algorithm</code>, but your issuing CA has to support it too — Vault PKI does, AWS Private CA does not.</p>
+<p>For internal cell PKI where you control both ends: <strong>ECDSA P-256 leaves, ECDSA P-384 intermediates and root.</strong> Faster handshakes, smaller certificates, less CPU on services doing thousands of mTLS connections. For anything a customer's SDK terminates against: RSA 2048 or ECDSA P-256 depending on what you can verify your customers support.</p>
+<div class="codehilite"><pre><span></span><code><span class="nt">spec</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">privateKey</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">algorithm</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">ECDSA</span><span class="w"></span>
+<span class="w">    </span><span class="nt">size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">256</span><span class="w"></span>
+<span class="w">    </span><span class="nt">encoding</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">PKCS8</span><span class="w"></span>
+<span class="w">    </span><span class="nt">rotationPolicy</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Always</span><span class="w"></span>
+</code></pre></div>
+
+<h3 id="serial-numbers">Serial numbers<a class="anchor" href="#serial-numbers">#</a></h3>
+<p>Serial numbers must be unique per issuer and, for public CAs, must contain at least 64 bits of CA-generated entropy (a Baseline Requirements rule that exists because of the MD5 collision attacks on sequential serials). For internal CAs the same practice is correct: random, not sequential. Vault PKI and cert-manager's CA issuer both do this. Sequential serials leak issuance volume and enable a class of prediction attacks.</p>
+<p>Serials also matter operationally because they are how you correlate a certificate in a log with a certificate on a wire:</p>
+<div class="codehilite"><pre><span></span><code>openssl x509 -in leaf.crt -noout -serial
+<span class="c1"># serial=5A3F1C09B2E7D48A...</span>
+</code></pre></div>
+
+<h3 id="aia-crl-and-ocsp">AIA, CRL, and OCSP<a class="anchor" href="#aia-crl-and-ocsp">#</a></h3>
+<p>Three extensions that tell a client where to get more information:</p>
+<ul>
+<li><strong>AIA (Authority Information Access)</strong> — <code>caIssuers</code> gives a URL where the issuing certificate can be fetched, letting a client complete a chain the server failed to send. <code>OCSP</code> gives a responder URL.</li>
+<li><strong>CRL Distribution Points</strong> — where to fetch the certificate revocation list.</li>
+<li><strong>OCSP</strong> — an online query for a single certificate's status.</li>
+</ul>
+<p><strong>For internal PKI, the honest position is that none of these work well, and you should design so you do not need them.</strong> CRLs grow unboundedly and are cached for hours. OCSP adds a network dependency to every handshake, and OCSP stapling — the fix — requires server support you may not have. Chrome removed online OCSP checking years ago; browsers use pushed revocation lists instead. And the CA/Browser Forum's own <a href="https://cabforum.org/2025/04/11/ballot-sc081v3-introduce-schedule-of-reducing-validity-and-data-reuse-periods/">SC-081v3 ballot</a> says it plainly: certificate status services "do not adequately protect relying parties at the current scale of the internet."</p>
+<p>If you do set AIA <code>caIssuers</code> for internal certs, the URL must be reachable from every client, which for a cell means an internal endpoint with its own availability requirement. Usually not worth it. <strong>Serve the full chain and use short lifetimes instead.</strong></p>
+<h3 id="certificate-lifetimes-and-the-industry-shortening">Certificate lifetimes and the industry shortening<a class="anchor" href="#certificate-lifetimes-and-the-industry-shortening">#</a></h3>
+<p>This is the change that reshapes certificate operations, and it is already partly in effect.</p>
+<p><strong>CA/Browser Forum Ballot SC-081v3</strong> passed on 2025-04-11 with <strong>25 Certificate Issuers voting yes, zero no</strong>, and all four Certificate Consumers (Apple, Google, Microsoft, Mozilla) voting yes. It sets a phased reduction of the maximum validity period for publicly trusted TLS certificates:</p>
+<table>
+<thead>
+<tr>
+<th>Effective date</th>
+<th>Max certificate validity</th>
+<th>Max DCV (domain validation) data reuse</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Before 2026-03-15</td>
+<td>398 days</td>
+<td>398 days</td>
+</tr>
+<tr>
+<td><strong>2026-03-15</strong></td>
+<td><strong>200 days</strong></td>
+<td>200 days</td>
+</tr>
+<tr>
+<td><strong>2027-03-15</strong></td>
+<td><strong>100 days</strong></td>
+<td>100 days</td>
+</tr>
+<tr>
+<td><strong>2029-03-15</strong></td>
+<td><strong>47 days</strong></td>
+<td><strong>10 days</strong></td>
+</tr>
+</tbody>
+</table>
+<p>As of today (2026-08-29) <strong>the 200-day limit is already in force.</strong> The 47-day endpoint in March 2029 is the number people quote, but the operational lesson lands earlier: by March 2027 you are renewing public certificates roughly every seven weeks, and manual renewal is simply not viable.</p>
+<p>Two things to be precise about:</p>
+<ol>
+<li><strong>This applies only to publicly trusted TLS server certificates.</strong> The ballot's own scope note says the Baseline Requirements address certificates "intended to be used for authenticating servers accessible through the Internet." Your internal cell CA is not bound by it.</li>
+<li><strong>You should adopt shorter lifetimes internally anyway</strong>, and for a better reason: short lifetimes are your revocation strategy. A 24-hour internal certificate means a compromised key is worthless tomorrow without any CRL infrastructure. It also means your renewal path is exercised constantly, so it cannot silently rot — the failure mode where renewal has been broken for six months and nobody noticed until expiry becomes structurally impossible.</li>
+</ol>
+<p>Practical internal targets: <strong>leaves 24h–90d, intermediates 1–5y, root 10–20y.</strong> With cert-manager and a Vault or cloud issuing CA, 24-hour leaves are entirely routine. Note cert-manager fixed an integer overflow in <code>renewBeforePercentage</code> in 1.21 that affected certificates with durations longer than roughly three years — another reason not to make leaves long-lived.</p>
+<hr />
+<h2 id="trust-distribution">Trust distribution<a class="anchor" href="#trust-distribution">#</a></h2>
+<p>This is the part with no default automation, and it is where internal PKIs actually fail.</p>
+<h3 id="how-a-workload-decides-to-trust-your-ca">How a workload decides to trust your CA<a class="anchor" href="#how-a-workload-decides-to-trust-your-ca">#</a></h3>
+<p>A TLS client validates a chain against a set of <strong>trust anchors</strong>. Where it finds them depends entirely on the stack:</p>
+<table>
+<thead>
+<tr>
+<th>Stack</th>
+<th>Where it looks</th>
+<th>How you add a CA</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>OpenSSL / most Linux C programs</td>
+<td><code>/etc/ssl/certs/ca-certificates.crt</code>, <code>$SSL_CERT_FILE</code>, <code>$SSL_CERT_DIR</code></td>
+<td>Drop PEM in <code>/usr/local/share/ca-certificates/</code>, run <code>update-ca-certificates</code></td>
+</tr>
+<tr>
+<td>Go</td>
+<td>System store via <code>crypto/x509</code>, or an explicit <code>RootCAs</code> pool</td>
+<td>Either system store or <code>tls.Config.RootCAs</code></td>
+</tr>
+<tr>
+<td>Java</td>
+<td><code>$JAVA_HOME/lib/security/cacerts</code> (JKS/PKCS#12)</td>
+<td><code>keytool -importcert</code>, or a PKCS#12 truststore</td>
+</tr>
+<tr>
+<td>Node.js</td>
+<td>Bundled CA list, plus <code>NODE_EXTRA_CA_CERTS</code></td>
+<td><code>NODE_EXTRA_CA_CERTS=/etc/ssl/internal-ca.pem</code></td>
+</tr>
+<tr>
+<td>Python <code>requests</code></td>
+<td><code>certifi</code> bundle</td>
+<td><code>REQUESTS_CA_BUNDLE</code> / <code>SSL_CERT_FILE</code></td>
+</tr>
+<tr>
+<td>Envoy / Istio</td>
+<td>Explicit config, never the system store</td>
+<td><code>validation_context.trusted_ca</code></td>
+</tr>
+</tbody>
+</table>
+<p>The Go behavior is the one that matters most here, and it is a trap: Go on Linux reads the system store, which in a <strong>distroless or scratch container may not exist at all</strong>. A Go service in a distroless image with no <code>/etc/ssl/certs</code> will fail every outbound TLS connection with a nearly useless error. You must either mount a bundle or use the <code>-nonroot</code> / <code>base</code> distroless variants that include <code>ca-certificates</code>.</p>
+<h3 id="the-four-mechanisms-compared">The four mechanisms, compared<a class="anchor" href="#the-four-mechanisms-compared">#</a></h3>
+<table>
+<thead>
+<tr>
+<th>Mechanism</th>
+<th>Scope</th>
+<th>Rotation</th>
+<th>Requires pod restart?</th>
+<th>Verdict</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Baked into container image</td>
+<td>Per image</td>
+<td>Rebuild + redeploy every image</td>
+<td>Yes</td>
+<td>Never. This is the anti-pattern.</td>
+</tr>
+<tr>
+<td>ConfigMap mounted as a volume</td>
+<td>Per namespace</td>
+<td>Update the ConfigMap; kubelet syncs the file (up to ~1 min)</td>
+<td>No, <em>if</em> the app re-reads the file</td>
+<td>Workable, but you manage the ConfigMap in N namespaces yourself</td>
+</tr>
+<tr>
+<td><strong>trust-manager <code>Bundle</code></strong></td>
+<td>Cluster-wide, namespace-selected</td>
+<td>Update a source; the operator fans out to every namespace</td>
+<td>No, if the app re-reads</td>
+<td><strong>The current answer for Kubernetes</strong></td>
+</tr>
+<tr>
+<td><strong><code>ClusterTrustBundle</code></strong></td>
+<td>Cluster-wide, native API</td>
+<td>Update the object; kubelet projects it into the volume</td>
+<td>No</td>
+<td><strong>The future answer — now GA</strong></td>
+</tr>
+</tbody>
+</table>
+<p><strong><code>ClusterTrustBundle</code> reached GA (stable, enabled by default) in Kubernetes 1.37</strong>, released 2026-08-26, in the <code>certificates.k8s.io/v1</code> API group. It went alpha in 1.27 and beta in 1.33. It is a cluster-scoped object holding PEM trust anchors that pods request via a projected volume, keyed by signer name. In the same release, <strong><code>PodCertificateRequest</code> (KEP-4317) also went stable</strong>: a pod declares a <code>podCertificate</code> projected volume naming a signer, the kubelet creates a <code>PodCertificateRequest</code>, a signer controller issues a short-lived certificate and maintains the corresponding <code>ClusterTrustBundle</code>, and the key and certificate are delivered straight into the pod with automatic rotation.</p>
+<p>That combination is significant: Kubernetes now has a native workload-PKI story that did not exist a year ago. It does not make cert-manager obsolete — you still need a real CA behind the signer, policy, ACME for public certs, and multi-format output — but it changes the trust-distribution half of the problem substantially, and it is worth designing toward. Note that cert-manager 1.21 supports Kubernetes <strong>1.33 → 1.36</strong>, so 1.37 support arrives with cert-manager 1.22 (~November 2026); check the <a href="https://cert-manager.io/docs/releases/">supported releases table</a> before assuming compatibility.</p>
+<h3 id="trust-manager">trust-manager<a class="anchor" href="#trust-manager">#</a></h3>
+<p>trust-manager adds one cluster-scoped CRD, <code>Bundle</code>, which assembles trust anchors from several sources and writes the result to a ConfigMap (or Secret) in every selected namespace.</p>
+<div class="codehilite"><pre><span></span><code><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">trust.cert-manager.io/v1alpha1</span><span class="w"></span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Bundle</span><span class="w"></span>
+<span class="nt">metadata</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">temporal-internal-trust</span><span class="w"></span>
+<span class="nt">spec</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">sources</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="c1"># Public CAs, for outbound calls to cloud APIs. Pin the package image.</span><span class="w"></span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">useDefaultCAs</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span><span class="w"></span>
+
+<span class="w">    </span><span class="c1"># Our root(s) — deliberately copied into a dedicated ConfigMap, NOT read</span><span class="w"></span>
+<span class="w">    </span><span class="c1"># directly from the cert-manager Secret. See the rotation section below.</span><span class="w"></span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">configMap</span><span class="p">:</span><span class="w"></span>
+<span class="w">        </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">temporal-trust-anchors</span><span class="w"></span>
+<span class="w">        </span><span class="nt">key</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">roots.pem</span><span class="w"></span>
+
+<span class="w">  </span><span class="nt">target</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">configMap</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="nt">key</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">ca-certificates.crt</span><span class="w"></span>
+<span class="w">    </span><span class="nt">additionalFormats</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="nt">pkcs12</span><span class="p">:</span><span class="w"></span>
+<span class="w">        </span><span class="nt">key</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">truststore.p12</span><span class="w"></span>
+<span class="w">    </span><span class="nt">namespaceSelector</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="nt">matchLabels</span><span class="p">:</span><span class="w"></span>
+<span class="w">        </span><span class="nt">example.com/cell</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;true&quot;</span><span class="w"></span>
+</code></pre></div>
+
+<p>Key facts from the <a href="https://cert-manager.io/docs/trust/trust-manager/">trust-manager docs</a>:</p>
+<ul>
+<li>Sources: <code>configMap</code>, <code>secret</code>, <code>inLine</code>, <code>useDefaultCAs</code>. ConfigMap and Secret sources support either a single <code>key</code> or <code>includeAllKeys</code>, and either a <code>name</code> or a label <code>selector</code> — mutually exclusive in both cases.</li>
+<li>Targets: ConfigMap by default; <strong>Secret targets require explicitly enabling them in the controller</strong> and have existed since v0.7.0.</li>
+<li>Additional formats: <strong>JKS since v0.5.0, PKCS#12 since v0.7.0.</strong> Default passwords are <code>changeit</code> for JKS and empty for PKCS#12, and the docs correctly call these "security theater." JKS output is now marked deprecated in the trust-manager API and slated for removal — use PKCS#12, which Java reads fine.</li>
+<li>The default CA package is a container image, currently <code>quay.io/jetstack/trust-pkg-debian-bookworm</code> for trust-manager &gt;= v0.16. <strong>You must keep it updated</strong> — it is the equivalent of never running <code>apt-get upgrade ca-certificates</code>.</li>
+<li><strong>An empty <code>namespaceSelector</code> currently syncs to all namespaces, and the docs warn this will change</strong> to sync only to the trust-manager namespace. Always set the selector explicitly.</li>
+<li>trust-manager is <a href="https://cert-manager.io/announcements/2025/09/05/trust-manager-clusterbundle-future/">migrating to a <code>ClusterBundle</code> resource</a> in a new API group <code>trust-manager.io/v1alpha2</code>, aligning more closely with the native <code>ClusterTrustBundle</code>. Plan for the API change.</li>
+</ul>
+<h3 id="the-root-rotation-problem--the-hardest-part-of-internal-pki">The root rotation problem — the hardest part of internal PKI<a class="anchor" href="#the-root-rotation-problem--the-hardest-part-of-internal-pki">#</a></h3>
+<p>This is the section to read twice.</p>
+<p><strong>The failure mode.</strong> You point a <code>Bundle</code> directly at the cert-manager Secret holding your root. You rotate the root. trust-manager sees the Secret change and immediately updates every trust bundle to contain only the new root. Every service still holding a leaf signed by the old root is now untrusted, cluster-wide, in about thirty seconds. The trust-manager docs describe exactly this: "if you rotate your issuer such that it's issued from a new root certificate, trust-manager will see the Secret be updated and automatically update your trust bundle to include the new root — immediately distrusting the old root."</p>
+<p><strong>The fix has two parts.</strong></p>
+<p><em>Part one: decouple.</em> Never point a <code>Bundle</code> at a live cert-manager Secret. Copy the root into a dedicated ConfigMap that only <em>you</em> change, and point the Bundle at that. This seems like pointless indirection until the first rotation, at which point it is the only thing standing between you and a fleet-wide outage. The trust-manager docs call this out as a best practice.</p>
+<p><em>Part two: overlap.</em> Trust both roots for a window that exceeds the maximum lifetime of any leaf signed by the old root.</p>
+<p><strong>The overlapping-trust rollover procedure, in order:</strong></p>
+<p><strong>Phase 0 — Preconditions.</strong></p>
+<ul>
+<li>Know the maximum lifetime of every leaf signed by the old root. Call it <code>L</code>.</li>
+<li>Know your slowest trust-bundle propagation time: how long from "I update the ConfigMap" to "the last pod in the fleet has re-read it." Call it <code>P</code>. For a fleet where some services only re-read on restart, <code>P</code> is your slowest deploy cadence, which may be days.</li>
+<li>Have monitoring that can answer "which certificates in the fleet chain to root A?" If you cannot answer that, stop and build it first. Certificate Transparency does not exist for internal PKI; you need your own inventory.</li>
+</ul>
+<p><strong>Phase 1 — Create the new root. Do not use it.</strong></p>
+<p>Generate root B, offline, with a lifetime that overlaps root A generously. Do not create any intermediate under it yet.</p>
+<p><strong>Phase 2 — Distribute trust for both roots. Wait <code>P</code>.</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># temporal-trust-anchors ConfigMap now contains BOTH</span><span class="w"></span>
+<span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">v1</span><span class="w"></span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">ConfigMap</span><span class="w"></span>
+<span class="nt">metadata</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">temporal-trust-anchors</span><span class="w"></span>
+<span class="w">  </span><span class="nt">namespace</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cert-manager</span><span class="w"></span>
+<span class="nt">data</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">roots.pem</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">|</span><span class="w"></span>
+<span class="w">    </span><span class="no">-----BEGIN CERTIFICATE-----   # root A (current)</span><span class="w"></span>
+<span class="w">    </span><span class="no">...</span><span class="w"></span>
+<span class="w">    </span><span class="no">-----END CERTIFICATE-----</span><span class="w"></span>
+<span class="w">    </span><span class="no">-----BEGIN CERTIFICATE-----   # root B (new, not yet issuing)</span><span class="w"></span>
+<span class="w">    </span><span class="no">...</span><span class="w"></span>
+<span class="w">    </span><span class="no">-----END CERTIFICATE-----</span><span class="w"></span>
+</code></pre></div>
+
+<p><strong>Verify propagation before proceeding.</strong> Not "wait a while" — actually check:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">for</span> ns <span class="k">in</span> <span class="k">$(</span>kubectl get ns -l example.com/cell<span class="o">=</span><span class="nb">true</span> -o name <span class="p">|</span> cut -d/ -f2<span class="k">)</span><span class="p">;</span> <span class="k">do</span>
+  <span class="nv">n</span><span class="o">=</span><span class="k">$(</span>kubectl -n <span class="s2">&quot;</span><span class="nv">$ns</span><span class="s2">&quot;</span> get cm temporal-internal-trust <span class="se">\</span>
+        -o <span class="nv">jsonpath</span><span class="o">=</span><span class="s1">&#39;{.data.ca-certificates\.crt}&#39;</span> <span class="m">2</span>&gt;/dev/null <span class="se">\</span>
+      <span class="p">|</span> grep -c <span class="s1">&#39;BEGIN CERTIFICATE&#39;</span><span class="k">)</span>
+  <span class="nb">echo</span> <span class="s2">&quot;</span><span class="nv">$ns</span><span class="s2">: </span><span class="nv">$n</span><span class="s2"> anchors&quot;</span>
+<span class="k">done</span>
+</code></pre></div>
+
+<p>And verify inside a running pod, not just in the ConfigMap — the ConfigMap being correct does not mean the process re-read it:</p>
+<div class="codehilite"><pre><span></span><code>kubectl -n cell-usw2-042 <span class="nb">exec</span> deploy/temporal-frontend -- <span class="se">\</span>
+  sh -c <span class="s1">&#39;openssl crl2pkcs7 -nocrl -certfile /etc/ssl/certs/ca-certificates.crt \</span>
+<span class="s1">         | openssl pkcs7 -print_certs -noout | grep -c subject&#39;</span>
+</code></pre></div>
+
+<p><strong>Phase 3 — Create the intermediate under root B and switch issuance.</strong></p>
+<p>Now, and only now, create intermediate B under root B, and repoint your <code>ClusterIssuer</code> at it. New leaves chain to B. Old leaves chaining to A are still valid, and still trusted, because both roots are in every bundle.</p>
+<p><strong>Phase 4 — Wait for natural expiry, or force reissuance.</strong></p>
+<p>Either wait <code>L</code> for every old leaf to expire and renew, or actively force reissuance:</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># cert-manager: force reissuance of every Certificate in a namespace</span>
+kubectl -n cell-usw2-042 get certificate -o name <span class="p">|</span> <span class="se">\</span>
+  xargs -I<span class="o">{}</span> kubectl -n cell-usw2-042 patch <span class="o">{}</span> --type<span class="o">=</span>merge <span class="se">\</span>
+    -p <span class="s1">&#39;{&quot;spec&quot;:{&quot;privateKey&quot;:{&quot;rotationPolicy&quot;:&quot;Always&quot;}}}&#39;</span>
+<span class="c1"># or, with cmctl:</span>
+cmctl renew --all --namespace cell-usw2-042
+</code></pre></div>
+
+<p><strong>Phase 5 — Verify zero remaining dependence on root A.</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># Check what a live service is actually serving</span>
+kubectl -n cell-usw2-042 <span class="nb">exec</span> deploy/temporal-frontend -- <span class="se">\</span>
+  openssl s_client -connect temporal-history:7234 -showcerts &lt;/dev/null <span class="m">2</span>&gt;/dev/null <span class="se">\</span>
+  <span class="p">|</span> openssl crl2pkcs7 -nocrl -certfile /dev/stdin <span class="se">\</span>
+  <span class="p">|</span> openssl pkcs7 -print_certs -noout
+</code></pre></div>
+
+<p>Do this across every service, every cell, and every non-Kubernetes consumer (there is always one — a CI runner, a monitoring probe, a partner integration).</p>
+<p><strong>Phase 6 — Remove root A from the anchors ConfigMap. Wait <code>P</code> again.</strong></p>
+<p><strong>Phase 7 — Destroy root A's private key</strong> only after step 6 has propagated and been verified.</p>
+<p>Total elapsed time: <code>P + L + P</code>, plus verification. For a fleet with 90-day leaves and a weekly deploy cadence, that is on the order of a quarter. <strong>Plan root rotations as quarter-long projects, not as change tickets.</strong> This is why roots have 10–20 year lifetimes and why the intermediate exists to absorb routine rotation instead.</p>
+<p><strong>Intermediate rotation is much cheaper</strong> because intermediates are not trust anchors — they travel in the chain. Rotating an intermediate under the same root requires no trust distribution at all, just reissuance. This is the entire argument for the two-level hierarchy, stated operationally.</p>
+<hr />
+<h2 id="cert-manager-architecture">cert-manager architecture<a class="anchor" href="#cert-manager-architecture">#</a></h2>
+<h3 id="components">Components<a class="anchor" href="#components">#</a></h3>
+<p>Four deployments, and knowing which one is broken saves hours:</p>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Job</th>
+<th>Failure symptom</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>controller</strong></td>
+<td>Runs all the reconcile loops: Certificate, CertificateRequest, Issuer, Order, Challenge</td>
+<td>Certificates stuck <code>Ready=False</code>, no events progressing</td>
+</tr>
+<tr>
+<td><strong>webhook</strong></td>
+<td>Validating + mutating admission for cert-manager CRDs</td>
+<td><code>kubectl apply</code> of <em>any</em> cert-manager resource hangs or fails with a webhook error. Also blocks unrelated deploys if failurePolicy is Fail.</td>
+</tr>
+<tr>
+<td><strong>cainjector</strong></td>
+<td>Injects CA bundles into <code>ValidatingWebhookConfiguration</code>, <code>MutatingWebhookConfiguration</code>, <code>APIService</code>, and <code>CustomResourceDefinition</code> <code>caBundle</code> fields</td>
+<td>Other operators' webhooks break with x509 errors</td>
+</tr>
+<tr>
+<td><strong>startupapicheck</strong></td>
+<td>A one-shot Job verifying the API is serving</td>
+<td>Fails at install; usually an RBAC or webhook-reachability problem</td>
+</tr>
+</tbody>
+</table>
+<p>The <strong>webhook is the bootstrap paradox</strong>: cert-manager's webhook needs a TLS certificate, and cert-manager is the thing that issues certificates. It resolves this by self-managing — the webhook generates its own self-signed CA at startup and cainjector wires the bundle into its own <code>ValidatingWebhookConfiguration</code>. This is why a broken cainjector breaks cert-manager itself. (cert-manager 1.21 fixed a related bug where the webhook's serving certificate was not renewed after a system suspend or VM live migration; it now polls wall-clock time and recovers within a minute.)</p>
+<h3 id="the-crds-and-the-reconcile-flow">The CRDs and the reconcile flow<a class="anchor" href="#the-crds-and-the-reconcile-flow">#</a></h3>
+<div class="codehilite"><pre><span></span><code>Certificate                          (what you want: names, duration, issuer)
+    │  controller creates
+    ▼
+CertificateRequest                   (one PEM CSR + issuerRef; immutable)
+    │  issuer-specific controller picks it up
+    ├── SelfSigned / CA / Vault / external → signs directly
+    └── ACME issuer
+            │  creates
+            ▼
+        Order                        (ACME order for this identifier set)
+            │  creates one per identifier
+            ▼
+        Challenge                    (HTTP-01 or DNS-01; solver pod / DNS record)
+            │  on success, Order gets the cert
+            ▼
+    CertificateRequest.status.certificate  ← signed PEM
+    │  controller writes
+    ▼
+Secret (type kubernetes.io/tls)      { tls.crt, tls.key, ca.crt }
+</code></pre></div>
+
+<p>The important structural facts:</p>
+<ul>
+<li><strong><code>CertificateRequest</code> is immutable and one-shot.</strong> Every renewal creates a <em>new</em> one. Old ones are kept per <code>spec.revisionHistoryLimit</code>. If you want to know why a renewal failed three days ago, the evidence is in an old CertificateRequest — until it is garbage collected.</li>
+<li><strong>The private key is generated by cert-manager, in the cluster, and stored in the Secret.</strong> cert-manager never sees a key it did not make (except with <code>csi-driver-spiffe</code>, where the key never leaves node memory). It also stores the <em>next</em> private key in a temporary Secret (<code>nextPrivateKeySecretName</code>) during reissuance.</li>
+<li><strong><code>ca.crt</code> is best-effort.</strong> Not every issuer can populate it. The trust-manager docs are blunt about this: <code>ca.crt</code> "can only ever be populated on a best-effort basis" and depends on the Issuer being configured correctly. Do not build a trust pipeline that assumes it exists.</li>
+<li><strong><code>tls.crt</code> contains the leaf plus the chain</strong> (excluding the root, normally). This is what you serve. It is <em>not</em> what you put in a trust store.</li>
+</ul>
+<div class="codehilite"><pre><span></span><code>kubectl describe certificate temporal-frontend -n cell-usw2-042
+kubectl get certificaterequest -n cell-usw2-042
+kubectl describe order -n cell-usw2-042
+kubectl describe challenge -n cell-usw2-042
+<span class="c1"># cmctl gives the whole tree at once:</span>
+cmctl status certificate temporal-frontend -n cell-usw2-042
+</code></pre></div>
+
+<hr />
+<h2 id="issuers">Issuers<a class="anchor" href="#issuers">#</a></h2>
+<p><code>Issuer</code> is namespaced; <code>ClusterIssuer</code> is cluster-scoped and reads its credentials from the cert-manager namespace. For a cell, <code>ClusterIssuer</code> is almost always right — you do not want to replicate issuer config into every namespace.</p>
+<table>
+<thead>
+<tr>
+<th>Issuer</th>
+<th>Where the CA key lives</th>
+<th>Audit trail</th>
+<th>Rate limits</th>
+<th>Good for</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>SelfSigned</strong></td>
+<td>Nowhere — each cert signs itself</td>
+<td>None</td>
+<td>None</td>
+<td>Bootstrapping a root; webhook certs; tests</td>
+</tr>
+<tr>
+<td><strong>CA</strong></td>
+<td>A Kubernetes Secret in the cluster</td>
+<td>Kubernetes audit log only</td>
+<td>None</td>
+<td>Cheap internal CA. <strong>The key is in etcd</strong> — accept that or do not use it.</td>
+</tr>
+<tr>
+<td><strong>ACME</strong></td>
+<td>The public CA's HSM</td>
+<td>Certificate Transparency logs</td>
+<td>Yes, strict</td>
+<td>Public-facing endpoints</td>
+</tr>
+<tr>
+<td><strong>Vault</strong></td>
+<td>Vault PKI, backed by Vault's barrier</td>
+<td>Vault audit devices</td>
+<td>Vault quotas</td>
+<td><strong>The right answer for cell PKI</strong></td>
+</tr>
+<tr>
+<td><strong>Venafi / CyberArk</strong></td>
+<td>Enterprise CLM platform</td>
+<td>Full enterprise audit</td>
+<td>Platform-dependent</td>
+<td>Orgs with an existing Venafi estate</td>
+</tr>
+<tr>
+<td><strong>AWS PCA issuer</strong> (external)</td>
+<td>AWS Private CA, FIPS 140-3 L3 HSM</td>
+<td>CloudTrail</td>
+<td>AWS API limits</td>
+<td>AWS-native, compliance-driven</td>
+</tr>
+<tr>
+<td><strong>Google CAS issuer</strong> (external)</td>
+<td>GCP Certificate Authority Service HSM</td>
+<td>Cloud Audit Logs</td>
+<td>GCP API limits</td>
+<td>GCP-native</td>
+</tr>
+<tr>
+<td><strong>step-issuer</strong> (external)</td>
+<td><code>step-ca</code></td>
+<td>step-ca logs</td>
+<td>None</td>
+<td>Smallstep shops</td>
+</tr>
+</tbody>
+</table>
+<p>The Venafi issuer is now documented under the <a href="https://cert-manager.io/docs/configuration/venafi/">CyberArk</a> name following the acquisition, and cert-manager 1.21 extended it to support PANW NGTS as a backend.</p>
+<h3 id="selfsigned--ca-building-a-hierarchy">SelfSigned → CA: building a hierarchy<a class="anchor" href="#selfsigned--ca-building-a-hierarchy">#</a></h3>
+<p>This is the standard bootstrap and it is worth internalizing, because it is exactly how you would build a cell's PKI if you were not using Vault.</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. A SelfSigned issuer exists only to sign the root.</span><span class="w"></span>
+<span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cert-manager.io/v1</span><span class="w"></span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">ClusterIssuer</span><span class="w"></span>
+<span class="nt">metadata</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">selfsigned-bootstrap</span><span class="w"></span>
+<span class="nt">spec</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">selfSigned</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">{}</span><span class="w"></span>
+<span class="nn">---</span><span class="w"></span>
+<span class="c1"># 2. The root. isCA: true, long duration, strong key.</span><span class="w"></span>
+<span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cert-manager.io/v1</span><span class="w"></span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Certificate</span><span class="w"></span>
+<span class="nt">metadata</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">temporal-root-ca</span><span class="w"></span>
+<span class="w">  </span><span class="nt">namespace</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cert-manager</span><span class="w"></span>
+<span class="nt">spec</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">isCA</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span><span class="w"></span>
+<span class="w">  </span><span class="nt">commonName</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Temporal Internal Root CA</span><span class="w"></span>
+<span class="w">  </span><span class="nt">secretName</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">temporal-root-ca</span><span class="w"></span>
+<span class="w">  </span><span class="nt">duration</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">87600h</span><span class="w">      </span><span class="c1"># 10 years</span><span class="w"></span>
+<span class="w">  </span><span class="nt">renewBefore</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">8760h</span><span class="w">    </span><span class="c1"># 1 year</span><span class="w"></span>
+<span class="w">  </span><span class="nt">privateKey</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">algorithm</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">ECDSA</span><span class="w"></span>
+<span class="w">    </span><span class="nt">size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">384</span><span class="w"></span>
+<span class="w">  </span><span class="nt">issuerRef</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">selfsigned-bootstrap</span><span class="w"></span>
+<span class="w">    </span><span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">ClusterIssuer</span><span class="w"></span>
+<span class="nn">---</span><span class="w"></span>
+<span class="c1"># 3. A CA issuer backed by the root&#39;s Secret.</span><span class="w"></span>
+<span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cert-manager.io/v1</span><span class="w"></span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">ClusterIssuer</span><span class="w"></span>
+<span class="nt">metadata</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">temporal-root-issuer</span><span class="w"></span>
+<span class="nt">spec</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">ca</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">secretName</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">temporal-root-ca</span><span class="w"></span>
+<span class="nn">---</span><span class="w"></span>
+<span class="c1"># 4. The intermediate. NOTE: cert-manager has no field for the Basic Constraints</span><span class="w"></span>
+<span class="c1">#    pathLen — see cert-manager#2820; the proposed `maxPathLen` was never merged.</span><span class="w"></span>
+<span class="c1">#    Enforce the shape with Vault PKI (`max_path_length`), a cloud private CA, or</span><span class="w"></span>
+<span class="c1">#    an out-of-band signing ceremony instead.</span><span class="w"></span>
+<span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cert-manager.io/v1</span><span class="w"></span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Certificate</span><span class="w"></span>
+<span class="nt">metadata</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">temporal-intermediate-usw2</span><span class="w"></span>
+<span class="w">  </span><span class="nt">namespace</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cert-manager</span><span class="w"></span>
+<span class="nt">spec</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">isCA</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span><span class="w"></span>
+<span class="w">  </span><span class="nt">commonName</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Temporal Intermediate CA usw2</span><span class="w"></span>
+<span class="w">  </span><span class="nt">secretName</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">temporal-intermediate-usw2</span><span class="w"></span>
+<span class="w">  </span><span class="nt">duration</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">26280h</span><span class="w">      </span><span class="c1"># 3 years</span><span class="w"></span>
+<span class="w">  </span><span class="nt">renewBefore</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">4380h</span><span class="w">    </span><span class="c1"># 6 months</span><span class="w"></span>
+<span class="w">  </span><span class="nt">privateKey</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">algorithm</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">ECDSA</span><span class="w"></span>
+<span class="w">    </span><span class="nt">size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">384</span><span class="w"></span>
+<span class="w">  </span><span class="nt">usages</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;cert</span><span class="nv"> </span><span class="s">sign&quot;</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">&quot;crl</span><span class="nv"> </span><span class="s">sign&quot;</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">&quot;digital</span><span class="nv"> </span><span class="s">signature&quot;</span><span class="p p-Indicator">]</span><span class="w"></span>
+<span class="w">  </span><span class="nt">issuerRef</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">temporal-root-issuer</span><span class="w"></span>
+<span class="w">    </span><span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">ClusterIssuer</span><span class="w"></span>
+<span class="nn">---</span><span class="w"></span>
+<span class="c1"># 5. THIS is the issuer workloads use.</span><span class="w"></span>
+<span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cert-manager.io/v1</span><span class="w"></span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">ClusterIssuer</span><span class="w"></span>
+<span class="nt">metadata</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cell-issuer</span><span class="w"></span>
+<span class="nt">spec</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">ca</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">secretName</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">temporal-intermediate-usw2</span><span class="w"></span>
+</code></pre></div>
+
+<p><strong>The honest caveat:</strong> in this design both CA private keys are Kubernetes Secrets, base64-encoded in etcd, readable by anyone with <code>get secrets</code> in <code>cert-manager</code>. That is fine for a lab and unacceptable for production. Production means Vault PKI or a cloud CA, with cert-manager as the requester rather than the signer.</p>
+<h3 id="acme-http-01-vs-dns-01">ACME: HTTP-01 vs DNS-01<a class="anchor" href="#acme-http-01-vs-dns-01">#</a></h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>HTTP-01</th>
+<th>DNS-01</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Proves</td>
+<td>Control of the HTTP endpoint on port 80</td>
+<td>Control of the DNS zone</td>
+</tr>
+<tr>
+<td>Wildcards</td>
+<td>No</td>
+<td><strong>Yes — required for wildcards</strong></td>
+</tr>
+<tr>
+<td>Needs public inbound?</td>
+<td>Yes, port 80 reachable from the ACME CA</td>
+<td>No</td>
+</tr>
+<tr>
+<td>Works for internal-only services</td>
+<td>No</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td>Failure modes</td>
+<td>Ingress misroute, port 80 blocked, split-horizon DNS</td>
+<td>Propagation delay, cross-account IAM, NS delegation</td>
+</tr>
+<tr>
+<td>Cell fit</td>
+<td>Public frontends only</td>
+<td>Everything else</td>
+</tr>
+</tbody>
+</table>
+<p>For cells — mostly private endpoints, likely wildcard certs per cell — <strong>DNS-01 is the answer</strong>, and the interesting part is the cloud identity plumbing.</p>
+<p><strong>Route53 with IRSA and cross-account:</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cert-manager.io/v1</span><span class="w"></span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">ClusterIssuer</span><span class="w"></span>
+<span class="nt">metadata</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">letsencrypt-dns</span><span class="w"></span>
+<span class="nt">spec</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">acme</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">server</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">https://acme-v02.api.letsencrypt.org/directory</span><span class="w"></span>
+<span class="w">    </span><span class="nt">email</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">platform@example.com</span><span class="w"></span>
+<span class="w">    </span><span class="nt">privateKeySecretRef</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">letsencrypt-dns-account-key</span><span class="w"></span>
+<span class="w">    </span><span class="nt">solvers</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">dns01</span><span class="p">:</span><span class="w"></span>
+<span class="w">          </span><span class="nt">route53</span><span class="p">:</span><span class="w"></span>
+<span class="w">            </span><span class="nt">region</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">us-west-2</span><span class="w"></span>
+<span class="w">            </span><span class="nt">hostedZoneID</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Z0123456789ABCDEFGHIJ</span><span class="w"></span>
+<span class="w">            </span><span class="c1"># Cross-account: cert-manager&#39;s IRSA role assumes a role in the</span><span class="w"></span>
+<span class="w">            </span><span class="c1"># DNS account. No static credentials anywhere.</span><span class="w"></span>
+<span class="w">            </span><span class="nt">role</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">arn:aws:iam::999988887777:role/cert-manager-dns01</span><span class="w"></span>
+</code></pre></div>
+
+<p>cert-manager's ServiceAccount is annotated with its own IRSA role; that role's policy allows <code>sts:AssumeRole</code> on the DNS account role; the DNS account role trusts it and holds <code>route53:ChangeResourceRecordSets</code> scoped to the hosted zone plus <code>route53:GetChange</code>. <strong>cert-manager 1.21 removed the default <code>serviceaccounts/token: create</code> RBAC from the Helm chart</strong> — if you were relying on <code>serviceAccountRef.name</code> pointing at the controller's own ServiceAccount (an undocumented pattern), you must now create that RBAC yourself or move to a dedicated ServiceAccount. Also new in 1.21: <a href="https://cert-manager.io/docs/releases/release-notes/release-notes-1.21/">AWS IAM authentication for the Vault issuer</a> supporting IRSA and EKS Pod Identity, which removes long-lived AWS Secrets from that path too.</p>
+<p><strong>Google CloudDNS with Workload Identity:</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">dns01</span><span class="p">:</span><span class="w"></span>
+<span class="w">          </span><span class="nt">cloudDNS</span><span class="p">:</span><span class="w"></span>
+<span class="w">            </span><span class="nt">project</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">temporal-dns-prod</span><span class="w"></span>
+<span class="w">            </span><span class="c1"># Omit serviceAccountSecretRef entirely; ambient Workload Identity</span><span class="w"></span>
+<span class="w">            </span><span class="c1"># credentials are used.</span><span class="w"></span>
+</code></pre></div>
+
+<p>Bind the Kubernetes SA to a Google SA with <code>roles/dns.admin</code> on the project (or finer-grained on the zone).</p>
+<p><strong>AzureDNS with workload identity:</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">dns01</span><span class="p">:</span><span class="w"></span>
+<span class="w">          </span><span class="nt">azureDNS</span><span class="p">:</span><span class="w"></span>
+<span class="w">            </span><span class="nt">resourceGroupName</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">dns-rg</span><span class="w"></span>
+<span class="w">            </span><span class="nt">subscriptionID</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">00000000-0000-0000-0000-000000000000</span><span class="w"></span>
+<span class="w">            </span><span class="nt">hostedZoneName</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cells.example.com</span><span class="w"></span>
+<span class="w">            </span><span class="nt">environment</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">AzurePublicCloud</span><span class="w"></span>
+<span class="w">            </span><span class="nt">managedIdentity</span><span class="p">:</span><span class="w"></span>
+<span class="w">              </span><span class="nt">clientID</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">11111111-1111-1111-1111-111111111111</span><span class="w"></span>
+</code></pre></div>
+
+<p><strong>The CNAME delegation trick.</strong> For all three clouds, the cleanest pattern is to <em>not</em> grant cert-manager write access to your production zone at all. Instead, <code>CNAME</code> the <code>_acme-challenge</code> record to a dedicated throwaway zone:</p>
+<div class="codehilite"><pre><span></span><code>_acme-challenge.cell-usw2-042.example.com.  CNAME  cell-usw2-042.acme-delegation.internal.
+</code></pre></div>
+
+<p>Then cert-manager only needs write access to <code>acme-delegation.internal</code>, which contains nothing else. Enable it with <code>cnameStrategy: Follow</code> on the solver. This is the single best blast-radius reduction available for DNS-01.</p>
+<h3 id="the-vault-issuer">The Vault issuer<a class="anchor" href="#the-vault-issuer">#</a></h3>
+<p>For cell PKI, this is the design: Vault PKI holds the intermediate's private key inside its barrier, cert-manager holds no CA key at all and simply requests signatures.</p>
+<div class="codehilite"><pre><span></span><code><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cert-manager.io/v1</span><span class="w"></span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">ClusterIssuer</span><span class="w"></span>
+<span class="nt">metadata</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cell-vault-issuer</span><span class="w"></span>
+<span class="nt">spec</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">vault</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">server</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">https://vault.cell-usw2-042.internal:8200</span><span class="w"></span>
+<span class="w">    </span><span class="nt">path</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">pki_int_usw2/sign/cell-workload</span><span class="w"></span>
+<span class="w">    </span><span class="nt">caBundle</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">&lt;base64 of Vault&#39;s own CA&gt;</span><span class="w"></span>
+<span class="w">    </span><span class="nt">auth</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="nt">kubernetes</span><span class="p">:</span><span class="w"></span>
+<span class="w">        </span><span class="nt">role</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cert-manager</span><span class="w"></span>
+<span class="w">        </span><span class="nt">mountPath</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">/v1/auth/kubernetes</span><span class="w"></span>
+<span class="w">        </span><span class="nt">serviceAccountRef</span><span class="p">:</span><span class="w"></span>
+<span class="w">          </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cert-manager</span><span class="w"></span>
+<span class="w">          </span><span class="nt">audiences</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;vault&quot;</span><span class="p p-Indicator">]</span><span class="w"></span>
+</code></pre></div>
+
+<p>cert-manager authenticates to Vault with its own Kubernetes service account token, gets a Vault token bound to a policy that permits exactly <code>pki_int_usw2/sign/cell-workload</code>, and Vault's PKI role constrains what can actually be issued:</p>
+<div class="codehilite"><pre><span></span><code>vault write pki_int_usw2/roles/cell-workload <span class="se">\</span>
+  <span class="nv">allowed_domains</span><span class="o">=</span><span class="s2">&quot;cell-usw2-042.svc.cluster.local,usw2.cells.example.internal&quot;</span> <span class="se">\</span>
+  <span class="nv">allow_subdomains</span><span class="o">=</span><span class="nb">true</span> <span class="se">\</span>
+  <span class="nv">allow_bare_domains</span><span class="o">=</span><span class="nb">false</span> <span class="se">\</span>
+  <span class="nv">allowed_uri_sans</span><span class="o">=</span><span class="s2">&quot;spiffe://example.internal/ns/cell-usw2-042/*&quot;</span> <span class="se">\</span>
+  <span class="nv">key_type</span><span class="o">=</span>ec <span class="nv">key_bits</span><span class="o">=</span><span class="m">256</span> <span class="se">\</span>
+  <span class="nv">ttl</span><span class="o">=</span>24h <span class="nv">max_ttl</span><span class="o">=</span>72h <span class="se">\</span>
+  <span class="nv">ext_key_usage</span><span class="o">=</span><span class="s2">&quot;ServerAuth,ClientAuth&quot;</span>
+</code></pre></div>
+
+<p>This gives you defense in depth that a CA-issuer-in-a-Secret design cannot: even a fully compromised cert-manager can only mint certificates matching the Vault role's constraints, and every issuance appears in Vault's audit log.</p>
+<p>One 1.21 hardening note: the Vault issuer webhook now <a href="https://cert-manager.io/docs/releases/release-notes/release-notes-1.21/">rejects <code>..</code> path segments</a> in <code>spec.vault.path</code> and auth mount paths, closing a path-traversal issue where <code>path.Join</code> silently resolved relative segments.</p>
+<p><em>See also: <a href="10-vault.html#secrets-engines">secrets engines</a> for the Vault side of this — mount layout, role constraints, and the lease behavior of PKI issuance — and <a href="10-vault.html#policies">policies</a> for writing the policy that scopes cert-manager to exactly one <code>sign</code> path.</em></p>
+<h3 id="external-issuers">External issuers<a class="anchor" href="#external-issuers">#</a></h3>
+<p>External issuers are separate controllers implementing the <code>CertificateRequest</code> contract. They plug in identically from the user's perspective.</p>
+<ul>
+<li><strong><a href="https://github.com/cert-manager/aws-privateca-issuer">AWS Private CA Issuer</a></strong> — <code>AWSPCAIssuer</code> / <code>AWSPCAClusterIssuer</code>, authenticated with IRSA.</li>
+<li><strong><a href="https://github.com/jetstack/google-cas-issuer">Google CAS Issuer</a></strong> — <code>GoogleCASIssuer</code>, authenticated with Workload Identity.</li>
+<li><strong><a href="https://github.com/smallstep/step-issuer">step-issuer</a></strong> — for <code>step-ca</code>.</li>
+</ul>
+<hr />
+<h2 id="renewal-and-the-reload-problem">Renewal and the reload problem<a class="anchor" href="#renewal-and-the-reload-problem">#</a></h2>
+<h3 id="how-cert-manager-schedules-renewal">How cert-manager schedules renewal<a class="anchor" href="#how-cert-manager-schedules-renewal">#</a></h3>
+<div class="codehilite"><pre><span></span><code><span class="nt">spec</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">duration</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">24h</span><span class="w"></span>
+<span class="w">  </span><span class="nt">renewBefore</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">8h</span><span class="w">          </span><span class="c1"># renew when 8h remain → every 16h</span><span class="w"></span>
+<span class="w">  </span><span class="c1"># or, preferred for short certs:</span><span class="w"></span>
+<span class="w">  </span><span class="c1"># renewBeforePercentage: 33</span><span class="w"></span>
+</code></pre></div>
+
+<p>Constraints and defaults from the <a href="https://cert-manager.io/docs/usage/certificate/">Certificate docs</a>: <code>duration</code> defaults to 90 days (2160h), <code>renewBefore</code> defaults to one-third of duration, <code>renewBefore</code> must be less than <code>duration</code>, and the effective minimum duration cert-manager will accept is one hour. <code>renewBefore</code> and <code>renewBeforePercentage</code> are mutually exclusive.</p>
+<p>cert-manager 1.21 added a <strong><code>renewal</code> field</strong> with genuinely useful semantics for a platform team: schedule renewal into approved maintenance windows with cron specs, or disable automatic renewal entirely with <code>spec.renewal.policy: Disabled</code>. Note 1.21.1 fixed a controller panic on <code>policy: Disabled</code>, so use 1.21.1 or later if you rely on it.</p>
+<p><strong>Reissuance triggers</strong> — the full list, because "why did it reissue?" is a common question:</p>
+<ol>
+<li>The renewal time arrived.</li>
+<li><code>spec.dnsNames</code>, <code>commonName</code>, <code>uris</code>, <code>ipAddresses</code>, <code>usages</code>, <code>subject</code>, or <code>duration</code> changed.</li>
+<li>The <code>issuerRef</code> changed.</li>
+<li>The Secret was deleted or its <code>tls.crt</code> became unparseable.</li>
+<li>Manual: <code>cmctl renew</code>, or adding the <code>cert-manager.io/issue-temporary-certificate</code> annotation.</li>
+<li><code>spec.privateKey.rotationPolicy: Always</code> combined with any of the above.</li>
+</ol>
+<p><strong><code>rotationPolicy</code></strong> is the one to get right. Since cert-manager v1.18 the default is <code>Always</code> — a fresh private key on every issuance. Before v1.18 it defaulted to <code>Never</code>, meaning <strong>cert-manager reused the existing private key on renewal</strong>, so any Certificate carried over from an older install, or any manifest that still pins <code>rotationPolicy: Never</code>, keeps a leaked key leaked across every renewal until someone notices.</p>
+<div class="codehilite"><pre><span></span><code><span class="nt">spec</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">privateKey</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">rotationPolicy</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Always</span><span class="w">    </span><span class="c1"># generate a fresh key on every issuance</span><span class="w"></span>
+</code></pre></div>
+
+<p>Set <code>Always</code> unless you have a specific reason not to — typically a system that pins the public key (HPKP-style, or a hardware token). The cost is that consumers must handle the key changing, which they must handle anyway.</p>
+<h3 id="the-reload-problem">The reload problem<a class="anchor" href="#the-reload-problem">#</a></h3>
+<p><strong>cert-manager's job ends when it writes the Secret.</strong> Nothing tells your application. If your Go service read <code>tls.crt</code> at startup into a <code>tls.Config</code>, it will happily serve the old certificate until it expires and then start failing — even though a perfectly good new certificate has been sitting in the mounted volume for weeks.</p>
+<p>This is the single most common "cert-manager is broken" report, and cert-manager is not broken.</p>
+<p>The kubelet syncs updated Secret volumes into the pod, but the sync is <strong>not instantaneous</strong> — it is bounded by the kubelet sync period (1 minute by default) <em>plus</em> the Secret cache TTL (also 1 minute by default), so up to roughly two minutes, and <strong>Secrets mounted with <code>subPath</code> are never updated at all</strong>. That last one is a silent killer: <code>subPath</code> mounts are frozen at pod creation.</p>
+<table>
+<thead>
+<tr>
+<th>Solution</th>
+<th>How</th>
+<th>Best for</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong><code>tls.Config.GetCertificate</code></strong></td>
+<td>Callback re-reads from disk (with caching) on each handshake</td>
+<td>Go services you own. <strong>The correct fix.</strong></td>
+</tr>
+<tr>
+<td><strong>fsnotify / file watch</strong></td>
+<td>Watch the mount, rebuild the <code>tls.Config</code> on change</td>
+<td>Go services; slightly more code, works for non-TLS material too</td>
+</tr>
+<tr>
+<td><strong>SIGHUP</strong></td>
+<td>nginx, HAProxy, Envoy reload on signal</td>
+<td>Proxies; needs something to send the signal</td>
+</tr>
+<tr>
+<td><strong><a href="https://github.com/stakater/Reloader">Reloader</a></strong></td>
+<td>Annotation-driven controller that restarts Deployments when a Secret changes</td>
+<td>Apps you cannot modify. Blunt but effective.</td>
+</tr>
+<tr>
+<td><strong>VSO-style <code>rolloutRestartTargets</code></strong></td>
+<td>Same idea, from the secret-sync side</td>
+<td>Vault-sourced material</td>
+</tr>
+<tr>
+<td><strong>Envoy SDS</strong></td>
+<td>Certificates delivered over xDS, hot-swapped</td>
+<td>Service meshes</td>
+</tr>
+<tr>
+<td><strong><code>csi-driver</code></strong></td>
+<td>Cert written to an ephemeral volume, driver renews in place</td>
+<td>Per-pod certs, no Secret at all</td>
+</tr>
+</tbody>
+</table>
+<p>The Go pattern, which is what you actually want in a cell:</p>
+<div class="codehilite"><pre><span></span><code><span class="kd">type</span><span class="w"> </span><span class="nx">reloadingCert</span><span class="w"> </span><span class="kd">struct</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">    </span><span class="nx">mu</span><span class="w">                </span><span class="nx">sync</span><span class="p">.</span><span class="nx">RWMutex</span><span class="w"></span>
+<span class="w">    </span><span class="nx">cert</span><span class="w">              </span><span class="o">*</span><span class="nx">tls</span><span class="p">.</span><span class="nx">Certificate</span><span class="w"></span>
+<span class="w">    </span><span class="nx">certPath</span><span class="p">,</span><span class="w"> </span><span class="nx">keyPath</span><span class="w"> </span><span class="kt">string</span><span class="w"></span>
+<span class="p">}</span><span class="w"></span>
+
+<span class="kd">func</span><span class="w"> </span><span class="p">(</span><span class="nx">r</span><span class="w"> </span><span class="o">*</span><span class="nx">reloadingCert</span><span class="p">)</span><span class="w"> </span><span class="nx">load</span><span class="p">()</span><span class="w"> </span><span class="kt">error</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">    </span><span class="nx">c</span><span class="p">,</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">tls</span><span class="p">.</span><span class="nx">LoadX509KeyPair</span><span class="p">(</span><span class="nx">r</span><span class="p">.</span><span class="nx">certPath</span><span class="p">,</span><span class="w"> </span><span class="nx">r</span><span class="p">.</span><span class="nx">keyPath</span><span class="p">)</span><span class="w"></span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="kc">nil</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="nx">err</span><span class="w"></span>
+<span class="w">    </span><span class="p">}</span><span class="w"></span>
+<span class="w">    </span><span class="nx">r</span><span class="p">.</span><span class="nx">mu</span><span class="p">.</span><span class="nx">Lock</span><span class="p">();</span><span class="w"> </span><span class="nx">r</span><span class="p">.</span><span class="nx">cert</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="o">&amp;</span><span class="nx">c</span><span class="p">;</span><span class="w"> </span><span class="nx">r</span><span class="p">.</span><span class="nx">mu</span><span class="p">.</span><span class="nx">Unlock</span><span class="p">()</span><span class="w"></span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="kc">nil</span><span class="w"></span>
+<span class="p">}</span><span class="w"></span>
+
+<span class="kd">func</span><span class="w"> </span><span class="p">(</span><span class="nx">r</span><span class="w"> </span><span class="o">*</span><span class="nx">reloadingCert</span><span class="p">)</span><span class="w"> </span><span class="nx">Get</span><span class="p">(</span><span class="o">*</span><span class="nx">tls</span><span class="p">.</span><span class="nx">ClientHelloInfo</span><span class="p">)</span><span class="w"> </span><span class="p">(</span><span class="o">*</span><span class="nx">tls</span><span class="p">.</span><span class="nx">Certificate</span><span class="p">,</span><span class="w"> </span><span class="kt">error</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">    </span><span class="nx">r</span><span class="p">.</span><span class="nx">mu</span><span class="p">.</span><span class="nx">RLock</span><span class="p">();</span><span class="w"> </span><span class="k">defer</span><span class="w"> </span><span class="nx">r</span><span class="p">.</span><span class="nx">mu</span><span class="p">.</span><span class="nx">RUnlock</span><span class="p">()</span><span class="w"></span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="nx">r</span><span class="p">.</span><span class="nx">cert</span><span class="p">,</span><span class="w"> </span><span class="kc">nil</span><span class="w"></span>
+<span class="p">}</span><span class="w"></span>
+
+<span class="c1">// Call load() on fsnotify events on the mount directory AND on a ticker as a</span><span class="w"></span>
+<span class="c1">// backstop — the atomic symlink swap that Secret volumes use generates events</span><span class="w"></span>
+<span class="c1">// that are easy to miss.</span><span class="w"></span>
+<span class="nx">tlsCfg</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="o">&amp;</span><span class="nx">tls</span><span class="p">.</span><span class="nx">Config</span><span class="p">{</span><span class="nx">GetCertificate</span><span class="p">:</span><span class="w"> </span><span class="nx">rc</span><span class="p">.</span><span class="nx">Get</span><span class="p">}</span><span class="w"></span>
+</code></pre></div>
+
+<p><strong>Annotate the reload path into your monitoring.</strong> The observable symptom of a failed reload is "the Secret's <code>tls.crt</code> notAfter is in the future, but the certificate served on the wire has a notAfter in the past." Probe the wire, not the Secret.</p>
+<hr />
+<h2 id="integration-points">Integration points<a class="anchor" href="#integration-points">#</a></h2>
+<h3 id="ingress-and-gateway-api">Ingress and Gateway API<a class="anchor" href="#ingress-and-gateway-api">#</a></h3>
+<p>The <strong>ingress-shim</strong> watches Ingress objects and creates Certificates from annotations:</p>
+<div class="codehilite"><pre><span></span><code><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">networking.k8s.io/v1</span><span class="w"></span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Ingress</span><span class="w"></span>
+<span class="nt">metadata</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cell-frontend</span><span class="w"></span>
+<span class="w">  </span><span class="nt">annotations</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">cert-manager.io/cluster-issuer</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">letsencrypt-dns</span><span class="w"></span>
+<span class="w">    </span><span class="nt">cert-manager.io/renew-before</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">720h</span><span class="w"></span>
+<span class="w">    </span><span class="nt">cert-manager.io/private-key-rotation-policy</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Always</span><span class="w"></span>
+<span class="nt">spec</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">tls</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">hosts</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;cell-usw2-042.example.com&quot;</span><span class="p p-Indicator">]</span><span class="w"></span>
+<span class="w">      </span><span class="nt">secretName</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cell-frontend-tls</span><span class="w">   </span><span class="c1"># cert-manager creates this</span><span class="w"></span>
+<span class="w">  </span><span class="nt">rules</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">host</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cell-usw2-042.example.com</span><span class="w"></span>
+<span class="w">      </span><span class="c1"># ...</span><span class="w"></span>
+</code></pre></div>
+
+<p>Use <code>cert-manager.io/cluster-issuer</code>, not <code>cert-manager.io/issuer</code>, unless you genuinely want a namespaced Issuer. The full annotation list is in the <a href="https://cert-manager.io/docs/reference/annotations/">annotations reference</a>; 1.21 added handling for <code>cert-manager.io/alt-names</code> and <code>cert-manager.io/ip-sans</code> on ingress-like objects.</p>
+<p><strong>Gateway API</strong> works the same way, on the Gateway's listeners. cert-manager 1.21 restructured the configuration: <code>enableGatewayAPI</code> and <code>enableGatewayAPIListenerSet</code> are deprecated in favor of <code>gatewayAPI.enabled</code> and <code>gatewayAPI.enableListenerSet</code>. It also added <code>cert-manager.io/ignore-tls-listeners</code> to exclude specific listeners, and an <code>acme.cert-manager.io/http01-parentreffallback: "true"</code> annotation so TLS-only ListenerSets can borrow a shared Gateway HTTP listener for challenges.</p>
+<p><strong>The honest recommendation for cells:</strong> do not use the shim for anything that matters. Write explicit <code>Certificate</code> resources. The shim's implicit lifecycle — delete the Ingress and the Certificate goes with it — is exactly the kind of coupling you do not want when a routing change can revoke a cell's TLS.</p>
+<p><em>See also: <a href="05-cni-and-host-networking.html#ingress-and-egress-at-the-cell-edge">ingress and egress at the cell edge</a> for what terminates this certificate and where, and <a href="02-grpc.html#the-biggest-infra-gotcha-l4-load-balancing-pins-grpc">the biggest infra gotcha: L4 load balancing pins gRPC</a> for why the TLS termination point and the balancing point are the same decision for a Temporal cell.</em></p>
+<h3 id="csi-drivers--per-pod-ephemeral-certificates">CSI drivers — per-pod ephemeral certificates<a class="anchor" href="#csi-drivers--per-pod-ephemeral-certificates">#</a></h3>
+<p><strong><code>csi-driver</code></strong> issues a certificate at pod start into an ephemeral volume. No Kubernetes Secret exists at all: the private key is generated on the node and never persisted. The certificate's lifecycle is the pod's lifecycle.</p>
+<div class="codehilite"><pre><span></span><code><span class="nt">volumes</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">tls</span><span class="w"></span>
+<span class="w">    </span><span class="nt">csi</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="nt">driver</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">csi.cert-manager.io</span><span class="w"></span>
+<span class="w">      </span><span class="nt">readOnly</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span><span class="w"></span>
+<span class="w">      </span><span class="nt">volumeAttributes</span><span class="p">:</span><span class="w"></span>
+<span class="w">        </span><span class="nt">csi.cert-manager.io/issuer-name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cell-vault-issuer</span><span class="w"></span>
+<span class="w">        </span><span class="nt">csi.cert-manager.io/issuer-kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">ClusterIssuer</span><span class="w"></span>
+<span class="w">        </span><span class="nt">csi.cert-manager.io/dns-names</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;${POD_NAME}.${POD_NAMESPACE}.svc.cluster.local&quot;</span><span class="w"></span>
+<span class="w">        </span><span class="nt">csi.cert-manager.io/duration</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">24h</span><span class="w"></span>
+<span class="w">        </span><span class="nt">csi.cert-manager.io/renew-before</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">8h</span><span class="w"></span>
+<span class="w">        </span><span class="nt">csi.cert-manager.io/key-usages</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;server</span><span class="nv"> </span><span class="s">auth,client</span><span class="nv"> </span><span class="s">auth&quot;</span><span class="w"></span>
+</code></pre></div>
+
+<p><strong><code>csi-driver-spiffe</code></strong> is the same mechanism specialized for SPIFFE: it uses CSI Token Requests to derive the pod's identity, mints a SPIFFE ID from the service account, and mounts an X.509 SVID. Per the <a href="https://github.com/cert-manager/csi-driver-spiffe">project docs</a>, the resulting documents are automatically renewed, the private key never leaves the node's virtual memory, each pod's document is unique, and it is destroyed on pod termination.</p>
+<p>For a cell full of gRPC services doing mTLS, <code>csi-driver-spiffe</code> is a strong fit: no Secrets, no reload problem (the driver renews in place), per-pod identity, and SPIFFE IDs that a service mesh or your own authz layer can consume.</p>
+<h3 id="webhook-certificate-self-management">Webhook certificate self-management<a class="anchor" href="#webhook-certificate-self-management">#</a></h3>
+<p><code>cainjector</code> injects CA bundles into other components' webhook configurations, which makes cert-manager the natural certificate source for every operator in a cell.</p>
+<div class="codehilite"><pre><span></span><code><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">admissionregistration.k8s.io/v1</span><span class="w"></span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">ValidatingWebhookConfiguration</span><span class="w"></span>
+<span class="nt">metadata</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">kyverno-resource-validating-webhook-cfg</span><span class="w"></span>
+<span class="w">  </span><span class="nt">annotations</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">cert-manager.io/inject-ca-from</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">kyverno/kyverno-svc-tls</span><span class="w"></span>
+<span class="nt">webhooks</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">validate.kyverno.svc</span><span class="w"></span>
+<span class="w">    </span><span class="nt">clientConfig</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="nt">service</span><span class="p">:</span><span class="w"></span>
+<span class="w">        </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">kyverno-svc</span><span class="w"></span>
+<span class="w">        </span><span class="nt">namespace</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">kyverno</span><span class="w"></span>
+<span class="w">        </span><span class="nt">path</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">/validate</span><span class="w"></span>
+<span class="w">      </span><span class="nt">caBundle</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Cg==</span><span class="w">   </span><span class="c1"># cainjector overwrites this</span><span class="w"></span>
+</code></pre></div>
+
+<p>Three injection annotations: <code>cert-manager.io/inject-ca-from</code> (namespace/certificate-name), <code>cert-manager.io/inject-ca-from-secret</code> (namespace/secret-name), and <code>cert-manager.io/inject-apiserver-ca: "true"</code>. They work on <code>ValidatingWebhookConfiguration</code>, <code>MutatingWebhookConfiguration</code>, <code>APIService</code>, and <code>CustomResourceDefinition</code>.</p>
+<p>Kyverno ships its own certificate management by default but supports being driven by cert-manager instead, which is worth doing for consistency — one certificate lifecycle for the whole cell rather than N operator-specific ones. cert-manager 1.21 promoted <code>CAInjectorMerging</code> to GA and made cainjector use server-side apply unconditionally, and added <code>--ignore-namespaces</code> to skip watching Secrets in specified namespaces (useful in large clusters where cainjector's Secret watch is expensive).</p>
+<p><strong>The ordering trap:</strong> if cert-manager's own webhook is down, you cannot create the Certificate that another operator's webhook needs, and if that operator's webhook has <code>failurePolicy: Fail</code> on a broad resource set, you can deadlock the cluster. Keep <code>failurePolicy: Ignore</code> on non-security-critical webhooks and always scope <code>namespaceSelector</code> to exclude <code>kube-system</code> and <code>cert-manager</code>.</p>
+<hr />
+<h2 id="mtls-between-services-cert-manager-vs-spiffespire">mTLS between services: cert-manager vs SPIFFE/SPIRE<a class="anchor" href="#mtls-between-services-cert-manager-vs-spiffespire">#</a></h2>
+<p>A cell full of gRPC services doing mutual TLS is precisely the SPIFFE use case, so this comparison deserves a real answer rather than a hand-wave.</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>cert-manager as mesh CA</th>
+<th>SPIFFE / SPIRE</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Identity model</td>
+<td>DNS names in SANs</td>
+<td>Structured URI SANs: <code>spiffe://trust-domain/path</code></td>
+</tr>
+<tr>
+<td>Who gets an identity</td>
+<td>Whatever you write a Certificate for</td>
+<td>Every workload, via attestation policy</td>
+</tr>
+<tr>
+<td><strong>Workload attestation</strong></td>
+<td>Kubernetes RBAC decides who may create a Certificate</td>
+<td><strong>SPIRE agent verifies the workload itself</strong> — kubelet API, process UID/GID, container image ID, node identity docs</td>
+</tr>
+<tr>
+<td>Key custody</td>
+<td>Secret (or ephemeral, with csi-driver)</td>
+<td>Never on disk; delivered over a Unix socket via the Workload API</td>
+</tr>
+<tr>
+<td>Rotation</td>
+<td>Minutes to hours</td>
+<td>Minutes, continuous, transparent to the app</td>
+</tr>
+<tr>
+<td>Cross-cluster / cross-cloud</td>
+<td>Manual trust bundle exchange</td>
+<td><strong>Federation</strong> — first-class trust bundle exchange between trust domains</td>
+</tr>
+<tr>
+<td>Non-Kubernetes workloads</td>
+<td>Awkward</td>
+<td>First-class (VMs, bare metal, Lambda)</td>
+</tr>
+<tr>
+<td>Operational weight</td>
+<td>One operator</td>
+<td>SPIRE server (with its own datastore + HA) + agent DaemonSet</td>
+</tr>
+<tr>
+<td>Ecosystem</td>
+<td>Kubernetes-native</td>
+<td>Istio, Linkerd, Envoy, Consul, Vault (Vault 2.0 added a <a href="https://developer.hashicorp.com/vault/docs/secrets/spiffe">SPIFFE JWT-SVID engine</a>)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>The real distinction is attestation.</strong> cert-manager's security model is "if you can create a <code>Certificate</code> in this namespace, you get this identity" — the identity is granted by Kubernetes RBAC. SPIRE's model is "prove to me <em>what you are</em> and I will tell you <em>who you are</em>": the <a href="https://spiffe.io/docs/latest/spire-about/spire-concepts/">SPIRE server</a> holds registration entries mapping attestation selectors — node identity, Kubernetes namespace and service account, container image digest, process UID — to SPIFFE IDs, and the agent verifies those selectors locally before issuing an SVID.</p>
+<p><strong>When cert-manager is enough:</strong> a single trust domain, everything in Kubernetes, DNS-name-based authorization, and you are willing to trust namespace RBAC as your identity boundary. This describes most single-cluster cells, and it is a legitimate answer.</p>
+<p><strong>When you want SPIFFE:</strong></p>
+<ol>
+<li><strong>Multi-cloud, multi-cluster, one logical identity space.</strong> A cell in AWS calling a control-plane service in GCP needs a name that means the same thing in both. SPIFFE federation solves trust bundle exchange between trust domains as a designed feature; with cert-manager you are hand-rolling it.</li>
+<li><strong>Non-Kubernetes workloads.</strong> Any VM, bare-metal node, or managed service in the identity mesh.</li>
+<li><strong>Image-level attestation.</strong> "Only this exact container digest may hold this identity" is not expressible in cert-manager.</li>
+<li><strong>Zero key material at rest.</strong> The SPIFFE Workload API delivers SVIDs over a Unix domain socket; nothing touches disk or etcd.</li>
+</ol>
+<p><strong>The pragmatic middle ground — and probably the right answer for a cell fleet — is <code>csi-driver-spiffe</code>.</strong> You get SPIFFE-shaped URI SAN identities, ephemeral per-pod keys that never leave node memory, and automatic renewal, while keeping cert-manager as the issuance path and Vault as the CA. You do not get SPIRE's attestation depth or federation, but you do get identities that are <em>compatible</em> with a future SPIRE deployment. It is the option that does not paint you into a corner.</p>
+<p>And note the new third option: <strong><code>PodCertificateRequest</code> plus <code>ClusterTrustBundle</code>, both stable in Kubernetes 1.37</strong>, give you kubelet-mediated per-pod certificates with automatic rotation using nothing but upstream Kubernetes. You still supply the signer, but the delivery and trust-anchor mechanism is now in the platform. For a team designing cell PKI in late 2026, this deserves evaluation before committing to any of the above.</p>
+<hr />
+<h2 id="designing-pki-for-cells">Designing PKI for cells<a class="anchor" href="#designing-pki-for-cells">#</a></h2>
+<p>Here is a concrete design and the reasoning behind each choice.</p>
+<div class="codehilite"><pre><span></span><code>                    Temporal Internal Root CA          (offline; key in HSM or
+                    ECDSA P-384, 20 years               KMS with no online signer)
+                              │
+        ┌─────────────────────┼─────────────────────┐
+        │                     │                     │
+   AWS Region CA         GCP Region CA        Azure Region CA   (1-3 years, online,
+   ECDSA P-384           ECDSA P-384          ECDSA P-384        name-constrained)
+        │                     │                     │
+   ┌────┴────┐           ┌────┴────┐           ┌────┴────┐
+ Cell-001  Cell-002    Cell-101  Cell-102    Cell-201  Cell-202  (Vault PKI per cell,
+ (Vault)   (Vault)     (Vault)   (Vault)     (Vault)   (Vault)    90d-1y, pathlen:0)
+    │         │            │         │           │         │
+  leaves    leaves       leaves    leaves      leaves    leaves   (24h, ECDSA P-256,
+                                                                   serverAuth+clientAuth)
+</code></pre></div>
+
+<p><strong>Offline root.</strong> The root's private key lives in an HSM or a cloud KMS key with no online signing path, and it is used perhaps twice a year to sign region intermediates. If the root key can be used by an automated system, it is not offline, regardless of where it is stored. Signing ceremonies are documented, dual-controlled, and recorded.</p>
+<p><strong>Per-region intermediates, name-constrained.</strong> Each region CA carries name constraints permitting only that region's DNS suffix. A compromise of the <code>usw2</code> intermediate cannot mint a valid certificate for <code>euw1</code>. This is where name constraints earn their keep. It is close to free with Vault PKI (<code>permitted_dns_domains</code>); with cert-manager it costs you an alpha feature gate on the controller and the webhook.</p>
+<p><strong>Per-cell issuing CAs in Vault PKI.</strong> Each cell's Vault holds its own issuing intermediate, signed by the region CA. Consequences that matter:</p>
+<ul>
+<li>Cell teardown is clean: destroy the Vault, and the issuing CA's key is gone with it.</li>
+<li>Compromise is bounded to one cell, and the Vault PKI <em>role</em> constrains issuance further than the certificate constraints do.</li>
+<li>Every issuance appears in that cell's Vault audit log, giving per-cell attribution for free.</li>
+<li>Cross-cloud is uniform: the Vault PKI API is identical in all three clouds; only the seal differs.</li>
+</ul>
+<p><strong>Short leaves as the revocation strategy.</strong> 24-hour leaves, renewed at 8 hours remaining. There is no CRL and no OCSP responder. Revocation is "stop issuing and wait one day," or in an emergency, "revoke the cell's Vault PKI role and force reissuance." This is a deliberate trade: you accept a 24-hour worst-case window in exchange for eliminating an entire class of infrastructure that does not work reliably anyway. Get explicit agreement on that window from whoever owns your security posture; it is a policy decision, not a technical one.</p>
+<p><strong>Naming and SAN conventions.</strong> Pick them once and enforce them in the Vault PKI role, not in a wiki:</p>
+<div class="codehilite"><pre><span></span><code>DNS SANs:
+  &lt;service&gt;.&lt;cell-ns&gt;.svc.cluster.local        # in-cluster
+  &lt;service&gt;.&lt;cell-id&gt;.&lt;region&gt;.cells.internal  # cross-cell / cross-cloud
+
+URI SAN:
+  spiffe://example.internal/cell/&lt;cell-id&gt;/ns/&lt;ns&gt;/sa/&lt;service-account&gt;
+
+CN: omitted (or the service name, purely cosmetic)
+</code></pre></div>
+
+<p>The URI SAN is the important one. Costing nothing today, it means that if you adopt SPIRE or a mesh in two years, your existing certificates already carry the right identity shape.</p>
+<p><strong>Key storage.</strong> Root in an HSM or a KMS key with deletion protection and a key policy denying <code>ScheduleKeyDeletion</code> to everyone except a break-glass principal. Region intermediates in Vault, protected by the barrier plus seal-wrap. Cell intermediates in each cell's Vault. Leaf keys ephemeral, generated per pod by <code>csi-driver</code>, never persisted.</p>
+<p><strong>Audit.</strong> Vault audit devices for issuance (who asked, for what names, when — with at least two devices, per <a href="10-vault.html#operations">10-vault.md</a>). Kubernetes audit for <code>Certificate</code> and <code>Secret</code> operations. And a <strong>certificate inventory</strong> — a periodic job that enumerates every Certificate across every cell, records issuer, notAfter, SANs, and key algorithm, and stores it somewhere queryable. You need this to answer "what still chains to root A" during a rotation, and internal PKI has no Certificate Transparency to fall back on.</p>
+<hr />
+<h2 id="multi-cloud-cloud-ca-vs-vault-pki">Multi-cloud: cloud CA vs Vault PKI<a class="anchor" href="#multi-cloud-cloud-ca-vs-vault-pki">#</a></h2>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>AWS Private CA</th>
+<th>GCP CA Service</th>
+<th>Azure Key Vault certificates</th>
+<th>Vault PKI</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Key protection</td>
+<td>FIPS 140-3 L3 HSM</td>
+<td>Cloud HSM (Enterprise tier)</td>
+<td>Managed HSM optional</td>
+<td>Vault barrier + seal wrap; PKCS#11 for real HSM (Enterprise)</td>
+</tr>
+<tr>
+<td>Cost model</td>
+<td><strong>$400/CA/month general-purpose</strong>, or <strong>$50/CA/month short-lived mode</strong> (max 7-day certs); certs $0.75 for the first 1,000, $0.35 for the next 9,000, $0.001 beyond — or $0.058/cert in short-lived mode</td>
+<td>Per-CA monthly fee by tier (DevOps vs Enterprise) plus per-certificate; see <a href="https://cloud.google.com/certificate-authority-service/pricing">pricing</a></td>
+<td>Per-operation, plus Managed HSM if used</td>
+<td>Vault license + compute</td>
+</tr>
+<tr>
+<td>cert-manager integration</td>
+<td>External issuer (aws-privateca-issuer)</td>
+<td>External issuer (google-cas-issuer)</td>
+<td>Via CSI/ESO; no first-class issuer</td>
+<td><strong>Built-in issuer</strong></td>
+</tr>
+<tr>
+<td>Cross-cloud portability</td>
+<td>None</td>
+<td>None</td>
+<td>None</td>
+<td><strong>Identical everywhere</strong></td>
+</tr>
+<tr>
+<td>Audit</td>
+<td>CloudTrail</td>
+<td>Cloud Audit Logs</td>
+<td>Azure Monitor</td>
+<td>Vault audit devices</td>
+</tr>
+<tr>
+<td>Offline root support</td>
+<td>Import an external root</td>
+<td>Import an external root</td>
+<td>Import</td>
+<td>Import or generate</td>
+</tr>
+<tr>
+<td>Per-cell CA at scale</td>
+<td><strong>$400/mo × N cells is prohibitive</strong>; short-lived mode at $50 helps a lot</td>
+<td>Per-CA fee × N</td>
+<td>N/A</td>
+<td>Marginal</td>
+</tr>
+<tr>
+<td>Operational burden</td>
+<td>Managed</td>
+<td>Managed</td>
+<td>Managed</td>
+<td>You run Vault</td>
+</tr>
+</tbody>
+</table>
+<p><strong>The recommendation.</strong> For a fleet of cells across three clouds, <strong>Vault PKI as the issuing CA is the right default</strong>, for one dominant reason: it is the only option that is identical in all three clouds. A per-cell CA design where the CA is AWS Private CA in AWS, CAS in GCP, and something else in Azure means three code paths, three IAM models, three audit formats, and three sets of failure modes for what is conceptually one operation. And $400/CA/month multiplied across a growing cell fleet is a real number that gets noticed. AWS's short-lived certificate mode at $50/CA/month with 7-day maximum validity is genuinely attractive if your design already uses 24-hour leaves — worth pricing out.</p>
+<p><strong>Where the cloud CA wins</strong> is compliance. If you need FIPS 140-3 Level 3 HSM attestation for the CA key and you are not buying Vault Enterprise with PKCS#11 support, AWS Private CA gives it to you as a line item. That is a compliance-driven decision, not an engineering one, and it should be made as such.</p>
+<p><strong>A defensible hybrid:</strong> the offline root in a cloud HSM (AWS Private CA in short-lived mode, or a KMS asymmetric key used only for ceremonies), region and cell intermediates in Vault PKI. You get HSM attestation where it matters — the root — and uniform, cheap, fast issuance everywhere else.</p>
+<hr />
+<h2 id="hands-on">Hands-on<a class="anchor" href="#hands-on">#</a></h2>
+<p><strong>Prerequisites for every lab below:</strong> a running Docker (or Podman) daemon, <code>kind</code> v0.30+, <code>kubectl</code>, <code>helm</code> v3 or v4, <code>jq</code>, <code>openssl</code> 3.x, and roughly 4 GB of free RAM for the kind node. Labs 2–6 each assume the cluster and the objects created by the preceding labs, so run them in order. Everything is local — no cloud account and no cost.</p>
+<h3 id="lab-1--install-cert-manager-on-kind-20-minutes">Lab 1 — Install cert-manager on kind, 20 minutes<a class="anchor" href="#lab-1--install-cert-manager-on-kind-20-minutes">#</a></h3>
+<div class="codehilite"><pre><span></span><code>kind create cluster --name pki-lab
+
+helm repo add jetstack https://charts.jetstack.io <span class="o">&amp;&amp;</span> helm repo update
+helm install cert-manager jetstack/cert-manager <span class="se">\</span>
+  --namespace cert-manager --create-namespace <span class="se">\</span>
+  --version v1.21.1 <span class="se">\</span>
+  --set crds.enabled<span class="o">=</span><span class="nb">true</span>
+
+kubectl -n cert-manager get pods
+<span class="c1"># cert-manager, cert-manager-webhook, cert-manager-cainjector</span>
+
+<span class="c1"># cmctl is worth installing now; it collapses four kubectl commands into one.</span>
+<span class="c1"># https://cert-manager.io/docs/reference/cmctl/</span>
+cmctl check api
+</code></pre></div>
+
+<p>Also install <code>step</code> for reading certificates — <code>openssl x509 -text</code> works but <code>step certificate inspect</code> is dramatically more readable.</p>
+<div class="codehilite"><pre><span></span><code>brew install step   <span class="c1"># or https://smallstep.com/docs/step-cli/installation/</span>
+</code></pre></div>
+
+<h3 id="lab-2--self-signed-root--intermediate--leaf-45-minutes">Lab 2 — Self-signed root → intermediate → leaf, 45 minutes<a class="anchor" href="#lab-2--self-signed-root--intermediate--leaf-45-minutes">#</a></h3>
+<p>Save the five-document manifest from the "SelfSigned → CA: building a hierarchy" section above into <code>hierarchy.yaml</code> first — it is not created for you — then apply it and read what you built.</p>
+<div class="codehilite"><pre><span></span><code>kubectl apply -f hierarchy.yaml   <span class="c1"># the SelfSigned → root → CA → intermediate → cell-issuer chain</span>
+
+kubectl -n cert-manager get certificate
+kubectl -n cert-manager <span class="nb">wait</span> --for<span class="o">=</span><span class="nv">condition</span><span class="o">=</span>Ready certificate/temporal-root-ca --timeout<span class="o">=</span>60s
+kubectl -n cert-manager <span class="nb">wait</span> --for<span class="o">=</span><span class="nv">condition</span><span class="o">=</span>Ready certificate/temporal-intermediate-usw2 --timeout<span class="o">=</span>60s
+</code></pre></div>
+
+<p>Now a leaf:</p>
+<div class="codehilite"><pre><span></span><code>kubectl create namespace cell-usw2-042
+
+kubectl apply -f - <span class="s">&lt;&lt;&#39;EOF&#39;</span>
+<span class="s">apiVersion: cert-manager.io/v1</span>
+<span class="s">kind: Certificate</span>
+<span class="s">metadata:</span>
+<span class="s">  name: temporal-frontend</span>
+<span class="s">  namespace: cell-usw2-042</span>
+<span class="s">spec:</span>
+<span class="s">  secretName: temporal-frontend-tls</span>
+<span class="s">  duration: 24h</span>
+<span class="s">  renewBefore: 8h</span>
+<span class="s">  commonName: temporal-frontend</span>
+<span class="s">  dnsNames:</span>
+<span class="s">    - temporal-frontend.cell-usw2-042.svc.cluster.local</span>
+<span class="s">    - temporal-frontend.cell-usw2-042.svc</span>
+<span class="s">  uris:</span>
+<span class="s">    - spiffe://example.internal/cell/usw2-042/ns/cell-usw2-042/sa/temporal-frontend</span>
+<span class="s">  usages:</span>
+<span class="s">    - digital signature</span>
+<span class="s">    - key encipherment</span>
+<span class="s">    - server auth</span>
+<span class="s">    - client auth</span>
+<span class="s">  privateKey:</span>
+<span class="s">    algorithm: ECDSA</span>
+<span class="s">    size: 256</span>
+<span class="s">    rotationPolicy: Always</span>
+<span class="s">  issuerRef:</span>
+<span class="s">    name: cell-issuer</span>
+<span class="s">    kind: ClusterIssuer</span>
+<span class="s">EOF</span>
+</code></pre></div>
+
+<p><strong>Read the certificates. This is the actual exercise.</strong></p>
+<div class="codehilite"><pre><span></span><code>kubectl -n cell-usw2-042 get secret temporal-frontend-tls <span class="se">\</span>
+  -o <span class="nv">jsonpath</span><span class="o">=</span><span class="s1">&#39;{.data.tls\.crt}&#39;</span> <span class="p">|</span> base64 -d &gt; leaf.pem
+
+step certificate inspect leaf.pem
+openssl x509 -in leaf.pem -noout -text
+
+<span class="c1"># What is in tls.crt? Count the certificates.</span>
+grep -c <span class="s1">&#39;BEGIN CERTIFICATE&#39;</span> leaf.pem     <span class="c1"># leaf + intermediate</span>
+
+<span class="c1"># And ca.crt?</span>
+kubectl -n cell-usw2-042 get secret temporal-frontend-tls <span class="se">\</span>
+  -o <span class="nv">jsonpath</span><span class="o">=</span><span class="s1">&#39;{.data.ca\.crt}&#39;</span> <span class="p">|</span> base64 -d <span class="p">|</span> step certificate inspect --short -
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="c1"># Pull out just the fields that matter</span>
+step certificate inspect leaf.pem --format json <span class="p">|</span> jq <span class="s1">&#39;{</span>
+<span class="s1">  subject: .subject, sans: .extensions.subject_alt_name,</span>
+<span class="s1">  eku: .extensions.extended_key_usage, ku: .extensions.key_usage,</span>
+<span class="s1">  serial: .serial_number, notAfter: .validity.end }&#39;</span>
+</code></pre></div>
+
+<p>Verify the chain by hand:</p>
+<div class="codehilite"><pre><span></span><code>kubectl -n cert-manager get secret temporal-root-ca <span class="se">\</span>
+  -o <span class="nv">jsonpath</span><span class="o">=</span><span class="s1">&#39;{.data.tls\.crt}&#39;</span> <span class="p">|</span> base64 -d &gt; root.pem
+kubectl -n cert-manager get secret temporal-intermediate-usw2 <span class="se">\</span>
+  -o <span class="nv">jsonpath</span><span class="o">=</span><span class="s1">&#39;{.data.tls\.crt}&#39;</span> <span class="p">|</span> base64 -d &gt; int.pem
+
+openssl verify -CAfile root.pem -untrusted int.pem leaf.pem
+<span class="c1"># leaf.pem: OK</span>
+
+<span class="c1"># Now prove that the chain matters: verify without the intermediate.</span>
+openssl verify -CAfile root.pem leaf.pem
+<span class="c1"># CN = temporal-frontend</span>
+<span class="c1"># error 20 at 0 depth lookup: unable to get local issuer certificate</span>
+<span class="c1"># error leaf.pem: verification failed</span>
+<span class="c1"># (exit status 2)</span>
+</code></pre></div>
+
+<p><strong>Exercises:</strong></p>
+<ol>
+<li>Remove <code>client auth</code> from <code>usages</code>, wait for reissuance, and inspect. Then set up a two-pod mTLS test and watch the client side fail while the server side works.</li>
+<li>Try to issue another <code>isCA: true</code> certificate from <code>cell-issuer</code> and observe that cert-manager happily does it — there is no <code>pathLen</code> control on the <code>Certificate</code> API (<a href="https://github.com/cert-manager/cert-manager/issues/2820">cert-manager#2820</a>), so the CA issuer cannot enforce the shape. Then build the same constraint by hand with openssl (<code>basicConstraints = critical,CA:TRUE,pathlen:0</code>) and confirm <code>openssl verify</code> rejects a three-deep chain. That gap is what Vault PKI's <code>max_path_length</code> closes.</li>
+<li>Create a certificate with only <code>commonName</code> and no <code>dnsNames</code>. Serve it from a Go HTTP server and connect with a Go client. Read the error. This is the death of CN, demonstrated.</li>
+</ol>
+<h3 id="lab-3--trust-manager-distribution-30-minutes">Lab 3 — trust-manager distribution, 30 minutes<a class="anchor" href="#lab-3--trust-manager-distribution-30-minutes">#</a></h3>
+<div class="codehilite"><pre><span></span><code>helm upgrade trust-manager oci://quay.io/jetstack/charts/trust-manager <span class="se">\</span>
+  --install --namespace cert-manager --wait
+
+kubectl label namespace cell-usw2-042 example.com/cell<span class="o">=</span><span class="nb">true</span>
+</code></pre></div>
+
+<p><strong>Do it the wrong way first</strong>, so the failure is concrete:</p>
+<div class="codehilite"><pre><span></span><code>kubectl apply -f - <span class="s">&lt;&lt;&#39;EOF&#39;</span>
+<span class="s">apiVersion: trust.cert-manager.io/v1alpha1</span>
+<span class="s">kind: Bundle</span>
+<span class="s">metadata:</span>
+<span class="s">  name: temporal-internal-trust</span>
+<span class="s">spec:</span>
+<span class="s">  sources:</span>
+<span class="s">    - useDefaultCAs: true</span>
+<span class="s">    - secret:</span>
+<span class="s">        name: temporal-root-ca      # DIRECTLY at the cert-manager Secret. Bad.</span>
+<span class="s">        key: tls.crt</span>
+<span class="s">  target:</span>
+<span class="s">    configMap:</span>
+<span class="s">      key: ca-certificates.crt</span>
+<span class="s">    namespaceSelector:</span>
+<span class="s">      matchLabels:</span>
+<span class="s">        example.com/cell: &quot;true&quot;</span>
+<span class="s">EOF</span>
+
+kubectl get bundle temporal-internal-trust
+kubectl -n cell-usw2-042 get cm temporal-internal-trust <span class="se">\</span>
+  -o <span class="nv">jsonpath</span><span class="o">=</span><span class="s1">&#39;{.data.ca-certificates\.crt}&#39;</span> <span class="p">|</span> grep -c <span class="s1">&#39;BEGIN CERTIFICATE&#39;</span>
+</code></pre></div>
+
+<p>Now trigger the disaster:</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># Force the root to be regenerated with a new key. Keep the leaf.pem and int.pem</span>
+<span class="c1"># you saved in Lab 2 — they are what you use to prove the break.</span>
+kubectl -n cert-manager delete secret temporal-root-ca
+
+<span class="c1"># Do NOT `kubectl wait --for=condition=Ready` here: the Certificate&#39;s Ready</span>
+<span class="c1"># condition is still True from the previous issuance, so wait returns instantly</span>
+<span class="c1"># and you race the controller. Wait for the Secret to come back instead.</span>
+<span class="k">until</span> kubectl -n cert-manager get secret temporal-root-ca &gt;/dev/null <span class="m">2</span>&gt;<span class="p">&amp;</span><span class="m">1</span><span class="p">;</span> <span class="k">do</span> sleep <span class="m">2</span><span class="p">;</span> <span class="k">done</span>
+
+sleep <span class="m">15</span>
+<span class="c1"># The bundle now contains the NEW root only. Verify the old leaf no longer validates:</span>
+kubectl -n cell-usw2-042 get cm temporal-internal-trust <span class="se">\</span>
+  -o <span class="nv">jsonpath</span><span class="o">=</span><span class="s1">&#39;{.data.ca-certificates\.crt}&#39;</span> &gt; bundle.pem
+openssl verify -CAfile bundle.pem -untrusted int.pem leaf.pem
+<span class="c1"># FAILS. Every service holding a leaf from the old root is now untrusted.</span>
+</code></pre></div>
+
+<p><strong>Now do it right.</strong> Rebuild the hierarchy, then decouple the Bundle from the live Secret by pointing it at a ConfigMap only you change:</p>
+<div class="codehilite"><pre><span></span><code>kubectl -n cert-manager get secret temporal-root-ca <span class="se">\</span>
+  -o <span class="nv">jsonpath</span><span class="o">=</span><span class="s1">&#39;{.data.tls\.crt}&#39;</span> <span class="p">|</span> base64 -d &gt; root.pem
+kubectl -n cert-manager create configmap temporal-trust-anchors <span class="se">\</span>
+  --from-file<span class="o">=</span>roots.pem<span class="o">=</span>root.pem
+
+kubectl patch bundle temporal-internal-trust --type<span class="o">=</span>json -p<span class="o">=</span><span class="s1">&#39;[</span>
+<span class="s1">  {&quot;op&quot;:&quot;replace&quot;,&quot;path&quot;:&quot;/spec/sources/1&quot;,</span>
+<span class="s1">   &quot;value&quot;:{&quot;configMap&quot;:{&quot;name&quot;:&quot;temporal-trust-anchors&quot;,&quot;key&quot;:&quot;roots.pem&quot;}}}]&#39;</span>
+</code></pre></div>
+
+<h3 id="lab-4--a-full-root-rotation-60-minutes">Lab 4 — A full root rotation, 60 minutes<a class="anchor" href="#lab-4--a-full-root-rotation-60-minutes">#</a></h3>
+<p>The most valuable exercise in this guide.</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># --- Phase 1: create root B, do not use it ---</span>
+kubectl apply -f - <span class="s">&lt;&lt;&#39;EOF&#39;</span>
+<span class="s">apiVersion: cert-manager.io/v1</span>
+<span class="s">kind: Certificate</span>
+<span class="s">metadata:</span>
+<span class="s">  name: temporal-root-ca-b</span>
+<span class="s">  namespace: cert-manager</span>
+<span class="s">spec:</span>
+<span class="s">  isCA: true</span>
+<span class="s">  commonName: Temporal Internal Root CA B</span>
+<span class="s">  secretName: temporal-root-ca-b</span>
+<span class="s">  duration: 87600h</span>
+<span class="s">  privateKey: { algorithm: ECDSA, size: 384 }</span>
+<span class="s">  issuerRef: { name: selfsigned-bootstrap, kind: ClusterIssuer }</span>
+<span class="s">EOF</span>
+
+kubectl -n cert-manager <span class="nb">wait</span> --for<span class="o">=</span><span class="nv">condition</span><span class="o">=</span>Ready certificate/temporal-root-ca-b --timeout<span class="o">=</span>60s
+kubectl -n cert-manager get secret temporal-root-ca-b <span class="se">\</span>
+  -o <span class="nv">jsonpath</span><span class="o">=</span><span class="s1">&#39;{.data.tls\.crt}&#39;</span> <span class="p">|</span> base64 -d &gt; rootB.pem
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="c1"># --- Phase 2: distribute trust for BOTH. Verify propagation. ---</span>
+cat root.pem rootB.pem &gt; both-roots.pem
+kubectl -n cert-manager create configmap temporal-trust-anchors <span class="se">\</span>
+  --from-file<span class="o">=</span>roots.pem<span class="o">=</span>both-roots.pem --dry-run<span class="o">=</span>client -o yaml <span class="p">|</span> kubectl apply -f -
+
+sleep <span class="m">15</span>
+kubectl -n cell-usw2-042 get cm temporal-internal-trust <span class="se">\</span>
+  -o <span class="nv">jsonpath</span><span class="o">=</span><span class="s1">&#39;{.data.ca-certificates\.crt}&#39;</span> &gt; bundle.pem
+<span class="c1"># Old leaves still validate:</span>
+openssl verify -CAfile bundle.pem -untrusted int.pem leaf.pem   <span class="c1"># OK</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="c1"># --- Phase 3: intermediate B, switch issuance ---</span>
+kubectl apply -f - <span class="s">&lt;&lt;&#39;EOF&#39;</span>
+<span class="s">apiVersion: cert-manager.io/v1</span>
+<span class="s">kind: ClusterIssuer</span>
+<span class="s">metadata: { name: temporal-root-issuer-b }</span>
+<span class="s">spec: { ca: { secretName: temporal-root-ca-b } }</span>
+<span class="s">---</span>
+<span class="s">apiVersion: cert-manager.io/v1</span>
+<span class="s">kind: Certificate</span>
+<span class="s">metadata: { name: temporal-intermediate-usw2-b, namespace: cert-manager }</span>
+<span class="s">spec:</span>
+<span class="s">  isCA: true</span>
+<span class="s">  commonName: Temporal Intermediate CA usw2 B</span>
+<span class="s">  secretName: temporal-intermediate-usw2-b</span>
+<span class="s">  duration: 26280h</span>
+<span class="s">  privateKey: { algorithm: ECDSA, size: 384 }</span>
+<span class="s">  usages: [&quot;cert sign&quot;, &quot;crl sign&quot;, &quot;digital signature&quot;]</span>
+<span class="s">  issuerRef: { name: temporal-root-issuer-b, kind: ClusterIssuer }</span>
+<span class="s">EOF</span>
+
+kubectl -n cert-manager <span class="nb">wait</span> --for<span class="o">=</span><span class="nv">condition</span><span class="o">=</span>Ready <span class="se">\</span>
+  certificate/temporal-intermediate-usw2-b --timeout<span class="o">=</span>60s
+
+<span class="c1"># Repoint the issuer workloads use.</span>
+kubectl patch clusterissuer cell-issuer --type<span class="o">=</span>merge <span class="se">\</span>
+  -p <span class="s1">&#39;{&quot;spec&quot;:{&quot;ca&quot;:{&quot;secretName&quot;:&quot;temporal-intermediate-usw2-b&quot;}}}&#39;</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="c1"># --- Phase 4: force reissuance ---</span>
+cmctl renew --all -n cell-usw2-042
+kubectl -n cell-usw2-042 get certificaterequest -w    <span class="c1"># ctrl-c when Ready</span>
+
+kubectl -n cell-usw2-042 get secret temporal-frontend-tls <span class="se">\</span>
+  -o <span class="nv">jsonpath</span><span class="o">=</span><span class="s1">&#39;{.data.tls\.crt}&#39;</span> <span class="p">|</span> base64 -d &gt; leaf-b.pem
+step certificate inspect leaf-b.pem --short    <span class="c1"># issuer is now &quot;... CA usw2 B&quot;</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="c1"># --- Phase 5: verify nothing depends on root A ---</span>
+kubectl -n cell-usw2-042 get secret -o json <span class="p">|</span> <span class="se">\</span>
+  jq -r <span class="s1">&#39;.items[] | select(.type==&quot;kubernetes.io/tls&quot;) | .metadata.name&#39;</span>
+<span class="c1"># For each, confirm it chains to root B and NOT to root A.</span>
+
+<span class="c1"># --- Phase 6: remove root A from the anchors ---</span>
+kubectl -n cert-manager create configmap temporal-trust-anchors <span class="se">\</span>
+  --from-file<span class="o">=</span>roots.pem<span class="o">=</span>rootB.pem --dry-run<span class="o">=</span>client -o yaml <span class="p">|</span> kubectl apply -f -
+sleep <span class="m">15</span>
+kubectl -n cell-usw2-042 get cm temporal-internal-trust <span class="se">\</span>
+  -o <span class="nv">jsonpath</span><span class="o">=</span><span class="s1">&#39;{.data.ca-certificates\.crt}&#39;</span> <span class="p">|</span> grep -c <span class="s1">&#39;BEGIN CERTIFICATE&#39;</span>
+</code></pre></div>
+
+<p><strong>Now do it wrong on purpose</strong> and time how long the outage lasts: skip Phase 2 entirely — switch the issuer first, <em>then</em> update the anchors. Every service is broken for the duration of the gap. Write down the number. That number is the argument for the procedure.</p>
+<h3 id="lab-5--acme-with-a-local-acme-server-30-minutes">Lab 5 — ACME with a local ACME server, 30 minutes<a class="anchor" href="#lab-5--acme-with-a-local-acme-server-30-minutes">#</a></h3>
+<p>Do not point at Let's Encrypt production while learning; you will burn rate limits. Run <a href="https://github.com/letsencrypt/pebble">Pebble</a>, Let's Encrypt's test ACME server, in-cluster:</p>
+<div class="codehilite"><pre><span></span><code>kubectl create namespace pebble
+kubectl -n pebble create deployment pebble --image<span class="o">=</span>ghcr.io/letsencrypt/pebble:latest <span class="se">\</span>
+  -- pebble -config /test/config/pebble-config.json -dnsserver <span class="m">10</span>.96.0.10:53
+kubectl -n pebble expose deployment pebble --port<span class="o">=</span><span class="m">14000</span>
+</code></pre></div>
+
+<p>Two Pebble facts that will otherwise cost you the afternoon: it validates HTTP-01 against <strong>port 5002</strong>, not port 80, so a stock Ingress will never satisfy a challenge; and it deliberately rejects ~5% of nonces to exercise client retry logic. For a lab that is about watching the <em>state machine</em> rather than about real validation, set <code>PEBBLE_VA_ALWAYS_VALID=1</code> on the Deployment so every challenge passes, and turn it off later if you want to debug real solver routing.</p>
+<div class="codehilite"><pre><span></span><code>kubectl -n pebble <span class="nb">set</span> env deployment/pebble <span class="nv">PEBBLE_VA_ALWAYS_VALID</span><span class="o">=</span><span class="m">1</span>
+</code></pre></div>
+
+<p>Point an ACME <code>ClusterIssuer</code> at <code>https://pebble.pebble.svc:14000/dir</code> with <code>skipTLSVerify: true</code>, create an Ingress with the <code>cert-manager.io/cluster-issuer</code> annotation, then watch the state machine:</p>
+<div class="codehilite"><pre><span></span><code>kubectl get order,challenge -A
+kubectl describe challenge -n cell-usw2-042
+kubectl -n cell-usw2-042 get pods    <span class="c1"># note the ephemeral cm-acme-http-solver pod</span>
+</code></pre></div>
+
+<p><strong>Exercises:</strong></p>
+<ol>
+<li>Delete the solver pod mid-challenge and watch the retry behavior.</li>
+<li>Break the Ingress routing so the solver is unreachable. Read the Challenge status message — it tells you exactly what the ACME server saw.</li>
+<li>Read the <a href="https://letsencrypt.org/docs/rate-limits/">Let's Encrypt rate limits</a> page and calculate: with 50 certificates per registered domain per 7 days, how many cells can you provision per week under <code>*.temporal.io</code> before you need an override? (The answer motivates per-cell subdomains or a private CA.)</li>
+</ol>
+<h3 id="lab-6--the-reload-problem-demonstrated">Lab 6 — The reload problem, demonstrated<a class="anchor" href="#lab-6--the-reload-problem-demonstrated">#</a></h3>
+<div class="codehilite"><pre><span></span><code><span class="c1"># Serve a 1-hour cert from a pod that reads it once at startup.</span>
+<span class="c1"># Force reissuance and watch the wire NOT change.</span>
+cmctl renew temporal-frontend -n cell-usw2-042
+
+<span class="c1"># Secret says the new notAfter:</span>
+kubectl -n cell-usw2-042 get secret temporal-frontend-tls <span class="se">\</span>
+  -o <span class="nv">jsonpath</span><span class="o">=</span><span class="s1">&#39;{.data.tls\.crt}&#39;</span> <span class="p">|</span> base64 -d <span class="p">|</span> <span class="se">\</span>
+  openssl x509 -noout -enddate
+
+<span class="c1"># The wire says the old one:</span>
+kubectl -n cell-usw2-042 <span class="nb">exec</span> deploy/probe -- <span class="se">\</span>
+  openssl s_client -connect temporal-frontend:8443 &lt;/dev/null <span class="m">2</span>&gt;/dev/null <span class="p">|</span> <span class="se">\</span>
+  openssl x509 -noout -enddate
+</code></pre></div>
+
+<p><strong>This divergence is the thing to monitor.</strong> Write a probe that compares the two. Then fix the app with <code>GetCertificate</code> and confirm the divergence disappears.</p>
+<hr />
+<h2 id="production-gotchas">Production gotchas<a class="anchor" href="#production-gotchas">#</a></h2>
+<ol>
+<li>
+<p><strong>Go disabled Common Name fallback by default in Go 1.15 and removed the <code>GODEBUG=x509ignoreCN=0</code> escape hatch entirely in Go 1.17.</strong> A certificate with a CN but no SAN is invalid to Kubernetes, Temporal, Envoy, and essentially every cloud-native component. Always set <code>dnsNames</code>. The error message will complain about the hostname, not about the missing SAN. Source: <a href="https://go.dev/doc/go1.15#commonname">Go 1.15 release notes</a> and <a href="https://www.rfc-editor.org/rfc/rfc6125">RFC 6125</a>.</p>
+</li>
+<li>
+<p><strong>The CA/Browser Forum's 200-day maximum for public TLS certificates has been in force since 2026-03-15</strong>, dropping to 100 days on 2027-03-15 and 47 days on 2029-03-15, with domain validation reuse falling to 10 days. Anything with a manual renewal step for public certificates is already on borrowed time. Source: <a href="https://cabforum.org/2025/04/11/ballot-sc081v3-introduce-schedule-of-reducing-validity-and-data-reuse-periods/">Ballot SC-081v3</a>.</p>
+</li>
+<li>
+<p><strong>Pointing a trust-manager <code>Bundle</code> directly at a cert-manager Secret means the next root rotation instantly distrusts every existing leaf.</strong> The trust-manager docs warn about this explicitly. Copy roots into a dedicated ConfigMap you control and point the Bundle at that. Source: <a href="https://cert-manager.io/docs/trust/trust-manager/#cert-manager-integration-intentionally-copying-ca-certificates">trust-manager — Intentionally Copying CA Certificates</a>.</p>
+</li>
+<li>
+<p><strong>Never put an intermediate in a trust store to "fix" a chain error.</strong> It makes the intermediate a de facto root that cannot be rotated without updating every trust store first — destroying the reason intermediates exist. Fix the server's chain instead. Source: <a href="https://cert-manager.io/docs/trust/trust-manager/#bundling-intermediates">trust-manager — Bundling Intermediates</a>.</p>
+</li>
+<li>
+<p><strong><code>spec.privateKey.rotationPolicy</code> defaulted to <code>Never</code> before cert-manager v1.18 and defaults to <code>Always</code> from v1.18 onward.</strong> Wherever <code>Never</code> is still in effect — an older cluster, or a manifest that pins it — renewal reuses the existing private key and a leaked key stays leaked. Audit for explicit <code>Never</code>. Source: <a href="https://cert-manager.io/docs/usage/certificate/">Certificate resource docs</a>.</p>
+</li>
+<li>
+<p><strong><code>ca.crt</code> in a cert-manager Secret is populated on a best-effort basis and some issuers cannot fill it at all.</strong> Do not build a trust pipeline that assumes it exists. Source: <a href="https://cert-manager.io/docs/trust/trust-manager/#cert-manager-integration-cacrt-vs-tlscrt">trust-manager — <code>ca.crt</code> vs <code>tls.crt</code></a>.</p>
+</li>
+<li>
+<p><strong>Secrets mounted with <code>subPath</code> are never updated by the kubelet.</strong> The certificate renews, the file on disk does not, and the pod serves an expired cert until it restarts. Mount the whole volume. Source: <a href="https://kubernetes.io/docs/concepts/storage/volumes/#configmap">Kubernetes — projected volumes / mounted ConfigMaps are updated automatically</a>.</p>
+</li>
+<li>
+<p><strong>cert-manager's job ends when it writes the Secret; nothing reloads your application.</strong> The observable symptom is a Secret with a future <code>notAfter</code> and a wire certificate with a past one. Monitor the wire, not the Secret, and implement <code>GetCertificate</code> or use Reloader.</p>
+</li>
+<li>
+<p><strong>Missing <code>clientAuth</code> in EKU breaks mTLS in a maximally confusing way</strong>: the server half of every handshake works and the client half is rejected, so exactly half your service graph appears healthy. Always set both <code>server auth</code> and <code>client auth</code> for mesh certificates.</p>
+</li>
+<li>
+<p><strong>cert-manager 1.21 removed the default <code>serviceaccounts/token: create</code> Role and RoleBinding from the Helm chart.</strong> If you used <code>serviceAccountRef.name</code> pointing at the controller's own ServiceAccount (an undocumented pattern), DNS-01 and Vault auth break on upgrade. Create the RBAC yourself or move to a dedicated ServiceAccount. Source: <a href="https://cert-manager.io/docs/releases/release-notes/release-notes-1.21/">cert-manager 1.21 release notes</a>.</p>
+</li>
+<li>
+<p><strong>cert-manager 1.21 removed three Prometheus Helm values</strong> (<code>prometheus.servicemonitor.targetPort</code>, <code>prometheus.servicemonitor.path</code>, <code>prometheus.podmonitor.path</code>) and renamed the metrics port from <code>tcp-prometheus-servicemonitor</code> to <code>http-metrics</code>. Because the values schema uses <code>additionalProperties: false</code>, leaving any of them in your overrides is a hard schema validation failure on upgrade. Source: same release notes.</p>
+</li>
+<li>
+<p><strong>cert-manager 1.21 tightened the <code>cert-manager-edit</code> aggregate ClusterRole</strong> (GHSA-8rvj-mm4h-c258), removing <code>create</code> on Challenges and <code>create</code>/<code>patch</code>/<code>update</code> on Orders. Tooling that manipulated those directly needs explicit grants. Already shipped in 1.20.3 and 1.19.6. Source: same release notes.</p>
+</li>
+<li>
+<p><strong>Let's Encrypt allows 50 certificates per registered domain per 7 days, and 5 per exact set of identifiers per 7 days.</strong> Provisioning cells under one apex domain hits the first limit fast; a CrashLooping test setup hits the second immediately. ARI-coordinated renewals are exempt from all rate limits — cert-manager 1.21 added ARI behind the <code>ACMEUseARI</code> feature gate. Use the staging environment for anything experimental. Source: <a href="https://letsencrypt.org/docs/rate-limits/">Let's Encrypt rate limits</a>, updated 2026-08-05.</p>
+</li>
+<li>
+<p><strong>Let's Encrypt also caps consecutive authorization failures per identifier at 1,152</strong>, after which the account is <em>paused</em> for that identifier and requires a self-service unpause. A permanently broken DNS-01 solver will eventually get you paused, not just throttled. Source: same page.</p>
+</li>
+<li>
+<p><strong>Stuck ACME Orders and Challenges usually mean the ACME server saw something you did not.</strong> <code>kubectl describe challenge</code> contains the server's own error text. Common causes: split-horizon DNS (the solver resolves internally but the CA resolves externally), NAT hairpin, and port 80 blocked. cert-manager 1.21 added <code>waitInsteadOfSelfCheck</code> as an escape hatch for exactly these environments. Source: <a href="https://cert-manager.io/docs/troubleshooting/acme/">Troubleshooting ACME</a>.</p>
+</li>
+<li>
+<p><strong>cert-manager's default CertificateRequest retry backoff caps at 32 hours.</strong> A transient CA outage can leave a failed request sitting for well over a day. cert-manager 1.21 made this configurable via <code>--certificate-request-maximum-backoff-duration</code>. Lower it if your CA has scheduled maintenance windows. Source: <a href="https://cert-manager.io/docs/releases/release-notes/release-notes-1.21/">cert-manager 1.21 release notes</a>.</p>
+</li>
+<li>
+<p><strong>Clock skew breaks certificate validation in both directions.</strong> A node whose clock is ahead sees freshly issued certificates as not-yet-valid (<code>notBefore</code> in the future); a node behind sees expired ones as valid. cert-manager sets a small <code>notBefore</code> backdate, but a node minutes off will still fail. Monitor NTP as a PKI dependency.</p>
+</li>
+<li>
+<p><strong>Deleting a <code>Certificate</code>'s Secret triggers immediate reissuance, and deleting the <code>Certificate</code> does not delete the Secret</strong> (unless <code>enableCertificateOwnerRef</code> is set). The asymmetry produces two distinct messes: a "cleanup" script that deletes Secrets causes a reissuance storm and can hit rate limits, while deleting Certificates leaves orphaned Secrets that nothing renews. Source: <a href="https://cert-manager.io/docs/faq/">cert-manager FAQ</a>.</p>
+</li>
+<li>
+<p><strong>A manually created Secret at a <code>Certificate</code>'s <code>secretName</code> will be overwritten.</strong> cert-manager takes ownership. The reverse — an app that writes to the Secret — produces a fight loop where cert-manager and the app overwrite each other every reconcile.</p>
+</li>
+<li>
+<p><strong>cert-manager CRDs are not upgraded by <code>helm upgrade</code> unless <code>crds.enabled=true</code> was used at install.</strong> If you installed CRDs separately via <code>kubectl apply</code>, you must upgrade them separately, and skipping a minor version is unsupported. Upgrading from 1.19 to 1.21 requires going through 1.20. Source: <a href="https://cert-manager.io/docs/installation/upgrade/">Upgrading cert-manager</a>.</p>
+</li>
+<li>
+<p><strong>cert-manager 1.21 supports Kubernetes 1.33–1.36 only.</strong> Kubernetes 1.37 shipped 2026-08-26 with ClusterTrustBundle and PodCertificateRequest going stable; cert-manager 1.22 (~November 2026) is the first release to support it. Check the <a href="https://cert-manager.io/docs/releases/">supported releases table</a> before upgrading a cluster ahead of cert-manager.</p>
+</li>
+<li>
+<p><strong>cert-manager's webhook is a cluster-wide availability dependency.</strong> If it is unreachable, every <code>kubectl apply</code> of a cert-manager resource fails, and a badly scoped <code>namespaceSelector</code> can affect unrelated resources. Never let cainjector and the webhook be co-scheduled on a single node in a cell that matters; set PDBs and topology spread.</p>
+</li>
+<li>
+<p><strong>Two cert-manager bugs fixed in 1.21 are worth recognizing by symptom.</strong> An issuer returning an already-expired certificate caused an <em>infinite re-issuance loop</em> (symptom: a Certificate reissuing continuously with no errors — check the CA's clock and its own expiry), and <code>renewBeforePercentage</code> had an <em>integer overflow</em> for durations longer than roughly three years, producing incorrect validation and renewal times. Both are further arguments against long-lived leaves. Source: <a href="https://cert-manager.io/docs/releases/release-notes/release-notes-1.21/">cert-manager 1.21 release notes</a>.</p>
+</li>
+<li>
+<p><strong>trust-manager's default CA package is a container image you must keep updated.</strong> Leaving it pinned is equivalent to never running <code>apt-get upgrade ca-certificates</code> — you will keep trusting distrusted roots and will not trust newly added ones. Source: <a href="https://cert-manager.io/docs/trust/trust-manager/#securely-maintaining-a-trust-manager-installation">trust-manager — Securely Maintaining an Installation</a>.</p>
+</li>
+<li>
+<p><strong>trust-manager's empty <code>namespaceSelector</code> currently syncs to all namespaces, and the docs warn this behavior will change.</strong> Always set the selector explicitly so the upgrade is a no-op. Source: same docs.</p>
+</li>
+<li>
+<p><strong>Expired-certificate outages happen to organizations with mature ops functions, because the certificate that expires is always the one outside the inventory.</strong> Microsoft Teams was down roughly three hours in February 2020 on an expired auth certificate; Spotify had roughly an hour of downtime in August 2020 on an expired cert on an <em>internal, non-customer-facing</em> service that monitoring did not cover; Ericsson's expired certificate took O2's UK 4G network down for nearly a day in December 2018, affecting around 32 million subscribers. The common thread, per <a href="https://www.configclarity.dev/incidents/ssl-expiry-outages/">this incident analysis</a> (secondary source), is that the certificate existed outside whatever inventory the team assumed was complete. <strong>Build the inventory, and probe the wire.</strong></p>
+</li>
+<li>
+<p><strong>Distroless and scratch containers may have no system trust store at all.</strong> A Go binary in <code>gcr.io/distroless/static</code> fails every outbound TLS call with an opaque error because <code>/etc/ssl/certs</code> does not exist. Use the <code>base</code> variant, or mount a trust bundle explicitly.</p>
+</li>
+</ol>
+<hr />
+<h2 id="how-this-shows-up-in-cell-lifecycle">How this shows up in cell lifecycle<a class="anchor" href="#how-this-shows-up-in-cell-lifecycle">#</a></h2>
+<p><strong>Provisioning.</strong> PKI is on the critical path for a cell reaching "ready," and the order is fixed:</p>
+<ol>
+<li>Region intermediate must already exist. If it does not, a human signing ceremony blocks the cell — which is why intermediates are created ahead of demand, not on demand.</li>
+<li>Create the cell's Vault PKI mount, generate a CSR, sign it with the region CA, import the chain, and configure the PKI role with the cell's name constraints. Schedule <code>tidy</code>.</li>
+<li>Install cert-manager and configure the Vault <code>ClusterIssuer</code> with Kubernetes auth. Verify by issuing a throwaway certificate before anything real depends on it.</li>
+<li>Install trust-manager and create the anchors ConfigMap and the <code>Bundle</code>. <strong>Trust distribution must complete before any workload starts</strong>, or the first pods come up unable to validate each other.</li>
+<li>Issue the cell's workload certificates. Verify on the wire, not just in the Secret.</li>
+<li>Register every certificate in the fleet inventory.</li>
+</ol>
+<p>The dependency worth calling out: cert-manager needs Vault, Vault needs KMS, KMS needs a network path the networking team owns. A cell that will not come up because certificates will not issue is often actually a networking incident three layers down. Build the diagnostic that distinguishes these, or you will debug it from the top every time.</p>
+<p><strong>Steady state.</strong> With 24-hour leaves, every certificate in the cell renews about once a day, which means the renewal path is continuously exercised and cannot silently rot. What you monitor:</p>
+<ul>
+<li><code>certmanager_certificate_expiration_timestamp_seconds</code> — alert at 2× <code>renewBefore</code> remaining, not at expiry.</li>
+<li><code>certmanager_certificate_ready_status</code> — any Certificate not Ready for more than an hour.</li>
+<li><strong>A wire probe</strong> comparing the certificate served on each service port against the Secret. This catches the reload failure, which no cert-manager metric can see.</li>
+<li>Vault PKI issuance rate per cell — a spike means a reissuance loop; a drop to zero means issuance is broken and you have hours, not days.</li>
+</ul>
+<p><strong>Upgrading a cell.</strong> cert-manager upgrades are single-minor-version steps with CRD updates, and the last release alone had three breaking Helm changes. Test in one cell, then roll. Never skip a minor version. And check the Kubernetes compatibility matrix in both directions — upgrading Kubernetes past what your cert-manager supports is as bad as the reverse.</p>
+<p><strong>Root rotation.</strong> A quarter-long, fleet-wide project, not a change ticket. It is the reason the two-level hierarchy exists — so that routine rotation happens at the intermediate layer, which needs no trust distribution at all. The runbook is the seven-phase procedure above, and it should have been rehearsed in a scratch cell before it is needed.</p>
+<p><strong>Teardown.</strong> Destroy the cell's Vault and the issuing CA's private key goes with it — clean, and one of the strongest arguments for per-cell Vault PKI. Remaining work: remove the cell's intermediate from any inventory or CRL, remove the cell's namespace label so trust-manager stops syncing, and delete the fleet-inventory entries. A cell whose certificates outlive it is a set of valid credentials for infrastructure that no longer exists — short lifetimes mean this self-corrects within a day, which is exactly the point.</p>
+<p><strong>Cross-cloud.</strong> Vault PKI makes the issuance path identical in AWS, GCP, and Azure; only the DNS-01 solver configuration and the Vault seal differ. Keep those two as the only cloud-conditional parts of your cell PKI module.</p>
+<hr />
+<h2 id="learning-path">Learning path<a class="anchor" href="#learning-path">#</a></h2>
+<h3 id="day-1-34-hours">Day 1 (3–4 hours)<a class="anchor" href="#day-1-34-hours">#</a></h3>
+<ul>
+<li>Read <a href="https://cert-manager.io/docs/concepts/">cert-manager Concepts</a> and the <a href="https://cert-manager.io/docs/usage/certificate/">Certificate resource docs</a> end to end. Then skim <a href="https://www.rfc-editor.org/rfc/rfc5280#section-4.2">RFC 5280 §4.2</a> — just the extensions section, not the whole thing.</li>
+<li>Run <strong>Lab 1</strong> and <strong>Lab 2</strong>. Spend most of the time in <code>step certificate inspect</code> and <code>openssl verify</code>. Reading certificates fluently is the underrated skill here.</li>
+<li>Be able to explain out loud: root vs intermediate and why; what <code>tls.crt</code> contains vs what belongs in a trust store; why CN does not work anymore; why <code>clientAuth</code> matters for mTLS.</li>
+</ul>
+<h3 id="week-1-1015-hours">Week 1 (10–15 hours)<a class="anchor" href="#week-1-1015-hours">#</a></h3>
+<ul>
+<li>Run <strong>Labs 3, 4, 5, and 6</strong>. Lab 4 (root rotation) is the one that matters; do the "wrong way" version too and time the outage.</li>
+<li>Read the <a href="https://cert-manager.io/docs/trust/trust-manager/">trust-manager docs</a> in full, especially "Preparing for Production." It is the best-written explanation of the trust rotation problem anywhere.</li>
+<li>Read the <a href="https://cert-manager.io/docs/releases/release-notes/release-notes-1.21/">cert-manager 1.21 release notes</a> and the <a href="https://cert-manager.io/docs/releases/">supported releases table</a>. Know the three breaking changes.</li>
+<li>Read <a href="https://cabforum.org/2025/04/11/ballot-sc081v3-introduce-schedule-of-reducing-validity-and-data-reuse-periods/">Ballot SC-081v3</a> — at minimum the Benefits and Revocation sections. It is the clearest statement of why short lifetimes beat revocation.</li>
+<li>Set up Vault PKI as the issuing CA behind cert-manager (combining this with <a href="10-vault.html#lab-2--kubernetes-auth-on-kind-45-minutes">10-vault.md</a>'s Lab 2, which builds the Kubernetes auth mount the Vault issuer needs). This is the production shape.</li>
+</ul>
+<h3 id="month-1-ongoing">Month 1 (ongoing)<a class="anchor" href="#month-1-ongoing">#</a></h3>
+<ul>
+<li><strong>Write the root rotation runbook for your actual fleet</strong> and execute it in a scratch cell. Measure <code>P</code> (trust propagation time) empirically — do not guess it.</li>
+<li><strong>Build the certificate inventory.</strong> A job that walks every cell, records issuer/notAfter/SANs/algorithm for every certificate, and exposes it queryably. You cannot rotate a root without it, and there is no CT log for internal PKI.</li>
+<li><strong>Build the wire probe.</strong> For every service port in a cell, compare the certificate on the wire against the Secret. This is the only monitor that catches the reload failure.</li>
+<li>Read the <a href="https://spiffe.io/docs/latest/spiffe-about/spiffe-concepts/">SPIFFE concepts</a> and <a href="https://spiffe.io/docs/latest/spire-about/spire-concepts/">SPIRE concepts</a> docs and deploy <code>csi-driver-spiffe</code> in a lab. Form an opinion on whether the cell fleet should adopt SPIFFE identities now (cheap: just URI SANs) or SPIRE later (expensive: another control plane).</li>
+<li>Evaluate <strong><code>PodCertificateRequest</code> + <code>ClusterTrustBundle</code></strong> on a Kubernetes 1.37 cluster. Both went stable on 2026-08-26 and they materially change the trust-distribution and per-pod-certificate story. Whatever you design now should be able to migrate onto them.</li>
+<li>Price out <strong>AWS Private CA short-lived mode ($50/CA/month, 7-day max validity)</strong> against Vault PKI for your projected cell count. If your design already uses 24-hour leaves, the compliance story may be worth the money for the root.</li>
+</ul>
+<hr />
+<h2 id="references">References<a class="anchor" href="#references">#</a></h2>
+<ol>
+<li><a href="https://cert-manager.io/docs/">cert-manager Documentation</a> — the project's own docs; unusually good, and the primary source for everything cert-manager-specific here.</li>
+<li><a href="https://cert-manager.io/docs/releases/">cert-manager Supported Releases</a> — the release/EOL table and Kubernetes compatibility matrix. 1.21 (Jul 08 2026) supports K8s 1.33–1.36; 1.22 lands ~Nov 2026.</li>
+<li><a href="https://cert-manager.io/docs/releases/release-notes/release-notes-1.21/">cert-manager 1.21 Release Notes</a> — the three breaking changes, ARI support, AWS IAM auth for the Vault issuer, renewal policies, and the reissuance-loop and <code>renewBeforePercentage</code> fixes.</li>
+<li><a href="https://cert-manager.io/docs/installation/upgrade/">Upgrading cert-manager</a> — CRD handling and the no-skipping-minors rule.</li>
+<li><a href="https://cert-manager.io/docs/usage/certificate/">Certificate resource — cert-manager</a> — <code>duration</code>, <code>renewBefore</code>, <code>renewBeforePercentage</code>, <code>rotationPolicy</code>, and the new <code>renewal</code> field.</li>
+<li><a href="https://cert-manager.io/docs/concepts/issuer/">Issuer concepts — cert-manager</a> — Issuer vs ClusterIssuer and the issuer type catalog.</li>
+<li><a href="https://cert-manager.io/docs/concepts/acme-orders-challenges/">ACME Orders and Challenges — cert-manager</a> — the Order/Challenge state machine you will be reading in incidents.</li>
+<li><a href="https://cert-manager.io/docs/concepts/ca-injector/">CA Injector concepts — cert-manager</a> — the three injection annotations and which resource kinds they work on.</li>
+<li><a href="https://cert-manager.io/docs/configuration/vault/">Vault Issuer configuration — cert-manager</a> — Kubernetes auth via <code>serviceAccountRef</code>, plus the new AWS IAM auth path.</li>
+<li><a href="https://cert-manager.io/docs/configuration/ca/">CA Issuer configuration — cert-manager</a> — the simplest real CA, with the key in a Secret.</li>
+<li><a href="https://cert-manager.io/docs/configuration/selfsigned/">SelfSigned Issuer — cert-manager</a> — bootstrapping a root.</li>
+<li><a href="https://cert-manager.io/docs/configuration/acme/dns01/route53/">ACME DNS-01 Route53 — cert-manager</a> — IRSA and the cross-account <code>role</code> field.</li>
+<li><a href="https://cert-manager.io/docs/configuration/acme/dns01/google/">ACME DNS-01 Google CloudDNS — cert-manager</a> — Workload Identity setup.</li>
+<li><a href="https://cert-manager.io/docs/configuration/acme/dns01/azuredns/">ACME DNS-01 AzureDNS — cert-manager</a> — managed identity and workload identity.</li>
+<li><a href="https://cert-manager.io/docs/configuration/acme/">ACME configuration — cert-manager</a> — solver selection, <code>preferredChain</code>, and <code>waitInsteadOfSelfCheck</code>.</li>
+<li><a href="https://cert-manager.io/docs/troubleshooting/acme/">Troubleshooting ACME — cert-manager</a> — the runbook for stuck Orders and Challenges.</li>
+<li><a href="https://cert-manager.io/docs/reference/annotations/">Annotations reference — cert-manager</a> — every ingress-shim and cainjector annotation in one place.</li>
+<li><a href="https://cert-manager.io/docs/usage/gateway/">Gateway API usage — cert-manager</a> — listener-based certificate management.</li>
+<li><a href="https://cert-manager.io/docs/usage/csi-driver/">csi-driver — cert-manager</a> — ephemeral per-pod certificates with no Secret.</li>
+<li><a href="https://cert-manager.io/docs/usage/csi-driver-spiffe/">csi-driver-spiffe — cert-manager</a> — SPIFFE SVIDs via CSI Token Requests; key never leaves node memory.</li>
+<li><a href="https://github.com/cert-manager/csi-driver-spiffe">csi-driver-spiffe — GitHub</a> — the property list (auto-renewal, per-pod uniqueness, destroyed on termination).</li>
+<li><a href="https://cert-manager.io/docs/trust/trust-manager/">trust-manager — cert-manager</a> — Bundle sources and targets, JKS/PKCS#12 support, and the best written explanation of the trust rotation problem. Read "Preparing for Production" twice.</li>
+<li><a href="https://cert-manager.io/announcements/2025/09/05/trust-manager-clusterbundle-future/">trust-manager is moving to ClusterBundle — cert-manager Announcements</a> — the <code>trust-manager.io/v1alpha2</code> API migration to plan for.</li>
+<li><a href="https://cert-manager.io/docs/installation/best-practice/">Best Practice Installation Options — cert-manager</a> — hardened install values worth adopting wholesale.</li>
+<li><a href="https://cert-manager.io/docs/devops-tips/prometheus-metrics/">Prometheus Metrics — cert-manager</a> — <code>certmanager_certificate_expiration_timestamp_seconds</code> and friends.</li>
+<li><a href="https://cert-manager.io/docs/reference/cmctl/">cmctl — cert-manager</a> — <code>cmctl status certificate</code> collapses four kubectl commands into one; <code>cmctl renew</code> forces reissuance.</li>
+<li><a href="https://www.rfc-editor.org/rfc/rfc5280">RFC 5280 — Internet X.509 PKI Certificate and CRL Profile</a> — the normative source for Basic Constraints, Key Usage, Name Constraints, and path validation. Read §4.2 and §6.</li>
+<li><a href="https://www.rfc-editor.org/rfc/rfc6125">RFC 6125 — Service Identity in TLS</a> — why SANs replaced CN.</li>
+<li><a href="https://www.rfc-editor.org/rfc/rfc8555">RFC 8555 — ACME</a> — the protocol behind Order and Challenge.</li>
+<li><a href="https://www.rfc-editor.org/rfc/rfc9773">RFC 9773 — ACME Renewal Information (ARI)</a> — the renewal-window extension cert-manager 1.21 added behind <code>ACMEUseARI</code>; ARI renewals are exempt from Let's Encrypt rate limits.</li>
+<li><a href="https://cabforum.org/2025/04/11/ballot-sc081v3-introduce-schedule-of-reducing-validity-and-data-reuse-periods/">Ballot SC-081v3 — CA/Browser Forum</a> — the 398 → 200 → 100 → 47 day schedule, the vote tally, and the clearest published argument for why revocation does not scale.</li>
+<li><a href="https://github.com/cabforum/servercert">CA/Browser Forum TLS Baseline Requirements — GitHub</a> — the live normative text and its release history.</li>
+<li><a href="https://letsencrypt.org/docs/rate-limits/">Let's Encrypt Rate Limits</a> — updated 2026-08-05; 50 certs per registered domain per week, 5 per exact identifier set, 1,152 consecutive-failure pause, and the ARI exemption.</li>
+<li><a href="https://letsencrypt.org/docs/staging-environment/">Let's Encrypt Staging Environment</a> — use it for everything experimental.</li>
+<li><a href="https://github.com/letsencrypt/pebble">Pebble — GitHub</a> — Let's Encrypt's small test ACME server; run it locally instead of burning rate limits.</li>
+<li><a href="https://kubernetes.io/blog/2026/08/26/kubernetes-v1-37-release/">Kubernetes v1.37 release announcement</a> — ClusterTrustBundle (KEP-3257) and PodCertificateRequest (KEP-4317) both reaching stable.</li>
+<li><a href="https://github.com/kubernetes/enhancements/issues/3257">KEP-3257: ClusterTrustBundles — kubernetes/enhancements</a> — the design history from alpha in 1.31 through GA.</li>
+<li><a href="https://github.com/kubernetes/enhancements/tree/master/keps/sig-auth/4317-pod-certificates">KEP-4317: Pod Certificates — kubernetes/enhancements</a> — kubelet-mediated per-pod X.509 with automatic rotation.</li>
+<li><a href="https://kubernetes.io/docs/reference/kubernetes-api/certificates/cluster-trust-bundle-v1beta1/">ClusterTrustBundle API reference — Kubernetes</a> — the object shape and signer-name semantics.</li>
+<li><a href="https://spiffe.io/docs/latest/spiffe-about/spiffe-concepts/">SPIFFE Concepts</a> — SPIFFE IDs, SVIDs, trust domains, and the Workload API.</li>
+<li><a href="https://spiffe.io/docs/latest/spire-about/spire-concepts/">SPIRE Concepts</a> — registration entries, attestation selectors, and federation. The attestation model is the thing cert-manager does not have.</li>
+<li><a href="https://spiffe.io/docs/latest/spiffe-specs/x509-svid/">X509-SVID specification — SPIFFE</a> — the URI SAN format; adopt it in your naming convention even if you never deploy SPIRE.</li>
+<li><a href="https://developer.hashicorp.com/vault/docs/secrets/pki">Vault PKI secrets engine — HashiCorp Developer</a> — roles, constraints, and <code>tidy</code>; the issuing CA behind cert-manager.</li>
+<li><a href="https://developer.hashicorp.com/vault/docs/secrets/spiffe">Vault SPIFFE secrets engine — HashiCorp Developer</a> — JWT-SVID issuance added in Vault 2.0 (Enterprise).</li>
+<li><a href="https://aws.amazon.com/private-ca/pricing/">AWS Private CA Pricing</a> — $400/CA/month general-purpose vs $50/CA/month short-lived mode (7-day max), plus per-certificate tiers.</li>
+<li><a href="https://github.com/cert-manager/aws-privateca-issuer">AWS Private CA Issuer — GitHub</a> — the external issuer, authenticated with IRSA.</li>
+<li><a href="https://cloud.google.com/certificate-authority-service/docs/ca-service-overview">Google Cloud Certificate Authority Service — Overview</a> and <a href="https://cloud.google.com/certificate-authority-service/pricing">Pricing</a> — DevOps vs Enterprise tiers.</li>
+<li><a href="https://github.com/jetstack/google-cas-issuer">Google CAS Issuer — GitHub</a> — the external issuer for CAS.</li>
+<li><a href="https://github.com/stakater/Reloader">Reloader — GitHub</a> — annotation-driven restart on Secret change; the blunt fix for the reload problem.</li>
+<li><a href="https://www.configclarity.dev/incidents/ssl-expiry-outages/">SSL Certificate Expiry Outages: Microsoft, Ericsson, Spotify — ConfigClarity</a> — <em>secondary source</em>; a useful compilation of expired-certificate incidents and the common inventory-gap root cause.</li>
+<li><a href="https://www.thousandeyes.com/blog/impacts-expired-tls-certificate">Impacts of an Expired TLS Certificate — ThousandEyes</a> — <em>secondary source</em>; network-level analysis of what an expiry actually looks like from the outside.</li>
+<li><a href="https://smallstep.com/docs/step-cli/">step CLI documentation — Smallstep</a> — <code>step certificate inspect</code> is the fastest way to read a certificate; install it before you need it.</li>
+</ol><p class="disclaimer"><strong>Disclaimer.</strong> I wrote this library before I joined Temporal, to ramp up on the areas my new role would likely touch. It contains no internal information &mdash; nothing here was sourced from Temporal&rsquo;s internal knowledge. Temporal is open source, so the programming model and server internals come from public code and documentation, and every statement about Temporal Cloud comes from Temporal&rsquo;s public docs and engineering blog, linked inline. Most of the library is general infrastructure technology &mdash; Go, gRPC, Kubernetes, Karpenter, Terraform, Helm, Vault, cert-manager, GitOps, observability &mdash; that has nothing to do with any one company. Where a guide goes beyond public sources, it says so and labels the claim as inference.</p></article><aside class="rail"><div class="rail-label">On this page</div><a href="#the-mental-model">The mental model</a><a href="#core-concepts">Core concepts</a><a class="h3" href="#what-a-ca-actually-is">What a CA actually is</a><a class="h3" href="#root-vs-intermediate-and-why-you-want-at-least-two-levels">Root vs intermediate, and why you want at least two levels</a><a class="h3" href="#cross-signing-and-the-which-chain-do-i-serve-problem">Cross-signing and the &quot;which chain do I serve&quot; problem</a><a class="h3" href="#name-constraints">Name constraints</a><a class="h3" href="#eku-ku-and-sans">EKU, KU, and SANs</a><a class="h3" href="#key-algorithms-what-actually-works">Key algorithms: what actually works</a><a class="h3" href="#serial-numbers">Serial numbers</a><a class="h3" href="#aia-crl-and-ocsp">AIA, CRL, and OCSP</a><a class="h3" href="#certificate-lifetimes-and-the-industry-shortening">Certificate lifetimes and the industry shortening</a><a href="#trust-distribution">Trust distribution</a><a class="h3" href="#how-a-workload-decides-to-trust-your-ca">How a workload decides to trust your CA</a><a class="h3" href="#the-four-mechanisms-compared">The four mechanisms, compared</a><a class="h3" href="#trust-manager">trust-manager</a><a class="h3" href="#the-root-rotation-problem--the-hardest-part-of-internal-pki">The root rotation problem — the hardest part of internal PKI</a><a href="#cert-manager-architecture">cert-manager architecture</a><a class="h3" href="#components">Components</a><a class="h3" href="#the-crds-and-the-reconcile-flow">The CRDs and the reconcile flow</a><a href="#issuers">Issuers</a><a class="h3" href="#selfsigned--ca-building-a-hierarchy">SelfSigned → CA: building a hierarchy</a><a class="h3" href="#acme-http-01-vs-dns-01">ACME: HTTP-01 vs DNS-01</a><a class="h3" href="#the-vault-issuer">The Vault issuer</a><a class="h3" href="#external-issuers">External issuers</a><a href="#renewal-and-the-reload-problem">Renewal and the reload problem</a><a class="h3" href="#how-cert-manager-schedules-renewal">How cert-manager schedules renewal</a><a class="h3" href="#the-reload-problem">The reload problem</a><a href="#integration-points">Integration points</a><a class="h3" href="#ingress-and-gateway-api">Ingress and Gateway API</a><a class="h3" href="#csi-drivers--per-pod-ephemeral-certificates">CSI drivers — per-pod ephemeral certificates</a><a class="h3" href="#webhook-certificate-self-management">Webhook certificate self-management</a><a href="#mtls-between-services-cert-manager-vs-spiffespire">mTLS between services: cert-manager vs SPIFFE/SPIRE</a><a href="#designing-pki-for-cells">Designing PKI for cells</a><a href="#multi-cloud-cloud-ca-vs-vault-pki">Multi-cloud: cloud CA vs Vault PKI</a><a href="#hands-on">Hands-on</a><a class="h3" href="#lab-1--install-cert-manager-on-kind-20-minutes">Lab 1 — Install cert-manager on kind, 20 minutes</a><a class="h3" href="#lab-2--self-signed-root--intermediate--leaf-45-minutes">Lab 2 — Self-signed root → intermediate → leaf, 45 minutes</a><a class="h3" href="#lab-3--trust-manager-distribution-30-minutes">Lab 3 — trust-manager distribution, 30 minutes</a><a class="h3" href="#lab-4--a-full-root-rotation-60-minutes">Lab 4 — A full root rotation, 60 minutes</a><a class="h3" href="#lab-5--acme-with-a-local-acme-server-30-minutes">Lab 5 — ACME with a local ACME server, 30 minutes</a><a class="h3" href="#lab-6--the-reload-problem-demonstrated">Lab 6 — The reload problem, demonstrated</a><a href="#production-gotchas">Production gotchas</a><a href="#how-this-shows-up-in-cell-lifecycle">How this shows up in cell lifecycle</a><a href="#learning-path">Learning path</a><a class="h3" href="#day-1-34-hours">Day 1 (3–4 hours)</a><a class="h3" href="#week-1-1015-hours">Week 1 (10–15 hours)</a><a class="h3" href="#month-1-ongoing">Month 1 (ongoing)</a><a href="#references">References</a></aside></div></div><script>
+document.querySelectorAll('.codehilite').forEach(function(block){
+  var wrap=document.createElement('div'); wrap.className='codewrap';
+  block.parentNode.insertBefore(wrap,block); wrap.appendChild(block);
+  var b=document.createElement('button'); b.className='copybtn'; b.textContent='copy';
+  b.addEventListener('click',function(){
+    var txt=block.innerText;
+    if(navigator.clipboard&&navigator.clipboard.writeText){
+      navigator.clipboard.writeText(txt).then(function(){
+        b.textContent='copied'; setTimeout(function(){b.textContent='copy';},1200);
+      }).catch(function(){b.textContent='select manually';});
+    } else {
+      var ta=document.createElement('textarea'); ta.value=txt; document.body.appendChild(ta);
+      ta.select(); try{document.execCommand('copy'); b.textContent='copied';}catch(e){}
+      document.body.removeChild(ta); setTimeout(function(){b.textContent='copy';},1200);
+    }
+  });
+  wrap.appendChild(b);
+});
+
+document.querySelectorAll('.doc table').forEach(function(t){
+  if(t.parentNode.classList.contains('tablewrap'))return;
+  var w=document.createElement('div'); w.className='tablewrap';
+  t.parentNode.insertBefore(w,t); w.appendChild(t);
+});
+
+(function(){
+  var links=Array.prototype.slice.call(document.querySelectorAll('.rail a'));
+  if(!links.length)return;
+  var map={};
+  links.forEach(function(a){
+    var el=document.getElementById(a.getAttribute('href').slice(1));
+    if(el)map[a.getAttribute('href').slice(1)]=a;
+  });
+  var obs=new IntersectionObserver(function(entries){
+    entries.forEach(function(e){
+      var a=map[e.target.id]; if(!a)return;
+      if(e.isIntersecting){
+        links.forEach(function(x){x.classList.remove('here');});
+        a.classList.add('here');
+      }
+    });
+  },{rootMargin:'0px 0px -78% 0px',threshold:0});
+  Object.keys(map).forEach(function(id){
+    var el=document.getElementById(id); if(el)obs.observe(el);
+  });
+})();
+</script>
+<script>/* open external links in a new tab; links within the library stay in this tab */
+document.addEventListener('click',function(e){var a=e.target.closest&&e.target.closest('a[href]');if(!a)return;var h=a.getAttribute('href');if(!h||h.charAt(0)==='#'||h.indexOf('javascript:')===0||a.hasAttribute('download'))return;if(!/^https?:$/.test(a.protocol)||a.host===location.host)return;a.target='_blank';a.rel='noopener';},true);
+</script>
+</body>
+</html>

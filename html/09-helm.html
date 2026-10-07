@@ -1,0 +1,1207 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Helm — As a Templating Engine - Temporal Cloud Infrastructure Ramp-Up</title>
+<link rel="stylesheet" href="style.css">
+<script>
+(function(){
+  try{
+    var t=localStorage.getItem('rampup-theme');
+    if(t){document.documentElement.setAttribute('data-theme',t);}
+  }catch(e){}
+  window.__toggleTheme=function(){
+    var el=document.documentElement;
+    var cur=el.getAttribute('data-theme');
+    if(!cur){
+      cur=window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';
+    }
+    var next=cur==='dark'?'light':'dark';
+    el.setAttribute('data-theme',next);
+    try{localStorage.setItem('rampup-theme',next);}catch(e){}
+  };
+})();
+</script>
+
+</head>
+<body>
+<div class="shell"><aside class="sidebar">
+  <div class="brand"><a href="../index.html">
+    <div class="brand-title">Temporal Cloud Infrastructure Ramp-Up</div>
+    <div class="brand-sub">New-role ramp-up &middot; public sources only</div>
+  </a></div>
+  <div class="nav-label">Guides</div>
+  <nav class="nav"><a href="01-golang.html"><span class="num">01</span><span>Go</span></a><a href="02-grpc.html"><span class="num">02</span><span>gRPC &amp; Protobuf</span></a><a href="03-multicloud-aws-gcp-azure.html"><span class="num">03</span><span>Multi-Cloud</span></a><a href="04-managed-kubernetes-eks-gke-aks.html"><span class="num">04</span><span>Managed Kubernetes</span></a><a href="05-cni-and-host-networking.html"><span class="num">05</span><span>CNI &amp; Host Networking</span></a><a href="06-karpenter.html"><span class="num">06</span><span>Karpenter</span></a><a href="07-kyverno.html"><span class="num">07</span><span>Kyverno</span></a><a href="08-terraform.html"><span class="num">08</span><span>Terraform</span></a><a href="09-helm.html" class="active"><span class="num">09</span><span>Helm</span></a><a href="10-vault.html"><span class="num">10</span><span>Vault</span></a><a href="11-cert-manager-and-pki.html"><span class="num">11</span><span>cert-manager &amp; PKI</span></a><a href="12-cell-lifecycle-synthesis.html"><span class="num">12</span><span>Cell Lifecycle</span></a><a href="13-gitops-argocd-flux.html"><span class="num">13</span><span>GitOps</span></a><a href="14-observability-for-cells.html"><span class="num">14</span><span>Observability</span></a><a href="15-temporal-programming-model.html"><span class="num">15</span><span>Temporal: Programming Model</span></a><a href="16-temporal-server-internals.html"><span class="num">16</span><span>Temporal Server Internals</span></a><a href="17-cell-based-architecture.html"><span class="num">17</span><span>Cell-Based Architecture</span></a></nav>
+  <div class="nav-label" style="margin-top:1rem">Practice</div>
+  <nav class="nav"><a href="../drill.html"><span class="num">&#9670;</span><span>Drill deck</span></a></nav>
+</aside><div class="main"><article class="doc"><div class="topbar">
+  <div class="crumbs"><span class="pill">Guide 09</span><span class="pill">40 refs</span><span class="pill">10,873 words</span></div>
+  <div style="display:flex;gap:.5rem;align-items:center">
+    <span>~54 min read</span>
+    <button class="iconbtn" onclick="__toggleTheme()">theme</button>
+  </div>
+</div><h1>Helm — As a Templating Engine</h1>
+<div class="lede"><p><strong>Why this matters.</strong> This guide assumes a specific, increasingly common constraint: <em>Helm for templating only, with no release state.</em> That means you render charts to YAML and hand the YAML to something else — a GitOps controller, a pipeline, <code>kubectl apply</code>. You are using roughly 40% of Helm and deliberately discarding the rest. This is a good decision and an increasingly common one, but it has sharp edges: half of what is written about Helm assumes release state exists, third-party charts assume hooks run, and the pruning problem Helm normally solves for you is now yours. You will be reading and writing charts on day one — some yours, many not — so you need to know both the templating engine in depth <em>and</em> the release model well enough to recognize when a chart you inherited quietly depends on it.</p></div>
+<p>Everything below was verified against primary sources on <strong>2026-08-29</strong>. Where I could not verify something, I say so.</p>
+<blockquote>
+<p><strong>Stale-content trap, read this first.</strong> Five things most Helm material gets wrong today:</p>
+<ol>
+<li><strong>Helm 4 exists.</strong> v4.0.0 shipped <strong>2025-11-12</strong> at KubeCon, the first major version in six years (<a href="https://helm.sh/blog/helm-4-released/">Helm 4 Released</a>). Current releases as of today: <strong>v4.2.4 (2026-08-13)</strong> and <strong>v3.21.4 (2026-08-14)</strong> (<a href="https://github.com/helm/helm/releases">releases</a>).</li>
+<li><strong>Helm 3 is dying on a published schedule.</strong> One final limited feature release on <strong>2026-09-09</strong>, security fixes originally scheduled through <strong>November 2026, extended to February 10, 2027</strong> (<a href="https://helm.sh/blog/helm-v3-end-of-life/">Helm 3 End of Life</a>). Pin your CI to a Helm 4 binary now.</li>
+<li><strong>There is no <code>helm render</code> command.</strong> The Helm 4 overview page contains a typo that says <code>helm render --post-renderer</code>; the actual command list has no <code>render</code>, and <code>pkg/cmd/template.go</code> declares <code>Use: "template [NAME] [CHART]"</code> with no alias. It is still <code>helm template</code>.</li>
+<li><strong>Helm 4 does server-side apply</strong> — SSA is the default for <em>new</em> installs, while upgrades latch to whatever the release used before (<a href="https://helm.sh/community/hips/hip-0023">HIP-0023</a>). This matters even in templating-only mode because it changes what the ecosystem assumes about field ownership.</li>
+<li><strong><code>kubectl apply --prune</code> is still alpha, and has been for a decade.</strong> The Kubernetes docs say it plainly: <em>"This mode has existed since kubectl v1.5 but is still in alpha due to usability, correctness and performance issues with its design"</em> (<a href="https://kubernetes.io/docs/tasks/manage-kubernetes-objects/declarative-config/#alternative-kubectl-apply-f-directory-prune">declarative config</a>). Do not build your garbage collection on it.</li>
+</ol>
+<p>Several core helm.sh topic pages (<code>topics/charts</code>, <code>topics/registries</code>) still carry a banner reading <em>"This page has not yet been updated for Helm 4."</em> Read them with that in mind.</p>
+</blockquote>
+<hr />
+<h2 id="the-mental-model">The mental model<a class="anchor" href="#the-mental-model">#</a></h2>
+<p>Hold five ideas.</p>
+<p><strong>1. Helm is two products wearing one binary.</strong> Product one is a <em>templating engine</em>: Go templates plus Sprig plus a values-merging algorithm, which turns a directory of files into a stream of Kubernetes manifests. Product two is a <em>release manager</em>: it applies that stream, records the result in a Secret in the cluster, and can diff, upgrade, roll back, and delete based on that record. This library assumes product one. Almost every Helm tutorial is about product two.</p>
+<p><strong>2. <code>helm template</code> is a pure function.</strong> Given a chart and a set of values, it emits YAML. It touches no cluster, keeps no record, and makes no decisions. Everything in Helm that requires knowing the current state of the world — <code>lookup</code>, <code>.Release.IsUpgrade</code>, hooks, three-way merge, <code>--wait</code>, rollback — either silently degrades or does nothing. Knowing <em>exactly which</em> features degrade, and how silently, is the practical core of working this way.</p>
+<p><strong>3. The rendered manifest is the artifact.</strong> In templating-only mode, the interesting object is not the chart and not the release — it is the YAML. It gets committed, diffed in a PR, scanned by policy, and applied by something else. The whole workflow reorganizes around making that artifact deterministic and reviewable. Akuity's framing is the best one-liner on why: <em>"Git contains the inputs to the desired state, not the desired state itself"</em> (<a href="https://akuity.io/blog/the-rendered-manifests-pattern">The Rendered Manifests Pattern</a>).</p>
+<p><strong>4. Without release state, nothing knows what to delete.</strong> Helm's release record is also its inventory: on upgrade it diffs the old manifest against the new one and deletes what disappeared. Throw away the record and you have thrown away the inventory. Something else must own it — Argo CD's tracking annotation, Flux's <code>.status.inventory</code>, or ApplySet. This is the single largest thing you give up, and it is the one people discover in production.</p>
+<p><strong>5. Field ownership replaces release ownership.</strong> Server-side apply moves the question "who owns this field?" from Helm's release record into the API server's <code>managedFields</code>. In a templating-only world where multiple actors touch the same objects — your pipeline, a controller, an operator, a human with <code>kubectl edit</code> — SSA field management <em>is</em> your conflict model. Learn it.</p>
+<div class="codehilite"><pre><span></span><code>  ┌────────── product one: templating (what you use) ──────────┐
+  │  Chart.yaml + values.yaml + templates/  ─┐                  │
+  │  -f overrides, --set                    ─┤                  │
+  │  --api-versions, --kube-version         ─┼─► helm template  │
+  │  (no cluster contact)                    ┘        │         │
+  └───────────────────────────────────────────────────┼─────────┘
+                                                      ▼
+                                              rendered YAML
+                                                      │
+      ┌───────────────────────────────────────────────┼──────────────┐
+      │  Git commit ──► Argo CD / Flux ──► kubectl apply --server-side│
+      │  (inventory, prune, health, waves live HERE now)             │
+      └──────────────────────────────────────────────────────────────┘
+
+  ┌────── product two: release management (what you gave up) ──────┐
+  │  helm install/upgrade → Secret sh.helm.release.v1.&lt;name&gt;.vN    │
+  │  → hooks, rollback, history, three-way merge, --wait, lookup   │
+  └────────────────────────────────────────────────────────────────┘
+</code></pre></div>
+
+<hr />
+<h2 id="core-concepts">Core concepts<a class="anchor" href="#core-concepts">#</a></h2>
+<h3 id="chart-anatomy">Chart anatomy<a class="anchor" href="#chart-anatomy">#</a></h3>
+<div class="codehilite"><pre><span></span><code>temporal-cell/
+├── Chart.yaml            # name, version, apiVersion: v2, type, dependencies
+├── Chart.lock            # resolved dependency digests (helm dependency update)
+├── values.yaml           # defaults; the documented interface of the chart
+├── values.schema.json    # JSON Schema; enforced on install/upgrade/lint/template
+├── .helmignore           # excluded from `helm package`
+├── charts/               # vendored subcharts (.tgz or directories)
+├── crds/                 # plain YAML CRDs; special install rules, see below
+└── templates/
+    ├── NOTES.txt         # rendered post-install message — invisible to `helm template`
+    ├── _helpers.tpl      # underscore prefix = partials, not manifests
+    ├── deployment.yaml
+    ├── service.yaml
+    └── tests/
+        └── connection.yaml   # helm.sh/hook: test
+</code></pre></div>
+
+<p><code>Chart.yaml</code> essentials (<a href="https://helm.sh/docs/topics/charts/">charts</a>):</p>
+<div class="codehilite"><pre><span></span><code><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">v2</span><span class="w">            </span><span class="c1"># v2 = Helm 3+. v1 charts still render but are legacy.</span><span class="w"></span>
+<span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">temporal-cell</span><span class="w"></span>
+<span class="nt">version</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">4.2.0</span><span class="w">            </span><span class="c1"># SemVer; the chart&#39;s own version</span><span class="w"></span>
+<span class="nt">appVersion</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;1.29.0&quot;</span><span class="w">      </span><span class="c1"># the app version; quoted, not used for resolution</span><span class="w"></span>
+<span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">application</span><span class="w">         </span><span class="c1"># or `library` — library charts are not installable</span><span class="w"></span>
+<span class="nt">kubeVersion</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;&gt;=</span><span class="nv"> </span><span class="s">1.31.0-0&quot;</span><span class="w"></span>
+<span class="nt">dependencies</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">temporal-server</span><span class="w"></span>
+<span class="w">    </span><span class="nt">version</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;~2.1.0&quot;</span><span class="w"></span>
+<span class="w">    </span><span class="nt">repository</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;oci://registry.internal/temporal/charts&quot;</span><span class="w"></span>
+<span class="w">    </span><span class="nt">condition</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">temporalServer.enabled</span><span class="w"></span>
+<span class="w">    </span><span class="nt">alias</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">server</span><span class="w"></span>
+</code></pre></div>
+
+<p>Since Helm 3.3.2, unknown <code>Chart.yaml</code> fields are rejected — put custom metadata under <code>annotations</code>.</p>
+<p><strong>Files starting with <code>_</code> are not manifests.</strong> Verbatim: <em>"files whose name begins with an underscore (<code>_</code>) are assumed to not have a manifest inside. These files are not rendered to Kubernetes object definitions, but are available everywhere within other chart templates for use"</em> (<a href="https://helm.sh/docs/chart_template_guide/named_templates/">named templates</a>). Note also that <strong>template names are global across the chart and all subcharts</strong> — always prefix with the chart name (<code>temporal-cell.labels</code>, not <code>labels</code>) or a subchart will silently shadow yours.</p>
+<p><strong><code>crds/</code> has rules that surprise everyone.</strong> From <a href="https://helm.sh/docs/topics/charts/#limitations-on-crds">limitations on CRDs</a>:</p>
+<blockquote>
+<p><em>"CRDs are never reinstalled… CRDs are never installed on upgrade or rollback. Helm will only create CRDs on installation operations. </em><em>CRDs are never deleted.</em><em> Deleting a CRD automatically deletes all of the CRD's contents across all namespaces in the cluster. Consequently, Helm will not delete CRDs."</em>
+<em>"CRD files cannot be templated. They must be plain YAML documents."</em></p>
+</blockquote>
+<p>In templating-only mode this whole mechanism is bypassed: <code>helm template</code> does <strong>not</strong> emit <code>crds/</code> unless you pass <code>--include-crds</code>. That is arguably an improvement — your GitOps tool now manages CRDs like any other resource, and <em>can</em> upgrade them — but you must remember the flag or your CRDs simply will not exist.</p>
+<p><strong><code>.helmignore</code></strong> is applied at <code>helm package</code> time, uses Go's <code>filepath.Match</code> (not <code>fnmatch</code>), and <strong>does not support <code>**</code></strong>. Its docs page is internally inconsistent about whether <code>!</code> negation works — the differences list says <em>"There is no support for <code>!</code> as a special leading sequence."</em> Do not rely on it (<a href="https://helm.sh/docs/chart_template_guide/helm_ignore_file/">helmignore</a>).</p>
+<p><strong><code>NOTES.txt</code> is invisible to you.</strong> <code>helm template</code> never emits notes — Helm 4 deprecated <code>--hide-notes</code> and <code>--render-subchart-notes</code> on <code>helm template</code> precisely because <em>"These flags have no effect because template output never includes notes"</em> (<a href="https://helm.sh/docs/overview/">Helm 4 overview</a>). If a chart puts important post-install instructions there, your users will never see them. Move anything load-bearing into a ConfigMap or your own docs.</p>
+<h3 id="go-templates-and-sprig-in-the-depth-you-need">Go templates and Sprig, in the depth you need<a class="anchor" href="#go-templates-and-sprig-in-the-depth-you-need">#</a></h3>
+<p>Helm's template language is Go <code>text/template</code> plus the <a href="https://masterminds.github.io/sprig/">Sprig</a> function library plus about a dozen Helm-specific functions (<a href="https://helm.sh/docs/chart_template_guide/function_list/">function list</a>).</p>
+<h4 id="actions-pipelines-and-scoping">Actions, pipelines, and scoping</h4>
+<div class="codehilite"><pre><span></span><code><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">apps/v1</span><span class="w"></span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Deployment</span><span class="w"></span>
+<span class="nt">metadata</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">{{</span><span class="w"> </span><span class="nv">include &quot;temporal-cell.fullname&quot; .</span><span class="w"> </span><span class="p p-Indicator">}}</span><span class="w"></span>
+<span class="w">  </span><span class="nt">labels</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="p p-Indicator">{{</span><span class="nv">- include &quot;temporal-cell.labels&quot; . | nindent 4</span><span class="w"> </span><span class="p p-Indicator">}}</span><span class="w"></span>
+<span class="nt">spec</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">replicas</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">{{</span><span class="w"> </span><span class="nv">.Values.replicaCount | default 2</span><span class="w"> </span><span class="p p-Indicator">}}</span><span class="w"></span>
+<span class="w">  </span><span class="nt">template</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">spec</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="nt">containers</span><span class="p">:</span><span class="w"></span>
+<span class="w">        </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">frontend</span><span class="w"></span>
+<span class="w">          </span><span class="nt">image</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;{{</span><span class="nv"> </span><span class="s">.Values.image.repository</span><span class="nv"> </span><span class="s">}}:{{</span><span class="nv"> </span><span class="s">.Values.image.tag</span><span class="nv"> </span><span class="s">|</span><span class="nv"> </span><span class="s">default</span><span class="nv"> </span><span class="s">.Chart.AppVersion</span><span class="nv"> </span><span class="s">}}&quot;</span><span class="w"></span>
+<span class="w">          </span><span class="p p-Indicator">{{</span><span class="nv">- with .Values.resources</span><span class="w"> </span><span class="p p-Indicator">}}</span><span class="w"></span>
+<span class="w">          </span><span class="nt">resources</span><span class="p">:</span><span class="w"></span>
+<span class="w">            </span><span class="p p-Indicator">{{</span><span class="nv">- toYaml . | nindent 12</span><span class="w"> </span><span class="p p-Indicator">}}</span><span class="w"></span>
+<span class="w">          </span><span class="p p-Indicator">{{</span><span class="nv">- end</span><span class="w"> </span><span class="p p-Indicator">}}</span><span class="w"></span>
+<span class="w">          </span><span class="nt">env</span><span class="p">:</span><span class="w"></span>
+<span class="w">            </span><span class="p p-Indicator">{{</span><span class="nv">- range $k</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">$v</span><span class="w"> </span><span class="p p-Indicator">:</span><span class="nv">= .Values.env</span><span class="w"> </span><span class="p p-Indicator">}}</span><span class="w"></span>
+<span class="w">            </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">{{</span><span class="w"> </span><span class="nv">$k | quote</span><span class="w"> </span><span class="p p-Indicator">}}</span><span class="w"></span>
+<span class="w">              </span><span class="nt">value</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">{{</span><span class="w"> </span><span class="nv">$v | quote</span><span class="w"> </span><span class="p p-Indicator">}}</span><span class="w"></span>
+<span class="w">            </span><span class="p p-Indicator">{{</span><span class="nv">- end</span><span class="w"> </span><span class="p p-Indicator">}}</span><span class="w"></span>
+</code></pre></div>
+
+<p><strong>Scoping is where people get lost.</strong> <code>with</code> and <code>range</code> <em>rebind the dot</em>. Inside <code>{{- with .Values.resources }}</code>, <code>.</code> is the resources object, and <code>.Values</code> no longer resolves. Two escapes:</p>
+<ul>
+<li><strong><code>$</code> is the root context</strong>, always. <code>{{ $.Values.global.region }}</code> works anywhere, at any nesting depth.</li>
+<li><strong>Capture what you need before entering the block</strong>: <code>{{- $fullName := include "temporal-cell.fullname" . -}}</code> at the top of the file.</li>
+</ul>
+<p>Inside <code>range</code> with two variables, <code>$k</code> and <code>$v</code> are the key and value while <code>.</code> is <em>also</em> rebound to the value. Using both forms in one block is a readability trap; pick the named variables.</p>
+<h4 id="whitespace-control----and--">Whitespace control — <code>{{-</code> and <code>-}}</code></h4>
+<p><code>{{-</code> chomps all whitespace (including newlines) to the <em>left</em>; <code>-}}</code> chomps to the right. The rule that keeps YAML valid: <strong>use <code>{{-</code> on control-flow lines so the action's own line disappears, and never use <code>-}}</code> before content you want on its own line.</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># WRONG: leaves a blank line where the `if` was</span><span class="w"></span>
+<span class="nt">metadata</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">annotations</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="p p-Indicator">{{</span><span class="w"> </span><span class="nv">if .Values.annotations</span><span class="w"> </span><span class="p p-Indicator">}}</span><span class="w"></span>
+<span class="w">    </span><span class="nt">foo</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">bar</span><span class="w"></span>
+<span class="w">    </span><span class="p p-Indicator">{{</span><span class="w"> </span><span class="nv">end</span><span class="w"> </span><span class="p p-Indicator">}}</span><span class="w"></span>
+
+<span class="c1"># RIGHT</span><span class="w"></span>
+<span class="nt">metadata</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">annotations</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="p p-Indicator">{{</span><span class="nv">- if .Values.annotations</span><span class="w"> </span><span class="p p-Indicator">}}</span><span class="w"></span>
+<span class="w">    </span><span class="nt">foo</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">bar</span><span class="w"></span>
+<span class="w">    </span><span class="p p-Indicator">{{</span><span class="nv">- end</span><span class="w"> </span><span class="p p-Indicator">}}</span><span class="w"></span>
+</code></pre></div>
+
+<h4 id="include-vs-template--always-use-include"><code>include</code> vs <code>template</code> — always use <code>include</code></h4>
+<p>This is not style. Verbatim from the docs: <em>"Because <code>template</code> is an action, and not a function, there is no way to pass the output of a <code>template</code> call to other functions; the data is simply inserted inline."</em> And: <em>"It is considered preferable to use <code>include</code> over <code>template</code>"</em> (<a href="https://helm.sh/docs/chart_template_guide/named_templates/#the-include-function">named templates</a>).</p>
+<p>Since you cannot pipe <code>template</code> output, you cannot indent it, which means <code>template</code> is unusable anywhere except column 0. Use <code>include</code> everywhere.</p>
+<h4 id="the-toyaml--nindent-bug--the-single-most-common-defect-in-charts">The <code>toYaml | nindent</code> bug — the single most common defect in charts</h4>
+<p><code>toYaml</code> emits multi-line YAML starting at column 0 with <strong>no leading newline</strong>. <code>indent n</code> pads every line <em>including the first</em> — but the first line has already been glued to the preceding key because <code>{{-</code> ate the newline. <code>nindent n</code> prepends a newline and <em>then</em> indents, which is what you almost always want.</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># BROKEN — produces `resources:  limits:` on one line, then wrong indentation</span><span class="w"></span>
+<span class="nt">resources</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="p p-Indicator">{{</span><span class="nv">- toYaml .Values.resources | indent 2</span><span class="w"> </span><span class="p p-Indicator">}}</span><span class="w"></span>
+
+<span class="c1"># CORRECT</span><span class="w"></span>
+<span class="nt">resources</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="p p-Indicator">{{</span><span class="nv">- toYaml .Values.resources | nindent 2</span><span class="w"> </span><span class="p p-Indicator">}}</span><span class="w"></span>
+</code></pre></div>
+
+<p>The docs describe the intended pattern directly: <em>"Using the <code>{{- ... | nindent n }}</code> pattern makes it easier to read the <code>include</code> in context, because it chomps the whitespace to the left (including the previous newline), then the <code>nindent</code> re-adds the newline and indents the included content by the requested amount"</em> (<a href="https://helm.sh/docs/howto/charts_tips_and_tricks/">tips and tricks</a>). Helm 4's own <code>helm create</code> scaffold uses <code>nindent</code> <strong>exclusively</strong> — <code>indent</code> appears zero times in <a href="https://github.com/helm/helm/blob/main/pkg/chart/v2/util/create.go"><code>pkg/chart/v2/util/create.go</code></a>. Treat a bare <code>| indent</code> in a chart as a code smell worth checking.</p>
+<p>The related trap: <code>{{- toYaml .Values.x | nindent 2 }}</code> when <code>.Values.x</code> is empty renders <code>resources:</code> followed by nothing, which YAML parses as <code>null</code>. Wrap in <code>{{- with }}</code> so the key disappears entirely when the value is absent — exactly what the Helm 4 scaffold does.</p>
+<h4 id="tpl-required-default"><code>tpl</code>, <code>required</code>, <code>default</code></h4>
+<div class="codehilite"><pre><span></span><code><span class="c1"># tpl renders a string from values as a template. Enables user-supplied</span><span class="w"></span>
+<span class="c1"># templating — powerful, and a rendering-error surface you do not control.</span><span class="w"></span>
+<span class="nt">annotations</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">external-dns.alpha.kubernetes.io/hostname</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">{{</span><span class="w"> </span><span class="nv">tpl .Values.hostnameTemplate .</span><span class="w"> </span><span class="p p-Indicator">}}</span><span class="w"></span>
+
+<span class="c1"># required fails the render with your message. The correct way to make a</span><span class="w"></span>
+<span class="c1"># value mandatory — far better than a runtime crash in a Pod.</span><span class="w"></span>
+<span class="nt">image</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">{{</span><span class="w"> </span><span class="nv">required &quot;cell.image.repository is required&quot; .Values.image.repository</span><span class="w"> </span><span class="p p-Indicator">}}</span><span class="w"></span>
+
+<span class="c1"># default supplies a fallback. Note: it treats &quot;&quot;, 0, and false as empty,</span><span class="w"></span>
+<span class="c1"># so `default 5 .Values.replicas` returns 5 when replicas is explicitly 0.</span><span class="w"></span>
+<span class="nt">replicas</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">{{</span><span class="w"> </span><span class="nv">.Values.replicas | default 3</span><span class="w"> </span><span class="p p-Indicator">}}</span><span class="w"></span>
+</code></pre></div>
+
+<p>That <code>default</code> behavior is a real bug source — to allow an explicit <code>0</code> or <code>false</code>, test with <code>if hasKey</code> or use the <code>values.schema.json</code> default instead.</p>
+<h4 id="lookup--dead-on-arrival-in-templating-only-mode"><code>lookup</code> — dead on arrival in templating-only mode</h4>
+<div class="codehilite"><pre><span></span><code><span class="p p-Indicator">{{</span><span class="nv">- $existing</span><span class="w"> </span><span class="p p-Indicator">:</span><span class="nv">= lookup &quot;v1&quot; &quot;Secret&quot; .Release.Namespace &quot;cell-token&quot;</span><span class="w"> </span><span class="p p-Indicator">}}</span><span class="w"></span>
+<span class="p p-Indicator">{{</span><span class="nv">- if $existing</span><span class="w"> </span><span class="p p-Indicator">}}</span><span class="w"></span>
+<span class="nt">token</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">{{</span><span class="w"> </span><span class="nv">index $existing.data &quot;token&quot;</span><span class="w"> </span><span class="p p-Indicator">}}</span><span class="w"></span>
+<span class="p p-Indicator">{{</span><span class="nv">- else</span><span class="w"> </span><span class="p p-Indicator">}}</span><span class="w"></span>
+<span class="nt">token</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">{{</span><span class="w"> </span><span class="nv">randAlphaNum 32 | b64enc</span><span class="w"> </span><span class="p p-Indicator">}}</span><span class="w"></span>
+<span class="p p-Indicator">{{</span><span class="nv">- end</span><span class="w"> </span><span class="p p-Indicator">}}</span><span class="w"></span>
+</code></pre></div>
+
+<p>Verbatim: <em>"<code>lookup</code> is used to look up resource in a running cluster. </em><em>When used with the <code>helm template</code> command it always returns an empty response</em><em>"</em> (<a href="https://helm.sh/docs/chart_template_guide/function_list/">function list</a>). So the branch above always takes the <code>else</code> path and regenerates the secret on every render — which, committed to Git, means a new secret in every commit and a rolling restart every sync.</p>
+<p>This is the most dangerous degradation in templating-only mode because it fails <em>silently and plausibly</em>. Audit every inherited chart for <code>lookup</code>. The chart-level fix is to stop generating secrets in templates; use an External Secrets Operator, a Vault sidecar, or a pre-created Secret referenced by name.</p>
+<h4 id="capabilities-and-release--what-they-say-without-a-cluster"><code>Capabilities</code> and <code>.Release</code> — what they say without a cluster</h4>
+<p><code>helm template</code> has no cluster, so it fabricates these. Two flags let you control the fabrication (<a href="https://helm.sh/docs/helm/helm_template/">helm template</a>):</p>
+<table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>Effect</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>-a, --api-versions</code></td>
+<td><em>"Kubernetes api versions used for Capabilities.APIVersions"</em> — repeatable or comma-separated</td>
+</tr>
+<tr>
+<td><code>--kube-version</code></td>
+<td><em>"Kubernetes version used for Capabilities.KubeVersion"</em></td>
+</tr>
+<tr>
+<td><code>--is-upgrade</code></td>
+<td><em>"set .Release.IsUpgrade instead of .Release.IsInstall"</em></td>
+</tr>
+</tbody>
+</table>
+<p>Without <code>--api-versions</code>, <code>.Capabilities.APIVersions.Has "monitoring.coreos.com/v1"</code> is <strong>false</strong>, so charts that conditionally emit a ServiceMonitor emit nothing. This is a silent-omission failure and it is extremely common with observability charts. Your render command must pass the real API surface of the target cluster:</p>
+<div class="codehilite"><pre><span></span><code>helm template cell ./charts/temporal-cell <span class="se">\</span>
+  --kube-version <span class="s2">&quot;1.34.0&quot;</span> <span class="se">\</span>
+  --api-versions <span class="s2">&quot;monitoring.coreos.com/v1&quot;</span> <span class="se">\</span>
+  --api-versions <span class="s2">&quot;cert-manager.io/v1&quot;</span> <span class="se">\</span>
+  --api-versions <span class="s2">&quot;gateway.networking.k8s.io/v1&quot;</span>
+</code></pre></div>
+
+<p>For <code>.Release</code>: under plain <code>helm template</code>, <strong><code>.Release.IsInstall</code> is <code>true</code> and <code>.Release.IsUpgrade</code> is <code>false</code></strong>, and the release name is the hardcoded string <code>"release-name"</code> unless you pass one. Any chart logic branching on <code>IsUpgrade</code> — schema migration Jobs, one-time bootstrap — is permanently stuck on the install path.</p>
+<h3 id="values">Values<a class="anchor" href="#values">#</a></h3>
+<h4 id="precedence">Precedence</h4>
+<p>The documented order, verbatim: <em>"<code>values.yaml</code> is the default, which can be overridden by a parent chart's <code>values.yaml</code>, which can in turn be overridden by a user-supplied values file, which can in turn be overridden by <code>--set</code> parameters"</em> (<a href="https://helm.sh/docs/chart_template_guide/values_files/">values files</a>). Within each family, last wins: <em>"You can specify the <code>--values</code>/<code>-f</code> flag multiple times. The priority will be given to the last (right-most) file specified."</em></p>
+<div class="codehilite"><pre><span></span><code>chart values.yaml
+  └► subchart values overridden by parent values.yaml
+      └► -f file1.yaml
+          └► -f file2.yaml            (later files win)
+              └► --set / --set-string / --set-json / --set-file / --set-literal
+</code></pre></div>
+
+<p>The <code>--set*</code> family: <code>--set-string</code> forces string typing, <code>--set-file</code> reads a value from a file, <code>--set-json</code> (Helm 3.10+) takes raw JSON, <code>--set-literal</code> (3.12+) disables all escaping. Their relative merge order among themselves is real but undocumented — it lives in <code>MergeValues</code> in <code>pkg/cli/values/options.go</code>. Do not depend on it.</p>
+<p><strong>Opinion for a platform team: ban <code>--set</code> from your render pipeline.</strong> It is unreviewable, it silently coerces types (<code>--set version=1.10</code> becomes the number <code>1.1</code>), and it makes the render non-reproducible from Git alone. Use layered <code>-f</code> files — <code>values.yaml</code>, <code>values-&lt;cloud&gt;.yaml</code>, <code>values-&lt;cell&gt;.yaml</code> — all committed. <code>--set</code> is for humans debugging at a terminal.</p>
+<p>Helm 4 adds <strong>multi-document values</strong>: <em>"Split complex values across multiple YAML files"</em> (<a href="https://helm.sh/docs/overview/">Helm 4 overview</a>), where documents within a file merge in order. Useful for keeping per-cell overlays in one reviewable file.</p>
+<h4 id="valuesschemajson"><code>values.schema.json</code></h4>
+<div class="codehilite"><pre><span></span><code><span class="p">{</span><span class="w"></span>
+<span class="w">  </span><span class="nt">&quot;$schema&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;https://json-schema.org/draft/2020-12/schema&quot;</span><span class="p">,</span><span class="w"></span>
+<span class="w">  </span><span class="nt">&quot;type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;object&quot;</span><span class="p">,</span><span class="w"></span>
+<span class="w">  </span><span class="nt">&quot;required&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;cell&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;image&quot;</span><span class="p">],</span><span class="w"></span>
+<span class="w">  </span><span class="nt">&quot;properties&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">    </span><span class="nt">&quot;cell&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">      </span><span class="nt">&quot;type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;object&quot;</span><span class="p">,</span><span class="w"></span>
+<span class="w">      </span><span class="nt">&quot;required&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;name&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;region&quot;</span><span class="p">],</span><span class="w"></span>
+<span class="w">      </span><span class="nt">&quot;properties&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">        </span><span class="nt">&quot;name&quot;</span><span class="p">:</span><span class="w">   </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;string&quot;</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;pattern&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;^[a-z0-9-]{3,32}$&quot;</span><span class="w"> </span><span class="p">},</span><span class="w"></span>
+<span class="w">        </span><span class="nt">&quot;region&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;string&quot;</span><span class="w"> </span><span class="p">},</span><span class="w"></span>
+<span class="w">        </span><span class="nt">&quot;tier&quot;</span><span class="p">:</span><span class="w">   </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;string&quot;</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;enum&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;standard&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;dedicated&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;isolated&quot;</span><span class="p">],</span><span class="w"> </span><span class="nt">&quot;default&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;standard&quot;</span><span class="w"> </span><span class="p">}</span><span class="w"></span>
+<span class="w">      </span><span class="p">},</span><span class="w"></span>
+<span class="w">      </span><span class="nt">&quot;additionalProperties&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="w"></span>
+<span class="w">    </span><span class="p">},</span><span class="w"></span>
+<span class="w">    </span><span class="nt">&quot;replicaCount&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;integer&quot;</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;minimum&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;maximum&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">100</span><span class="w"> </span><span class="p">}</span><span class="w"></span>
+<span class="w">  </span><span class="p">}</span><span class="w"></span>
+<span class="p">}</span><span class="w"></span>
+</code></pre></div>
+
+<p>Verbatim on enforcement: <em>"Validation occurs when any of the following commands are invoked: <code>helm install</code>, <code>helm upgrade</code>, <code>helm lint</code>, <code>helm template</code>"</em> — so it works in templating-only mode, which makes it your single best guardrail. Also: <em>"the final <code>.Values</code> object is checked against all subchart schemas."</em> Disable with <code>--skip-schema-validation</code> (<a href="https://helm.sh/docs/topics/charts/#schema-files">schema files</a>).</p>
+<p>Supported drafts are 4, 6, 7, 2019-09, and 2020-12 — Helm swapped to the <code>santhosh-tekuri/jsonschema/v6</code> validator in <strong>3.18.5</strong>, replacing an older library capped at draft-07. The docs only <em>show</em> draft-07 in their example and never state the list, so "Helm only supports draft-07" is a widely repeated but now-false claim. Set <code>$schema</code> explicitly.</p>
+<p><code>additionalProperties: false</code> is the highest-value line in the file: it turns a typo'd value key from a silent no-op into a render failure. That single change catches more real incidents than any linter.</p>
+<h4 id="subcharts-and-global">Subcharts and <code>global</code></h4>
+<p>The four rules (<a href="https://helm.sh/docs/chart_template_guide/subcharts_and_globals/">subcharts and globals</a>):</p>
+<ul>
+<li>A subchart cannot access its parent's values.</li>
+<li>A parent can override a subchart's values, by nesting under the subchart name.</li>
+<li><code>global</code> values are visible to all charts.</li>
+<li><em>"Globals require explicit declaration. You can't use an existing non-global as if it were a global."</em></li>
+</ul>
+<p>And the direction rule: <em>"If a subchart declares a global variable, that global will be passed downward… but not upward to the parent chart… global variables of parent charts take precedence over the global variables from subcharts"</em> (<a href="https://helm.sh/docs/topics/charts/#global-values">charts</a>).</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># parent values.yaml</span><span class="w"></span>
+<span class="nt">global</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">cellName</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cell-042</span><span class="w"></span>
+<span class="w">  </span><span class="nt">imageRegistry</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">registry.internal</span><span class="w"></span>
+
+<span class="nt">temporal-server</span><span class="p">:</span><span class="w">          </span><span class="c1"># keyed by the subchart&#39;s name (or its `alias`)</span><span class="w"></span>
+<span class="w">  </span><span class="nt">replicaCount</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">5</span><span class="w"></span>
+<span class="w">  </span><span class="nt">resources</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">limits</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> cpu</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;2&quot;</span><span class="w"> </span><span class="p p-Indicator">}</span><span class="w"></span>
+</code></pre></div>
+
+<p><code>import-values</code> in a dependency lets a parent pull a child's values upward, in two forms — <code>exports</code> (implicit; the parent key is not retained) and explicit <code>child</code>/<code>parent</code> paths (<a href="https://helm.sh/docs/topics/charts/#importing-child-values-via-dependencies">importing child values</a>). It is powerful and it makes charts hard to reason about; prefer explicit wiring.</p>
+<h3 id="library-charts-and-dependencies">Library charts and dependencies<a class="anchor" href="#library-charts-and-dependencies">#</a></h3>
+<p>A <code>type: library</code> chart contains only partials — <code>helm install</code> on one fails with <code>Error: library charts are not installable</code>. Two quirks most guides miss (<a href="https://helm.sh/docs/topics/library_charts/">library charts</a>): <em>"The <code>.Files</code> object references the file paths on the parent chart"</em> and <em>"The <code>.Values</code> object is the same as the parent chart, in contrast to application [subcharts]."</em></p>
+<p>For a cell platform this is the right factoring: one library chart owning labels, annotations, naming, security contexts, and topology-spread defaults; many thin application charts consuming it.</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># library chart: templates/_container.tpl</span><span class="w"></span>
+<span class="p p-Indicator">{{</span><span class="nv">- define &quot;temporal-lib.securityContext&quot; -</span><span class="p p-Indicator">}}</span><span class="w"></span>
+<span class="nt">allowPrivilegeEscalation</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">false</span><span class="w"></span>
+<span class="nt">readOnlyRootFilesystem</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span><span class="w"></span>
+<span class="nt">runAsNonRoot</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span><span class="w"></span>
+<span class="nt">runAsUser</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">65532</span><span class="w"></span>
+<span class="nt">capabilities</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">drop</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;ALL&quot;</span><span class="p p-Indicator">]</span><span class="w"></span>
+<span class="nt">seccompProfile</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">RuntimeDefault</span><span class="w"></span>
+<span class="p p-Indicator">{{</span><span class="nv">- end -</span><span class="p p-Indicator">}}</span><span class="w"></span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="c1"># application chart Chart.yaml</span><span class="w"></span>
+<span class="nt">dependencies</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">temporal-lib</span><span class="w"></span>
+<span class="w">    </span><span class="nt">version</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;1.4.0&quot;</span><span class="w"></span>
+<span class="w">    </span><span class="nt">repository</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;oci://registry.internal/temporal/charts&quot;</span><span class="w"></span>
+</code></pre></div>
+
+<p><strong>OCI registries</strong> are now the recommended distribution mechanism: <em>"It is recommended to use container registries with OCI support to store and share chart packages"</em> (<a href="https://helm.sh/docs/topics/registries/">registries</a>). Classic <code>index.yaml</code> repos are <strong>not deprecated</strong> — the strongest wording anywhere is a soft steer: <em>"If you are considering creating a chart repository, you may want to consider using an OCI registry instead"</em> (<a href="https://helm.sh/docs/topics/chart_repository/">chart repository</a>).</p>
+<div class="codehilite"><pre><span></span><code>helm package ./charts/temporal-cell            <span class="c1"># produces temporal-cell-4.2.0.tgz</span>
+helm push temporal-cell-4.2.0.tgz oci://registry.internal/temporal/charts
+helm pull oci://registry.internal/temporal/charts/temporal-cell --version <span class="m">4</span>.2.0
+</code></pre></div>
+
+<p>Note <code>helm push</code> accepts only <code>.tgz</code>, and the OCI reference <em>"must not contain the basename or tag."</em> Helm 4 hardened digest support: <em>"Install charts by digest… Charts with non-matching digests are not installed"</em> — which is what you want for a reproducible pipeline. Also useful: <code>helm package</code> honors <code>SOURCE_DATE_EPOCH</code> for byte-reproducible archives (<a href="https://helm.sh/docs/howto/charts_tips_and_tricks/">tips and tricks</a>).</p>
+<p>Helm 4 registry login is now <strong>domain-scoped only</strong> — no scheme, no path. This breaks CI scripts that passed a full URL.</p>
+<h3 id="the-rendered-manifest--templating-only-pattern">The rendered-manifest / templating-only pattern<a class="anchor" href="#the-rendered-manifest--templating-only-pattern">#</a></h3>
+<h4 id="what-it-is">What it is</h4>
+<p>Render the chart, commit the YAML, let a controller apply it:</p>
+<div class="codehilite"><pre><span></span><code>helm template cell-042 ./charts/temporal-cell <span class="se">\</span>
+  --namespace temporal-system <span class="se">\</span>
+  --kube-version <span class="m">1</span>.34.0 <span class="se">\</span>
+  --api-versions monitoring.coreos.com/v1 <span class="se">\</span>
+  -f values/base.yaml <span class="se">\</span>
+  -f values/aws.yaml <span class="se">\</span>
+  -f values/cells/cell-042.yaml <span class="se">\</span>
+  --include-crds <span class="se">\</span>
+  &gt; rendered/aws/us-east-1/cell-042/manifests.yaml
+</code></pre></div>
+
+<p>The pattern was named and popularized by Akuity — first published in 2023 by Nicholas Morey, revised through July 2026 (<a href="https://akuity.io/blog/the-rendered-manifests-pattern">The Rendered Manifests Pattern</a>, <a href="https://github.com/akuity/rendered-manifest-pattern">companion repo</a>). Its sharpest argument: <em>"Running Helm or Kustomize at sync time is the equivalent of running <code>apt-get install</code> inside a container's startup script."</em> Argo CD has since built it in as the <a href="https://argo-cd.readthedocs.io/en/latest/user-guide/source-hydrator/">Source Hydrator</a>, <em>"Beta Feature (Since v3.5.0)"</em>, designed in the <a href="https://github.com/argoproj/argo-cd/blob/master/docs/proposals/manifest-hydrator.md">manifest-hydrator proposal</a>.</p>
+<h4 id="why-teams-do-it">Why teams do it</h4>
+<ul>
+<li><strong>The diff is the real diff.</strong> A PR shows "this Deployment's memory limit goes from 4Gi to 8Gi," not "this values key changed and, three template layers down, something happens." At 300 cells this is the difference between reviewable and not.</li>
+<li><strong>Rendering happens once, not per sync.</strong> Chart bugs surface in CI, not at 3 a.m. during a controller resync.</li>
+<li><strong>You get an auditable artifact.</strong> What was deployed to cell-042 on 2026-08-14 is a Git object, not a reconstruction.</li>
+<li><strong>Policy and scanning get something concrete.</strong> Conftest, Kyverno CLI, and kubeconform all run naturally over YAML.</li>
+<li><strong>It removes a runtime dependency.</strong> The controller doesn't need Helm, chart repo credentials, or network access to a registry at sync time.</li>
+<li><strong>It sidesteps the whole release-state failure class</strong> — no <code>another operation is in progress</code>, no <code>--atomic</code> rollback surprises, no drift between Helm's record and reality.</li>
+</ul>
+<p>Argo CD does <em>not</em> use release state even when you point it at a chart. Verbatim: <em>"Helm is only used to inflate charts with <code>helm template</code>. The lifecycle of the application is handled by Argo CD instead of Helm"</em> (<a href="https://argo-cd.readthedocs.io/en/stable/user-guide/helm/">Argo CD Helm docs</a>), and <em>"It runs <code>helm template</code> and then deploys the resulting manifests… This means that you cannot use any Helm command to view/verify the application"</em> (<a href="https://argo-cd.readthedocs.io/en/stable/faq/#after-deploying-my-helm-application-with-argo-cd-i-cannot-see-it-with-helm-ls-and-other-helm-commands">Argo CD FAQ</a>). So if you use Argo CD at all, you are already in templating-only mode — the rendered-manifest pattern only moves the render from sync time to CI time. As of Argo CD 3.5, <em>"The only Helm binary used to render charts in Argo CD is v4."</em></p>
+<p>Flux is the counterexample worth knowing: its <code>HelmRelease</code> controller performs <em>"reconciliation of Helm releases via Helm actions such as install, upgrade, test, uninstall, and rollback"</em> (<a href="https://fluxcd.io/flux/components/helm/helmreleases/">Flux HelmRelease</a>) — real release state, real hooks (disabled via <code>.disableHooks</code>), real storage Secrets. Flux <code>Kustomization</code> is the templating-only path. Flux has shipped Helm 4 since <a href="https://fluxcd.io/blog/2026/02/flux-v2.8.0/">v2.8.0 (2026-02-24)</a>, with SSA and kstatus health checking as new defaults and a <code>UseHelm3Defaults</code> feature gate to revert.</p>
+<h4 id="what-you-lose-concretely">What you lose, concretely</h4>
+<table>
+<thead>
+<tr>
+<th>Capability</th>
+<th>Status under <code>helm template</code></th>
+<th>Mitigation</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Hooks (<code>pre-install</code>, <code>post-upgrade</code>, …)</td>
+<td>Manifests are <strong>rendered into the output</strong> but never executed</td>
+<td>Argo CD sync waves/hooks; a real Job in the pipeline; Flux dependency ordering</td>
+</tr>
+<tr>
+<td><code>helm.sh/hook-delete-policy</code></td>
+<td>Meaningless — nothing manages hook lifecycle</td>
+<td><code>ttlSecondsAfterFinished</code> on the Job; Argo CD <code>hook-delete-policy</code></td>
+</tr>
+<tr>
+<td><code>helm rollback</code> / <code>helm history</code></td>
+<td>Gone</td>
+<td><code>git revert</code> the rendered manifests. Arguably better: it is auditable</td>
+</tr>
+<tr>
+<td><code>helm list</code> / <code>helm status</code></td>
+<td>Gone</td>
+<td>Argo CD app list, Flux <code>Kustomization</code> status</td>
+</tr>
+<tr>
+<td><code>lookup</code></td>
+<td>Always returns empty</td>
+<td>Do not template cluster-dependent values</td>
+</tr>
+<tr>
+<td><code>.Release.IsUpgrade</code></td>
+<td>Always false (unless <code>--is-upgrade</code>)</td>
+<td>Remove the branch, or pass the flag from a pipeline that knows</td>
+</tr>
+<tr>
+<td><code>Capabilities.APIVersions</code></td>
+<td>Empty unless <code>--api-versions</code> passed</td>
+<td>Enumerate the target cluster's API surface in your render command</td>
+</tr>
+<tr>
+<td>Three-way merge</td>
+<td>N/A — Helm is not applying</td>
+<td>Server-side apply, which is strictly better</td>
+</tr>
+<tr>
+<td><code>--wait</code>, <code>--timeout</code>, kstatus</td>
+<td>Gone</td>
+<td>Argo CD health assessment; Flux health checks; kstatus in your pipeline</td>
+</tr>
+<tr>
+<td>Pruning of removed resources</td>
+<td><strong>Nothing deletes anything</strong></td>
+<td>See the next section — this is the big one</td>
+</tr>
+<tr>
+<td>CRD auto-install from <code>crds/</code></td>
+<td>Not rendered without <code>--include-crds</code></td>
+<td>Always pass <code>--include-crds</code>, or manage CRDs separately</td>
+</tr>
+<tr>
+<td><code>NOTES.txt</code></td>
+<td>Never emitted</td>
+<td>Move anything load-bearing elsewhere</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Hooks deserve a precise statement</strong>, because the docs never make one. <code>helm template</code> <strong>renders hook manifests into stdout by default but never executes them</strong>. <code>--no-hooks</code> <em>omits them from the output</em>; <code>--skip-tests</code> exists specifically because test hooks are included by default. This is deliberate design (<a href="https://github.com/helm/helm/issues/6443">helm/helm#6443</a>), and verifiable in <a href="https://github.com/helm/helm/blob/main/pkg/cmd/template.go"><code>pkg/cmd/template.go</code></a>, which appends hooks to the output buffer and has no cluster write path.</p>
+<p>The practical consequence: a third-party chart's <code>pre-install</code> migration Job lands in your rendered output as an ordinary Job. Your GitOps tool applies it — possibly <em>concurrently</em> with the Deployment it was supposed to precede, and possibly <em>again</em> on every sync, since it is now just a resource. That is how a database migration runs twice.</p>
+<p>Argo CD's mitigation is a documented mapping (<a href="https://argo-cd.readthedocs.io/en/stable/user-guide/helm/#helm-hooks">Argo CD Helm hooks</a>):</p>
+<table>
+<thead>
+<tr>
+<th>Helm</th>
+<th>Argo CD</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>pre-install</code>, <code>pre-upgrade</code></td>
+<td><code>PreSync</code></td>
+</tr>
+<tr>
+<td><code>post-install</code>, <code>post-upgrade</code></td>
+<td><code>PostSync</code></td>
+</tr>
+<tr>
+<td><code>pre-delete</code> / <code>post-delete</code></td>
+<td><code>PreDelete</code> / <code>PostDelete</code></td>
+</tr>
+<tr>
+<td><code>helm.sh/hook-weight</code></td>
+<td><code>argocd.argoproj.io/sync-wave</code></td>
+</tr>
+<tr>
+<td><code>helm.sh/resource-policy: keep</code></td>
+<td><code>argocd.argoproj.io/sync-options: Delete=false</code></td>
+</tr>
+<tr>
+<td><code>pre-rollback</code>, <code>post-rollback</code>, <code>test-success</code>, <code>test-failure</code></td>
+<td><strong>Not supported</strong></td>
+</tr>
+</tbody>
+</table>
+<p>Two critical notes on that page: <em>"This is annotation compatibility, not a guarantee that hook lifecycle semantics are identical to Helm's"</em>, and — the one that bites — <strong><em>"If you define any Argo CD hooks, all Helm hooks will be ignored."</em></strong> Mixing the two annotation families in one application silently disables one of them.</p>
+<p><strong>One more thing you lose, and it reaches beyond Helm: secrets in the render path.</strong> If the rendered output is committed to git, then anything that resolves a secret <em>during</em> rendering writes plaintext into a commit. Argo CD's Source Hydrator docs state it without hedging: <em>"Do not use the source hydrator with any tool that injects secrets into your manifests as part of the hydration process (for example, Helm with SOPS or the Argo CD Vault Plugin). These secrets would be committed to git"</em> (<a href="https://argo-cd.readthedocs.io/en/latest/user-guide/source-hydrator/">source hydrator</a>). So the templating-only choice is not secrets-neutral: it structurally forces a <em>runtime</em> secrets operator — VSO, ESO, or the CSI driver — because the only thing your chart may render is a <em>pointer</em> to a secret, never the secret. Budget for that operator when you cost out this pattern. See <a href="13-gitops-argocd-flux.html#secrets-in-gitops">13-gitops-argocd-flux.md</a> for the comparison and <a href="10-vault.html#kubernetes-integration--four-options">10-vault.md</a> for the Vault-side options.</p>
+<h3 id="pruning-and-garbage-collection">Pruning and garbage collection<a class="anchor" href="#pruning-and-garbage-collection">#</a></h3>
+<p>Delete a template from a chart and re-render: the object is simply absent from the output. Nothing tells the cluster to remove it. Your options, in descending order of quality:</p>
+<table>
+<thead>
+<tr>
+<th>Mechanism</th>
+<th>How it tracks</th>
+<th>Verdict</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Argo CD prune</strong></td>
+<td><code>argocd.argoproj.io/tracking-id</code> annotation on every managed object</td>
+<td>Best. Mature, per-app, with <code>Prune=confirm</code> for dangerous deletes</td>
+</tr>
+<tr>
+<td><strong>Flux <code>Kustomization</code> prune</strong></td>
+<td>Server-side inventory in <code>.status.inventory</code></td>
+<td>Excellent. Nothing written on the managed objects themselves</td>
+</tr>
+<tr>
+<td><strong>ApplySet</strong> (<code>kubectl apply --prune --applyset</code>)</td>
+<td><code>applyset.kubernetes.io/part-of</code> label + a parent Secret</td>
+<td><strong>Still alpha</strong>, unchanged since v1.27</td>
+</tr>
+<tr>
+<td><strong><code>kubectl apply --prune -l</code></strong> (allowlist)</td>
+<td>Label selector</td>
+<td>Alpha since v1.5. Do not use</td>
+</tr>
+</tbody>
+</table>
+<p>Argo CD: enable with <code>spec.syncPolicy.automated.prune: true</code> (<a href="https://argo-cd.readthedocs.io/en/stable/user-guide/auto_sync/">auto sync</a>), or <code>argocd app sync --prune</code>. Per-resource sync options are <code>Prune=false</code> and <code>Prune=confirm</code> — there is <strong>no <code>Prune=true</code></strong> sync option, a very commonly copy-pasted mistake; the authoritative constant list is in <a href="https://github.com/argoproj/gitops-engine/blob/master/pkg/sync/common/types.go">gitops-engine</a>. Also available: <code>PruneLast=true</code> and <code>PrunePropagationPolicy=background|foreground|orphan</code> (<a href="https://argo-cd.readthedocs.io/en/stable/user-guide/sync-options/">sync options</a>).</p>
+<p>Resource tracking defaults changed: Argo CD 3.0 flipped the default from <code>label</code> to <code>annotation</code> (<a href="https://argo-cd.readthedocs.io/en/stable/operator-manual/upgrading/2.14-3.0/#use-annotation-based-tracking-by-default">3.0 upgrade notes</a>). The old label method truncates at 63 characters and collides with other tools that write <code>app.kubernetes.io/instance</code>. If you inherit a cluster on label tracking, migrating is worth doing.</p>
+<p>Flux: <code>.spec.prune</code> is required, and <em>"objects that were previously applied on the cluster but are missing from the current source revision, are removed"</em> (<a href="https://fluxcd.io/flux/components/kustomize/kustomizations/#prune">prune</a>). The inventory is <em>"the list of Kubernetes resource object references that have been successfully applied… recorded in <code>.status.inventory</code>"</em> (<a href="https://fluxcd.io/flux/components/kustomize/kustomizations/#inventory">inventory</a>). Opt individual objects out with <code>kustomize.toolkit.fluxcd.io/prune: disabled</code>.</p>
+<p>ApplySet is the eventual Kubernetes-native answer but is <strong>not ready</strong>: <a href="https://github.com/kubernetes/enhancements/blob/master/keps/sig-cli/3659-kubectl-apply-prune/kep.yaml">KEP-3659</a> still reads <code>stage: alpha</code>, <code>latest-milestone: v1.27</code>, <code>beta: TBD</code>, and it is gated behind the env var <code>KUBECTL_APPLYSET=true</code>. Current Kubernetes is <a href="https://kubernetes.io/releases/1.37/">v1.37 (2026-08-26)</a>, so that is ten releases without graduating. Plan around a GitOps controller instead.</p>
+<p><em>See also: <a href="13-gitops-argocd-flux.html#argo-cd-resource-tracking-prune-and-deletion">Argo CD resource tracking, prune, and deletion</a> and <a href="13-gitops-argocd-flux.html#flux-sources-kustomization-and-the-inventory">Flux sources, Kustomization, and the inventory</a> for how each controller actually stores the inventory you are outsourcing pruning to — including the finalizer traps that make "prune" not mean "gone."</em></p>
+<h3 id="server-side-apply-and-field-management">Server-side apply and field management<a class="anchor" href="#server-side-apply-and-field-management">#</a></h3>
+<p>Once Helm is not applying, <em>your applier</em> owns fields — and so does everything else that touches those objects. SSA is how Kubernetes arbitrates that, and it has been GA since v1.22 (<a href="https://kubernetes.io/blog/2021/08/06/server-side-apply-ga/">SSA GA blog</a>).</p>
+<p>The model: each writer sends its full desired object with a <code>fieldManager</code> name. The API server records which manager owns which fields in <code>metadata.managedFields</code>. If you try to set a field another manager owns to a different value, you get a <strong>conflict</strong> — a 409 listing the fields and their owners.</p>
+<div class="codehilite"><pre><span></span><code>kubectl apply --server-side --field-manager<span class="o">=</span>temporal-cell-pipeline <span class="se">\</span>
+  -f rendered/aws/us-east-1/cell-042/manifests.yaml
+
+<span class="c1"># On conflict, either fix the other writer or take ownership deliberately:</span>
+kubectl apply --server-side --force-conflicts --field-manager<span class="o">=</span>temporal-cell-pipeline -f ...
+</code></pre></div>
+
+<p>The docs are direct about when forcing is right: <em>"the applier should set the <code>force</code> query parameter to true (for <code>kubectl apply</code>, you use the <code>--force-conflicts</code> command line parameter)… This forces the operation to succeed… and removes the field from all other managers' entries in <code>managedFields</code>"</em>, and <em>"It is strongly recommended for controllers to always force conflicts on objects that they own and manage"</em> (<a href="https://kubernetes.io/docs/reference/using-api/server-side-apply/">server-side apply</a>).</p>
+<p>For a GitOps pipeline that is the sole intended owner of rendered manifests, forcing conflicts is correct: your Git repo is the source of truth, and a conflict means someone edited out of band. But <strong>choose a stable <code>--field-manager</code> name and never change it</strong>, or every rename orphans a set of fields and you accumulate ghost managers.</p>
+<p>Argo CD exposes this as <code>ServerSideApply=true</code>, which <em>"runs <code>kubectl apply --server-side --force-conflicts</code>"</em>. Two related options: <code>Replace=true</code> uses <code>kubectl replace</code>/<code>create</code> and <strong>takes precedence over <code>ServerSideApply=true</code></strong>; <code>RespectIgnoreDifferences=true</code> applies your <code>ignoreDifferences</code> rules at sync time rather than only in the diff. Argo CD also ships <code>ClientSideApplyMigration=true</code> <strong>on by default</strong>, which migrates <code>managedFields</code> from <code>kubectl-client-side-apply</code> to <code>argocd-controller</code> (<a href="https://argo-cd.readthedocs.io/en/stable/user-guide/sync-options/#server-side-apply">sync options — server-side apply</a>).</p>
+<p>One more concrete reason to use SSA: client-side apply stores the previous object in the <code>kubectl.kubernetes.io/last-applied-configuration</code> annotation, which is subject to the 262144-byte annotation limit. Argo CD's docs call this out — large CRDs simply cannot be applied client-side, and <em>"server-side apply can be used to avoid this issue as the annotation is not used in this case."</em></p>
+<p>Helm 4 also does SSA now: default for new installs, with upgrades <strong>latching</strong> to whatever the release used before, so every Helm 3-created release stays on client-side apply until explicitly opted in with <code>--server-side</code>. Field manager name is <code>"helm"</code> (<a href="https://helm.sh/community/hips/hip-0023">HIP-0023</a>). Even in templating-only mode this matters: if any part of your estate still uses <code>helm upgrade</code>, you now have two managers with different apply semantics touching similar objects.</p>
+<p><em>See also: <a href="13-gitops-argocd-flux.html#server-side-apply-field-managers-and-pruning">server-side apply, field managers, and pruning</a> for the field-manager names each GitOps controller actually writes, and the Argo <code>ignoreDifferences[].managedFieldsManagers</code> / Flux <code>spec.ignore</code> escape hatches for coexisting with another writer.</em></p>
+<h3 id="chart-testing-and-linting--the-workflow-you-will-build">Chart testing and linting — the workflow you will build<a class="anchor" href="#chart-testing-and-linting--the-workflow-you-will-build">#</a></h3>
+<p>This is the CI pipeline worth building on day one.</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. Structural lint. Also validates values.schema.json.</span>
+helm lint ./charts/temporal-cell --strict <span class="se">\</span>
+  -f values/base.yaml -f values/cells/cell-042.yaml
+
+<span class="c1"># 2. Unit tests over rendered output.</span>
+helm unittest ./charts/temporal-cell
+
+<span class="c1"># 3. Render deterministically, with the real cluster API surface.</span>
+helm template cell-042 ./charts/temporal-cell <span class="se">\</span>
+  --namespace temporal-system --kube-version <span class="m">1</span>.34.0 <span class="se">\</span>
+  --api-versions monitoring.coreos.com/v1 <span class="se">\</span>
+  -f values/base.yaml -f values/cells/cell-042.yaml <span class="se">\</span>
+  --include-crds &gt; /tmp/rendered.yaml
+
+<span class="c1"># 4. Schema-validate against real Kubernetes OpenAPI + CRD schemas.</span>
+kubeconform -strict -summary -kubernetes-version <span class="m">1</span>.34.0 <span class="se">\</span>
+  -schema-location default <span class="se">\</span>
+  -schema-location <span class="s1">&#39;https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json&#39;</span> <span class="se">\</span>
+  /tmp/rendered.yaml
+
+<span class="c1"># 5. Policy over the rendered manifests.</span>
+conftest <span class="nb">test</span> --policy policy/ /tmp/rendered.yaml
+
+<span class="c1"># 6. Snapshot diff: the review artifact.</span>
+diff -u rendered/aws/us-east-1/cell-042/manifests.yaml /tmp/rendered.yaml
+</code></pre></div>
+
+<p><code>helm lint</code> checks chart structure and values schema. It does <strong>not</strong> validate against Kubernetes OpenAPI schemas — that is step 4's job. Helm 4 adds a <code>crds</code> lint rule and moved <code>pkg/lint</code> to <code>pkg/chart/v2/lint</code>.</p>
+<p><a href="https://github.com/helm-unittest/helm-unittest"><code>helm unittest</code></a> (v1.1.2, 2026-07-24) is a plugin that asserts on rendered output without a cluster. It works with Helm 4 as of v1.1.0. Note Helm 4 verifies plugin provenance by default, so git-URL installs need <code>--verify=false</code>.</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># charts/temporal-cell/tests/deployment_test.yaml</span><span class="w"></span>
+<span class="nt">suite</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">deployment</span><span class="w"></span>
+<span class="nt">templates</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">deployment.yaml</span><span class="w"></span>
+<span class="nt">tests</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">it</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">renders resource limits with correct indentation</span><span class="w"></span>
+<span class="w">    </span><span class="nt">set</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="nt">resources.limits.memory</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">8Gi</span><span class="w"></span>
+<span class="w">    </span><span class="nt">asserts</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">equal</span><span class="p">:</span><span class="w"></span>
+<span class="w">          </span><span class="nt">path</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">spec.template.spec.containers[0].resources.limits.memory</span><span class="w"></span>
+<span class="w">          </span><span class="nt">value</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">8Gi</span><span class="w"></span>
+
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">it</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">omits the resources key entirely when unset</span><span class="w"></span>
+<span class="w">    </span><span class="nt">set</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="nt">resources</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">null</span><span class="w"></span>
+<span class="w">    </span><span class="nt">asserts</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">notExists</span><span class="p">:</span><span class="w"></span>
+<span class="w">          </span><span class="nt">path</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">spec.template.spec.containers[0].resources</span><span class="w"></span>
+
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">it</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">emits a ServiceMonitor only when the API is available</span><span class="w"></span>
+<span class="w">    </span><span class="nt">capabilities</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="nt">apiVersions</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;monitoring.coreos.com/v1&quot;</span><span class="p p-Indicator">]</span><span class="w"></span>
+<span class="w">    </span><span class="nt">templates</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">servicemonitor.yaml</span><span class="w"></span>
+<span class="w">    </span><span class="nt">asserts</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">hasDocuments</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> count</span><span class="p">:</span><span class="w"> </span><span class="nv">1</span><span class="w"> </span><span class="p p-Indicator">}</span><span class="w"></span>
+</code></pre></div>
+
+<p>That third test is the one that earns its keep in templating-only mode — it pins the <code>--api-versions</code> behavior so a silent omission becomes a failing test.</p>
+<p><strong>The snapshot diff is the highest-value CI step you will build.</strong> Commit rendered output per cell; in a PR, re-render and fail if the committed output differs from the freshly rendered output. Reviewers then see the Kubernetes diff, not the values diff. Concretely: a <code>make render</code> target regenerates everything, CI runs it and <code>git diff --exit-code</code>, and a PR that changes a chart <em>must</em> include the regenerated manifests. This gives you exactly the review property that makes the rendered-manifest pattern worth the trouble.</p>
+<p>Tooling status worth knowing:</p>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>Version</th>
+<th>Helm 4?</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="https://github.com/helm-unittest/helm-unittest"><code>helm unittest</code></a></td>
+<td>v1.1.2 (2026-07-24)</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td><a href="https://github.com/helm/chart-testing"><code>chart-testing</code> (ct)</a></td>
+<td>v3.14.0 (Oct 2025)</td>
+<td><strong>No</strong> — still vendors <code>helm.sh/helm/v3</code></td>
+</tr>
+<tr>
+<td><a href="https://github.com/yannh/kubeconform"><code>kubeconform</code></a></td>
+<td>v0.8.0</td>
+<td>N/A</td>
+</tr>
+<tr>
+<td><code>kubeval</code></td>
+<td>—</td>
+<td><strong>Unmaintained</strong>; its README says <em>"a good replacement is kubeconform"</em></td>
+</tr>
+<tr>
+<td><a href="https://github.com/databus23/helm-diff"><code>helm diff</code></a></td>
+<td>v3.15.8 (2026-06-06)</td>
+<td>Yes; uses <code>--dry-run=server</code> on Helm 4</td>
+</tr>
+</tbody>
+</table>
+<p><code>ct</code> not supporting Helm 4 is a real gap; if your CI depends on it, either pin a Helm 3 binary for that step or build the equivalent out of <code>helm lint</code> + <code>helm unittest</code> + <code>kubeconform</code>, which is what I would do anyway since it is faster and the failure messages are better.</p>
+<h3 id="alternatives-honestly-compared">Alternatives, honestly compared<a class="anchor" href="#alternatives-honestly-compared">#</a></h3>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>Model</th>
+<th>Strength</th>
+<th>Real cost</th>
+<th>When I would pick it</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Helm (templating-only)</strong></td>
+<td>Go text templates over YAML</td>
+<td>Universal; every vendor ships a chart; the ecosystem is the moat</td>
+<td>String templating YAML is fundamentally unsafe — indentation bugs, no types, <code>nindent</code> traps</td>
+<td>Default. You must speak it regardless, because third-party charts are Helm</td>
+</tr>
+<tr>
+<td><strong><a href="https://github.com/kubernetes-sigs/kustomize">Kustomize</a></strong></td>
+<td>Structural overlays, no templating</td>
+<td>Merges typed YAML, not strings; built into <code>kubectl</code> (v1.37 embeds v5.8.1)</td>
+<td>No variables, no conditionals <em>by design</em>; you trade template sprawl for overlay sprawl, and anything truly dynamic must leave Kustomize</td>
+<td>Small, structural per-cell deltas over a common base</td>
+</tr>
+<tr>
+<td><strong><a href="https://github.com/grafana/tanka">Tanka</a> / jsonnet</strong></td>
+<td>Real config language</td>
+<td>Functions, imports, actual abstraction; battle-tested at Grafana</td>
+<td>Nobody knows Jsonnet; thin tooling; ecosystem ≈ Grafana and a few shops</td>
+<td>Only if the team already knows Jsonnet</td>
+</tr>
+<tr>
+<td><strong><a href="https://cdk8s.io/">cdk8s</a></strong></td>
+<td>TypeScript/Python/Go → manifests</td>
+<td>Types, IDE completion, refactoring; real loops</td>
+<td>CNCF Sandbox since 2020, never promoted; a Node/jsii toolchain in your deploy path; construct library trails upstream Kubernetes</td>
+<td>Generating many cells programmatically, if the team is fluent</td>
+</tr>
+<tr>
+<td><strong><a href="https://timoni.sh/">Timoni</a></strong></td>
+<td>CUE modules, OCI-distributed</td>
+<td>CUE gives genuine schema validation and typed values — the thing Helm most lacks</td>
+<td>v0.33.0, pre-1.0, de-facto single maintainer, not in CNCF</td>
+<td>Watch it; do not bet a platform on it yet</td>
+</tr>
+<tr>
+<td><strong><a href="https://kcl-lang.io/">KCL</a></strong></td>
+<td>Purpose-built config language</td>
+<td>Schemas, LSP, constraint checking</td>
+<td>CNCF Sandbox with <strong>"Concerning"</strong> health and no tagged GitHub release since v0.11.2 (Apr 2025)</td>
+<td>Not today</td>
+</tr>
+<tr>
+<td><strong><a href="https://github.com/helmfile/helmfile">Helmfile</a></strong></td>
+<td>Declarative orchestration over Helm</td>
+<td>Manages N releases/environments; v1.7.4, very active, supports Helm 4</td>
+<td>Orchestration <em>on top of</em> Helm, not an escape — you keep every Go-template problem and add a second templated layer</td>
+<td>If you need release orchestration and are not on Argo/Flux</td>
+</tr>
+<tr>
+<td><strong>Plain Go templating</strong></td>
+<td>Your own renderer</td>
+<td>Total control; types from your own structs</td>
+<td>You now maintain a chart format nobody else knows; no third-party charts</td>
+<td>Never, for a whole platform</td>
+</tr>
+</tbody>
+</table>
+<p>My honest read for your situation: <strong>Helm for anything third-party (non-negotiable — vendors ship charts), plus Kustomize overlays for per-cell structural deltas.</strong> Kustomize is genuinely good at "same base, small typed differences per environment," which is precisely the many-cells shape, and its patches are structural rather than textual so they cannot produce the indentation class of bug. The combination <code>helm template | kustomize build</code> is well-trodden and both halves are in <code>kubectl</code>'s own orbit. Timoni is the one to watch, because CUE-typed values would eliminate an entire defect class — but pre-1.0 with one maintainer is not where a cell platform should live.</p>
+<h3 id="debugging">Debugging<a class="anchor" href="#debugging">#</a></h3>
+<div class="codehilite"><pre><span></span><code><span class="c1"># Show the render even when the YAML is invalid. Without --debug you just get</span>
+<span class="c1"># &quot;Use --debug flag to render out invalid YAML&quot;.</span>
+helm template cell ./charts/temporal-cell --debug
+
+<span class="c1"># Render with real cluster contact — the only way to exercise `lookup`.</span>
+helm template cell ./charts/temporal-cell --dry-run<span class="o">=</span>server
+
+<span class="c1"># Isolate one template.</span>
+helm template cell ./charts/temporal-cell -s templates/deployment.yaml
+
+<span class="c1"># See exactly what values Helm computed after all merging.</span>
+helm template cell ./charts/temporal-cell -f a.yaml -f b.yaml --debug <span class="m">2</span>&gt;<span class="p">&amp;</span><span class="m">1</span> <span class="se">\</span>
+  <span class="p">|</span> sed -n <span class="s1">&#39;/^USER-SUPPLIED VALUES/,/^HOOKS/p&#39;</span>
+
+<span class="c1"># For anything that DOES have release state: what Helm believes is deployed.</span>
+helm get manifest my-release
+helm get values my-release --all
+helm get hooks my-release
+
+<span class="c1"># Compare rendered output across two chart versions, no cluster required.</span>
+<span class="c1"># The helm-diff plugin only has release/revision/rollback/upgrade subcommands,</span>
+<span class="c1"># all of which need release state, so for a pure local comparison use process</span>
+<span class="c1"># substitution against two `helm template` runs.</span>
+diff -u &lt;<span class="o">(</span>helm template cell ./charts/v1<span class="o">)</span> &lt;<span class="o">(</span>helm template cell ./charts/v2<span class="o">)</span>
+</code></pre></div>
+
+<p><code>--dry-run=server</code> arrived in <strong>Helm 3.13.0</strong> and <em>"also works on <code>helm template</code>"</em> (<a href="https://helm.sh/blog/helm-3.13/">Helm 3.13 blog</a>). It is the only way to test a <code>lookup</code> and the only accurate simulation once SSA is in play — HIP-0023 notes <em>"<code>--dry-run=client</code> won't accurately simulate an install with SSA enabled… instead use <code>--dry-run=server</code>."</em></p>
+<p><code>helm get manifest</code> returns <em>"what Helm's release storage says is deployed"</em>, not a re-render (<a href="https://helm.sh/docs/helm/helm_get_manifest/">helm get manifest</a>). Diffing it against a fresh <code>helm template</code> is the canonical way to detect that a release has drifted from its chart — useful when migrating an existing Helm-managed estate into a rendered-manifest pipeline.</p>
+<hr />
+<h2 id="hands-on">Hands-on<a class="anchor" href="#hands-on">#</a></h2>
+<p><strong>Cost: $0.</strong> Everything runs on kind locally.</p>
+<h3 id="setup">Setup<a class="anchor" href="#setup">#</a></h3>
+<div class="codehilite"><pre><span></span><code>brew install helm kind kubectl kubeconform conftest
+helm plugin install https://github.com/helm-unittest/helm-unittest --verify<span class="o">=</span><span class="nb">false</span>
+helm version          <span class="c1"># expect v4.2.x</span>
+kind create cluster --name helm-lab
+</code></pre></div>
+
+<h3 id="lab-1--build-a-chart-and-hit-the-nindent-bug-on-purpose">Lab 1 — Build a chart and hit the <code>nindent</code> bug on purpose<a class="anchor" href="#lab-1--build-a-chart-and-hit-the-nindent-bug-on-purpose">#</a></h3>
+<div class="codehilite"><pre><span></span><code>mkdir -p ~/helm-lab <span class="o">&amp;&amp;</span> <span class="nb">cd</span> ~/helm-lab
+helm create temporal-cell
+rm -rf temporal-cell/templates/tests temporal-cell/templates/hpa.yaml <span class="se">\</span>
+       temporal-cell/templates/ingress.yaml temporal-cell/templates/serviceaccount.yaml
+</code></pre></div>
+
+<p>Now deliberately break it. Edit <code>temporal-cell/templates/deployment.yaml</code> and replace the resources block with the broken form:</p>
+<div class="codehilite"><pre><span></span><code><span class="w">          </span><span class="c1"># BROKEN ON PURPOSE</span><span class="w"></span>
+<span class="w">          </span><span class="nt">resources</span><span class="p">:</span><span class="w"></span>
+<span class="w">            </span><span class="p p-Indicator">{{</span><span class="nv">- toYaml .Values.resources | indent 12</span><span class="w"> </span><span class="p p-Indicator">}}</span><span class="w"></span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="c1"># temporal-cell/values.yaml — give resources a real value</span><span class="w"></span>
+<span class="nt">resources</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">limits</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">cpu</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">500m</span><span class="w"></span>
+<span class="w">    </span><span class="nt">memory</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">512Mi</span><span class="w"></span>
+<span class="w">  </span><span class="nt">requests</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">cpu</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">100m</span><span class="w"></span>
+<span class="w">    </span><span class="nt">memory</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">128Mi</span><span class="w"></span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code>helm template cell ./temporal-cell
+</code></pre></div>
+
+<p>You will get a YAML parse error. Now look at the actual bytes:</p>
+<div class="codehilite"><pre><span></span><code>helm template cell ./temporal-cell --debug <span class="m">2</span>&gt;<span class="p">&amp;</span><span class="m">1</span> <span class="p">|</span> grep -A4 <span class="s1">&#39;resources:&#39;</span>
+</code></pre></div>
+
+<p>The first line of <code>toYaml</code> output is glued directly after <code>resources:</code> because <code>{{-</code> consumed the newline, and every subsequent line is indented 12 — so <code>limits:</code> ends up on the wrong line entirely. Fix it:</p>
+<div class="codehilite"><pre><span></span><code><span class="w">          </span><span class="nt">resources</span><span class="p">:</span><span class="w"></span>
+<span class="w">            </span><span class="p p-Indicator">{{</span><span class="nv">- toYaml .Values.resources | nindent 12</span><span class="w"> </span><span class="p p-Indicator">}}</span><span class="w"></span>
+</code></pre></div>
+
+<p>Then produce the <em>second</em> variant of the same bug — set <code>resources: {}</code> in values and re-render with the fixed <code>nindent</code>. You get <code>resources:</code> followed by <code>{}</code>, which is fine, but try <code>resources: null</code>:</p>
+<div class="codehilite"><pre><span></span><code>helm template cell ./temporal-cell --set <span class="nv">resources</span><span class="o">=</span>null <span class="p">|</span> grep -A2 <span class="s1">&#39;resources:&#39;</span>
+</code></pre></div>
+
+<p>Now wrap it the way Helm 4's own scaffold does and confirm the key disappears entirely:</p>
+<div class="codehilite"><pre><span></span><code><span class="w">          </span><span class="p p-Indicator">{{</span><span class="nv">- with .Values.resources</span><span class="w"> </span><span class="p p-Indicator">}}</span><span class="w"></span>
+<span class="w">          </span><span class="nt">resources</span><span class="p">:</span><span class="w"></span>
+<span class="w">            </span><span class="p p-Indicator">{{</span><span class="nv">- toYaml . | nindent 12</span><span class="w"> </span><span class="p p-Indicator">}}</span><span class="w"></span>
+<span class="w">          </span><span class="p p-Indicator">{{</span><span class="nv">- end</span><span class="w"> </span><span class="p p-Indicator">}}</span><span class="w"></span>
+</code></pre></div>
+
+<p>Doing this by hand once means you will spot it in code review forever.</p>
+<h3 id="lab-2--prove-what-dies-without-a-cluster">Lab 2 — Prove what dies without a cluster<a class="anchor" href="#lab-2--prove-what-dies-without-a-cluster">#</a></h3>
+<p>Add a template that depends on all three degraded features:</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># temporal-cell/templates/degraded.yaml</span><span class="w"></span>
+<span class="p p-Indicator">{{</span><span class="nv">- $existing</span><span class="w"> </span><span class="p p-Indicator">:</span><span class="nv">= lookup &quot;v1&quot; &quot;ConfigMap&quot; .Release.Namespace &quot;cell-state&quot;</span><span class="w"> </span><span class="p p-Indicator">}}</span><span class="w"></span>
+<span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">v1</span><span class="w"></span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">ConfigMap</span><span class="w"></span>
+<span class="nt">metadata</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">{{</span><span class="w"> </span><span class="nv">include &quot;temporal-cell.fullname&quot; .</span><span class="w"> </span><span class="p p-Indicator">}}</span><span class="l l-Scalar l-Scalar-Plain">-probe</span><span class="w"></span>
+<span class="nt">data</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">lookupFoundExisting</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">{{</span><span class="w"> </span><span class="nv">if $existing</span><span class="w"> </span><span class="p p-Indicator">}}</span><span class="s">&quot;yes&quot;</span><span class="p p-Indicator">{{</span><span class="w"> </span><span class="nv">else</span><span class="w"> </span><span class="p p-Indicator">}}</span><span class="s">&quot;no&quot;</span><span class="p p-Indicator">{{</span><span class="w"> </span><span class="nv">end</span><span class="w"> </span><span class="p p-Indicator">}}</span><span class="w"></span>
+<span class="w">  </span><span class="nt">isUpgrade</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">{{</span><span class="w"> </span><span class="nv">.Release.IsUpgrade | quote</span><span class="w"> </span><span class="p p-Indicator">}}</span><span class="w"></span>
+<span class="w">  </span><span class="nt">isInstall</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">{{</span><span class="w"> </span><span class="nv">.Release.IsInstall | quote</span><span class="w"> </span><span class="p p-Indicator">}}</span><span class="w"></span>
+<span class="w">  </span><span class="nt">releaseName</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">{{</span><span class="w"> </span><span class="nv">.Release.Name | quote</span><span class="w"> </span><span class="p p-Indicator">}}</span><span class="w"></span>
+<span class="w">  </span><span class="nt">hasPrometheusCRD</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">{{</span><span class="w"> </span><span class="nv">.Capabilities.APIVersions.Has &quot;monitoring.coreos.com/v1&quot; | quote</span><span class="w"> </span><span class="p p-Indicator">}}</span><span class="w"></span>
+<span class="w">  </span><span class="nt">kubeVersion</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">{{</span><span class="w"> </span><span class="nv">.Capabilities.KubeVersion.Version | quote</span><span class="w"> </span><span class="p p-Indicator">}}</span><span class="w"></span>
+<span class="nn">---</span><span class="w"></span>
+<span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">batch/v1</span><span class="w"></span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Job</span><span class="w"></span>
+<span class="nt">metadata</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">{{</span><span class="w"> </span><span class="nv">include &quot;temporal-cell.fullname&quot; .</span><span class="w"> </span><span class="p p-Indicator">}}</span><span class="l l-Scalar l-Scalar-Plain">-migrate</span><span class="w"></span>
+<span class="w">  </span><span class="nt">annotations</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="s">&quot;helm.sh/hook&quot;</span><span class="p p-Indicator">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">pre-install,pre-upgrade</span><span class="w"></span>
+<span class="w">    </span><span class="s">&quot;helm.sh/hook-weight&quot;</span><span class="p p-Indicator">:</span><span class="w"> </span><span class="s">&quot;-5&quot;</span><span class="w"></span>
+<span class="w">    </span><span class="s">&quot;helm.sh/hook-delete-policy&quot;</span><span class="p p-Indicator">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">hook-succeeded</span><span class="w"></span>
+<span class="nt">spec</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">template</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">spec</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="nt">restartPolicy</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Never</span><span class="w"></span>
+<span class="w">      </span><span class="nt">containers</span><span class="p">:</span><span class="w"></span>
+<span class="w">        </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">migrate</span><span class="w"></span>
+<span class="w">          </span><span class="nt">image</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">busybox:1.36</span><span class="w"></span>
+<span class="w">          </span><span class="nt">command</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;sh&quot;</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">&quot;-c&quot;</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">&quot;echo</span><span class="nv"> </span><span class="s">migrating;</span><span class="nv"> </span><span class="s">sleep</span><span class="nv"> </span><span class="s">2&quot;</span><span class="p p-Indicator">]</span><span class="w"></span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. Create the ConfigMap the lookup is looking for.</span>
+kubectl create namespace temporal-system
+kubectl -n temporal-system create configmap cell-state --from-literal<span class="o">=</span><span class="nv">x</span><span class="o">=</span><span class="m">1</span>
+
+<span class="c1"># 2. Plain template — lookup is blind, IsUpgrade is false, no Prometheus CRD.</span>
+helm template cell ./temporal-cell -n temporal-system <span class="p">|</span> grep -A8 <span class="s1">&#39;name: cell-temporal-cell-probe&#39;</span>
+
+<span class="c1"># 3. Now with a server dry-run — the lookup works.</span>
+helm template cell ./temporal-cell -n temporal-system --dry-run<span class="o">=</span>server <span class="se">\</span>
+  <span class="p">|</span> grep lookupFoundExisting
+
+<span class="c1"># 4. Feed in capabilities explicitly.</span>
+helm template cell ./temporal-cell -n temporal-system <span class="se">\</span>
+  --api-versions monitoring.coreos.com/v1 --kube-version <span class="m">1</span>.34.0 <span class="se">\</span>
+  <span class="p">|</span> grep -E <span class="s1">&#39;hasPrometheusCRD|kubeVersion&#39;</span>
+
+<span class="c1"># 5. Confirm the hook Job IS in the output but has no lifecycle.</span>
+helm template cell ./temporal-cell -n temporal-system <span class="p">|</span> grep -c <span class="s1">&#39;kind: Job&#39;</span>
+helm template cell ./temporal-cell -n temporal-system --no-hooks <span class="p">|</span> grep -c <span class="s1">&#39;kind: Job&#39;</span>
+</code></pre></div>
+
+<p>Step 5 is the important one: the Job appears in normal output and disappears with <code>--no-hooks</code>. In a GitOps pipeline that Job is an ordinary resource that will be applied — and re-applied — with no ordering guarantee relative to the Deployment.</p>
+<h3 id="lab-3--schema-validate-your-values">Lab 3 — Schema-validate your values<a class="anchor" href="#lab-3--schema-validate-your-values">#</a></h3>
+<p>Create <code>temporal-cell/values.schema.json</code> (JSON has no comments, so the path goes here rather than inside the file):</p>
+<div class="codehilite"><pre><span></span><code><span class="p">{</span><span class="w"></span>
+<span class="w">  </span><span class="nt">&quot;$schema&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;https://json-schema.org/draft/2020-12/schema&quot;</span><span class="p">,</span><span class="w"></span>
+<span class="w">  </span><span class="nt">&quot;type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;object&quot;</span><span class="p">,</span><span class="w"></span>
+<span class="w">  </span><span class="nt">&quot;required&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;replicaCount&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;image&quot;</span><span class="p">],</span><span class="w"></span>
+<span class="w">  </span><span class="nt">&quot;properties&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">    </span><span class="nt">&quot;replicaCount&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;integer&quot;</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;minimum&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;maximum&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">50</span><span class="w"> </span><span class="p">},</span><span class="w"></span>
+<span class="w">    </span><span class="nt">&quot;image&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">      </span><span class="nt">&quot;type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;object&quot;</span><span class="p">,</span><span class="w"></span>
+<span class="w">      </span><span class="nt">&quot;required&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;repository&quot;</span><span class="p">],</span><span class="w"></span>
+<span class="w">      </span><span class="nt">&quot;properties&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">        </span><span class="nt">&quot;repository&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;string&quot;</span><span class="w"> </span><span class="p">},</span><span class="w"></span>
+<span class="w">        </span><span class="nt">&quot;tag&quot;</span><span class="p">:</span><span class="w">        </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;string&quot;</span><span class="w"> </span><span class="p">},</span><span class="w"></span>
+<span class="w">        </span><span class="nt">&quot;pullPolicy&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;string&quot;</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;enum&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;Always&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;IfNotPresent&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;Never&quot;</span><span class="p">]</span><span class="w"> </span><span class="p">}</span><span class="w"></span>
+<span class="w">      </span><span class="p">},</span><span class="w"></span>
+<span class="w">      </span><span class="nt">&quot;additionalProperties&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="w"></span>
+<span class="w">    </span><span class="p">}</span><span class="w"></span>
+<span class="w">  </span><span class="p">}</span><span class="w"></span>
+<span class="p">}</span><span class="w"></span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code>helm template cell ./temporal-cell --set <span class="nv">replicaCount</span><span class="o">=</span><span class="m">100</span>          <span class="c1"># fails: maximum</span>
+helm template cell ./temporal-cell --set image.pullPolicy<span class="o">=</span>Sometimes <span class="c1"># fails: enum</span>
+helm template cell ./temporal-cell --set image.repositry<span class="o">=</span>nginx      <span class="c1"># fails: typo caught</span>
+helm lint ./temporal-cell                                           <span class="c1"># schema runs here too</span>
+helm template cell ./temporal-cell --set <span class="nv">replicaCount</span><span class="o">=</span><span class="m">100</span> --skip-schema-validation  <span class="c1"># escape hatch</span>
+</code></pre></div>
+
+<p>That third command is the payoff: <code>additionalProperties: false</code> turns a misspelled values key from a silent no-op into a build failure.</p>
+<h3 id="lab-4--unit-tests">Lab 4 — Unit tests<a class="anchor" href="#lab-4--unit-tests">#</a></h3>
+<div class="codehilite"><pre><span></span><code><span class="c1"># temporal-cell/tests/deployment_test.yaml</span><span class="w"></span>
+<span class="nt">suite</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">deployment</span><span class="w"></span>
+<span class="nt">templates</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">deployment.yaml</span><span class="w"></span>
+<span class="nt">tests</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">it</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">sets replicas from values</span><span class="w"></span>
+<span class="w">    </span><span class="nt">set</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> replicaCount</span><span class="p">:</span><span class="w"> </span><span class="nv">7</span><span class="w"> </span><span class="p p-Indicator">}</span><span class="w"></span>
+<span class="w">    </span><span class="nt">asserts</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">equal</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> path</span><span class="p">:</span><span class="w"> </span><span class="nv">spec.replicas</span><span class="p p-Indicator">,</span><span class="nt"> value</span><span class="p">:</span><span class="w"> </span><span class="nv">7</span><span class="w"> </span><span class="p p-Indicator">}</span><span class="w"></span>
+
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">it</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">omits resources when empty</span><span class="w"></span>
+<span class="w">    </span><span class="nt">set</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> resources</span><span class="p">:</span><span class="w"> </span><span class="nv">null</span><span class="w"> </span><span class="p p-Indicator">}</span><span class="w"></span>
+<span class="w">    </span><span class="nt">asserts</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="c1"># Quote any path containing [] — unquoted it is a YAML flow sequence</span><span class="w"></span>
+<span class="w">      </span><span class="c1"># inside a flow mapping, which fails to parse.</span><span class="w"></span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">notExists</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> path</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;spec.template.spec.containers[0].resources&quot;</span><span class="w"> </span><span class="p p-Indicator">}</span><span class="w"></span>
+
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">it</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">renders resources with correct nesting when set</span><span class="w"></span>
+<span class="w">    </span><span class="nt">set</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="nt">resources</span><span class="p">:</span><span class="w"></span>
+<span class="w">        </span><span class="nt">limits</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> memory</span><span class="p">:</span><span class="w"> </span><span class="nv">8Gi</span><span class="w"> </span><span class="p p-Indicator">}</span><span class="w"></span>
+<span class="w">    </span><span class="nt">asserts</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">equal</span><span class="p">:</span><span class="w"></span>
+<span class="w">          </span><span class="nt">path</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">spec.template.spec.containers[0].resources.limits.memory</span><span class="w"></span>
+<span class="w">          </span><span class="nt">value</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">8Gi</span><span class="w"></span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code>helm unittest ./temporal-cell
+helm unittest ./temporal-cell -f <span class="s1">&#39;tests/*_test.yaml&#39;</span> --color
+</code></pre></div>
+
+<p>Break the <code>nindent</code> back to <code>indent</code> and watch the third test fail — that is your regression net for the bug class from Lab 1.</p>
+<h3 id="lab-5--convert-to-a-rendered-manifest-workflow-with-a-ci-diff-gate">Lab 5 — Convert to a rendered-manifest workflow with a CI diff gate<a class="anchor" href="#lab-5--convert-to-a-rendered-manifest-workflow-with-a-ci-diff-gate">#</a></h3>
+<div class="codehilite"><pre><span></span><code><span class="nb">cd</span> ~/helm-lab
+mkdir -p values rendered/cell-001 rendered/cell-002 policy
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="c1"># values/base.yaml</span><span class="w"></span>
+<span class="nt">image</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> repository</span><span class="p">:</span><span class="w"> </span><span class="nv">nginx</span><span class="p p-Indicator">,</span><span class="nt"> tag</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;1.27&quot;</span><span class="p p-Indicator">,</span><span class="nt"> pullPolicy</span><span class="p">:</span><span class="w"> </span><span class="nv">IfNotPresent</span><span class="w"> </span><span class="p p-Indicator">}</span><span class="w"></span>
+<span class="nt">replicaCount</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">2</span><span class="w"></span>
+<span class="nt">resources</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">limits</span><span class="p">:</span><span class="w">   </span><span class="p p-Indicator">{</span><span class="nt"> cpu</span><span class="p">:</span><span class="w"> </span><span class="nv">500m</span><span class="p p-Indicator">,</span><span class="nt"> memory</span><span class="p">:</span><span class="w"> </span><span class="nv">512Mi</span><span class="w"> </span><span class="p p-Indicator">}</span><span class="w"></span>
+<span class="w">  </span><span class="nt">requests</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> cpu</span><span class="p">:</span><span class="w"> </span><span class="nv">100m</span><span class="p p-Indicator">,</span><span class="nt"> memory</span><span class="p">:</span><span class="w"> </span><span class="nv">128Mi</span><span class="w"> </span><span class="p p-Indicator">}</span><span class="w"></span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="c1"># values/cell-002.yaml</span><span class="w"></span>
+<span class="nt">replicaCount</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">5</span><span class="w"></span>
+<span class="nt">resources</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">limits</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> cpu</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;2&quot;</span><span class="p p-Indicator">,</span><span class="nt"> memory</span><span class="p">:</span><span class="w"> </span><span class="nv">4Gi</span><span class="w"> </span><span class="p p-Indicator">}</span><span class="w"></span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="c"># Makefile</span>
+<span class="nv">CELLS</span>      <span class="o">:=</span> cell-001 cell-002
+<span class="nv">KUBE_VER</span>   <span class="o">:=</span> <span class="m">1</span>.34.0
+<span class="nv">API_VERS</span>   <span class="o">:=</span> --api-versions monitoring.coreos.com/v1 --api-versions cert-manager.io/v1
+
+<span class="nf">.PHONY</span><span class="o">:</span> <span class="n">render</span> <span class="n">verify</span> <span class="n">test</span>
+
+<span class="nf">render</span><span class="o">:</span>
+    @for c <span class="k">in</span> <span class="k">$(</span>CELLS<span class="k">)</span><span class="p">;</span> <span class="k">do</span> <span class="se">\</span>
+      <span class="nv">extra</span><span class="o">=</span><span class="s2">&quot;&quot;</span><span class="p">;</span> <span class="o">[</span> -f values/<span class="nv">$$</span>c.yaml <span class="o">]</span> <span class="o">&amp;&amp;</span> <span class="nv">extra</span><span class="o">=</span><span class="s2">&quot;-f values/</span><span class="nv">$$</span><span class="s2">c.yaml&quot;</span><span class="p">;</span> <span class="se">\</span>
+      helm template <span class="nv">$$</span>c ./temporal-cell <span class="se">\</span>
+        --namespace temporal-system <span class="se">\</span>
+        --kube-version <span class="k">$(</span>KUBE_VER<span class="k">)</span> <span class="k">$(</span>API_VERS<span class="k">)</span> <span class="se">\</span>
+        --include-crds <span class="se">\</span>
+        -f values/base.yaml <span class="nv">$$</span>extra <span class="se">\</span>
+        &gt; rendered/<span class="nv">$$</span>c/manifests.yaml<span class="p">;</span> <span class="se">\</span>
+      <span class="nb">echo</span> <span class="s2">&quot;rendered </span><span class="nv">$$</span><span class="s2">c&quot;</span><span class="p">;</span> <span class="se">\</span>
+    <span class="k">done</span>
+
+<span class="nf">verify</span><span class="o">:</span> <span class="n">render</span>
+    @git diff --exit-code -- rendered/ <span class="se">\</span>
+      <span class="o">||</span> <span class="o">(</span><span class="nb">echo</span> <span class="s2">&quot;ERROR: rendered manifests are stale. Run &#39;make render&#39; and commit.&quot;</span><span class="p">;</span> <span class="nb">exit</span> <span class="m">1</span><span class="o">)</span>
+
+<span class="nf">test</span><span class="o">:</span>
+    helm lint ./temporal-cell --strict -f values/base.yaml
+    helm unittest ./temporal-cell
+    @for c <span class="k">in</span> <span class="k">$(</span>CELLS<span class="k">)</span><span class="p">;</span> <span class="k">do</span> <span class="se">\</span>
+      kubeconform -strict -summary -kubernetes-version <span class="k">$(</span>KUBE_VER<span class="k">)</span> <span class="se">\</span>
+        -schema-location default rendered/<span class="nv">$$</span>c/manifests.yaml<span class="p">;</span> <span class="se">\</span>
+      conftest <span class="nb">test</span> --policy policy/ rendered/<span class="nv">$$</span>c/manifests.yaml<span class="p">;</span> <span class="se">\</span>
+    <span class="k">done</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code># policy/security.rego
+package main
+
+deny contains msg if {
+  input.kind == &quot;Deployment&quot;
+  some c in input.spec.template.spec.containers
+  not c.resources.limits.memory
+  msg := sprintf(&quot;container %v has no memory limit&quot;, [c.name])
+}
+
+deny contains msg if {
+  input.kind == &quot;Deployment&quot;
+  some c in input.spec.template.spec.containers
+  not c.securityContext.runAsNonRoot
+  msg := sprintf(&quot;container %v must set runAsNonRoot&quot;, [c.name])
+}
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code>git init <span class="o">&amp;&amp;</span> git add -A <span class="o">&amp;&amp;</span> git commit -m <span class="s2">&quot;baseline&quot;</span>
+make render <span class="o">&amp;&amp;</span> git add -A <span class="o">&amp;&amp;</span> git commit -m <span class="s2">&quot;rendered manifests&quot;</span>
+
+<span class="c1"># Expect this to FAIL on the runAsNonRoot rule: `helm create` scaffolds</span>
+<span class="c1"># `securityContext: {}`, so the `{{- with }}` wrapper omits the key entirely.</span>
+<span class="c1"># That is the gate doing its job. Set securityContext.runAsNonRoot: true in</span>
+<span class="c1"># values/base.yaml to make it pass.</span>
+make <span class="nb">test</span>
+
+<span class="c1"># Now change a value and observe the review artifact.</span>
+sed -i <span class="s1">&#39;&#39;</span> <span class="s1">&#39;s/replicaCount: 5/replicaCount: 9/&#39;</span> values/cell-002.yaml
+make verify        <span class="c1"># FAILS: rendered output is stale</span>
+make render
+git diff -- rendered/    <span class="c1"># &lt;-- this is what a reviewer sees: replicas 5 -&gt; 9</span>
+</code></pre></div>
+
+<p>That <code>git diff</code> is the entire point of the pattern. The reviewer sees a Kubernetes-level change, not a values-level one, and policy ran against the exact bytes that will be applied.</p>
+<h3 id="lab-6--apply-with-ssa-and-force-a-conflict">Lab 6 — Apply with SSA and force a conflict<a class="anchor" href="#lab-6--apply-with-ssa-and-force-a-conflict">#</a></h3>
+<div class="codehilite"><pre><span></span><code>kubectl create namespace temporal-system --dry-run<span class="o">=</span>client -o yaml <span class="p">|</span> kubectl apply -f -
+kubectl -n temporal-system apply --server-side <span class="se">\</span>
+  --field-manager<span class="o">=</span>cell-pipeline -f rendered/cell-001/manifests.yaml
+
+<span class="c1"># Inspect who owns what.</span>
+kubectl -n temporal-system get deploy cell-001-temporal-cell <span class="se">\</span>
+  -o <span class="nv">jsonpath</span><span class="o">=</span><span class="s1">&#39;{.metadata.managedFields[*].manager}{&quot;\n&quot;}&#39;</span>
+
+<span class="c1"># Simulate a rogue actor taking a field.</span>
+kubectl -n temporal-system scale deploy/cell-001-temporal-cell --replicas<span class="o">=</span><span class="m">11</span>
+
+kubectl -n temporal-system get deploy cell-001-temporal-cell <span class="se">\</span>
+  -o json <span class="p">|</span> jq <span class="s1">&#39;.metadata.managedFields[] | {manager, operation}&#39;</span>
+
+<span class="c1"># Re-apply — conflict, because kubectl-scale now owns spec.replicas.</span>
+kubectl -n temporal-system apply --server-side <span class="se">\</span>
+  --field-manager<span class="o">=</span>cell-pipeline -f rendered/cell-001/manifests.yaml
+
+<span class="c1"># Take ownership back, the way a GitOps controller does.</span>
+kubectl -n temporal-system apply --server-side --force-conflicts <span class="se">\</span>
+  --field-manager<span class="o">=</span>cell-pipeline -f rendered/cell-001/manifests.yaml
+</code></pre></div>
+
+<p>Read the conflict error carefully — it names the exact field paths and the competing manager. That message is what you will be reading when a controller and your pipeline fight over an annotation at 3 a.m.</p>
+<hr />
+<h2 id="production-gotchas">Production gotchas<a class="anchor" href="#production-gotchas">#</a></h2>
+<ol>
+<li>
+<p><strong><code>lookup</code> silently returns empty and your chart takes the wrong branch.</strong> <em>"When used with the <code>helm template</code> command it always returns an empty response"</em> (<a href="https://helm.sh/docs/chart_template_guide/function_list/">function list</a>). The classic victim is <code>lookup</code>-then-<code>randAlphaNum</code> secret generation, which regenerates the secret on every render and restarts every Pod on every sync. Grep every inherited chart for <code>lookup</code>.</p>
+</li>
+<li>
+<p><strong><code>Capabilities.APIVersions</code> is empty without <code>--api-versions</code>, so conditional resources silently vanish.</strong> No error, no warning — the ServiceMonitor just is not there. Enumerate the target cluster's API surface in your render command and pin it with a unit test (<a href="https://helm.sh/docs/helm/helm_template/">helm template</a>).</p>
+</li>
+<li>
+<p><strong><code>.Release.IsUpgrade</code> is always false and the release name is the literal string <code>release-name</code>.</strong> Verified in <a href="https://github.com/helm/helm/blob/main/pkg/cmd/template.go"><code>pkg/cmd/template.go</code></a>. Pass a release name explicitly, and use <code>--is-upgrade</code> if a chart genuinely needs it — or better, delete the branch.</p>
+</li>
+<li>
+<p><strong>Hooks are rendered but never run — and then applied as ordinary resources.</strong> <code>helm template</code> writes hook manifests to stdout; <code>--no-hooks</code> removes them. Your GitOps tool will apply that <code>pre-install</code> migration Job with no ordering guarantee, and may re-run it every sync. Either strip hooks and re-express them as Argo sync waves, or map them (<a href="https://argo-cd.readthedocs.io/en/stable/user-guide/helm/#helm-hooks">Argo CD Helm hooks</a>).</p>
+</li>
+<li>
+<p><strong>Mixing Argo CD hooks and Helm hooks disables the Helm ones entirely.</strong> <em>"If you define any Argo CD hooks, all Helm hooks will be ignored"</em> (same page). One stray <code>argocd.argoproj.io/hook</code> annotation anywhere in a chart neutralizes every Helm hook in it.</p>
+</li>
+<li>
+<p><strong>There is no <code>Prune=true</code> sync option in Argo CD.</strong> Only <code>Prune=false</code> and <code>Prune=confirm</code> exist (<a href="https://github.com/argoproj/gitops-engine/blob/master/pkg/sync/common/types.go">gitops-engine constants</a>). Automated pruning is <code>spec.syncPolicy.automated.prune: true</code>. Copy-pasting <code>Prune=true</code> produces a silently ignored annotation and no pruning.</p>
+</li>
+<li>
+<p><strong><code>crds/</code> is not rendered unless you pass <code>--include-crds</code>.</strong> Forget the flag and your CRDs never reach the cluster, and everything that depends on them fails to apply. Bake it into your Makefile, not into someone's memory (<a href="https://helm.sh/docs/topics/charts/#custom-resource-definitions-crds">charts</a>).</p>
+</li>
+<li>
+<p><strong><code>toYaml | indent n</code> is almost always wrong; you want <code>nindent</code>.</strong> And a <code>toYaml</code> of an empty value renders the key as <code>null</code>. Wrap in <code>{{- with }}</code> so the key disappears, which is what Helm 4's own scaffold does (<a href="https://helm.sh/docs/chart_template_guide/named_templates/">named templates</a>).</p>
+</li>
+<li>
+<p><strong><code>default</code> treats <code>0</code>, <code>""</code>, and <code>false</code> as empty.</strong> <code>{{ .Values.replicas | default 3 }}</code> returns 3 when the user explicitly set 0. Use <code>hasKey</code> or a schema default when zero is meaningful.</p>
+</li>
+<li>
+<p><strong>Template names are global across a chart and all subcharts.</strong> An unprefixed <code>{{- define "labels" }}</code> will be silently overridden by whichever chart defines it last. Always prefix with the chart name (<a href="https://helm.sh/docs/howto/charts_tips_and_tricks/">tips and tricks</a>).</p>
+</li>
+<li>
+<p><strong><code>NOTES.txt</code> never appears in <code>helm template</code> output</strong> — Helm 4 deprecated the related flags because <em>"template output never includes notes"</em> (<a href="https://helm.sh/docs/overview/">Helm 4 overview</a>). Post-install instructions in a chart you inherit are invisible in your workflow.</p>
+</li>
+<li>
+<p><strong>Nothing prunes.</strong> Delete a template and the object stays in the cluster forever until something with an inventory removes it. Argo CD's tracking annotation and Flux's <code>.status.inventory</code> are the two production answers; <code>kubectl apply --prune</code> is <em>"still in alpha due to usability, correctness and performance issues with its design"</em> (<a href="https://kubernetes.io/docs/tasks/manage-kubernetes-objects/declarative-config/#alternative-kubectl-apply-f-directory-prune">declarative config</a>).</p>
+</li>
+<li>
+<p><strong>ApplySet has been alpha since Kubernetes 1.27 and has not moved.</strong> <a href="https://github.com/kubernetes/enhancements/blob/master/keps/sig-cli/3659-kubectl-apply-prune/kep.yaml">KEP-3659</a> still says <code>stage: alpha</code>, <code>beta: TBD</code>, gated on <code>KUBECTL_APPLYSET=true</code>. Kubernetes is now on v1.37. Do not plan around it.</p>
+</li>
+<li>
+<p><strong>Changing your <code>--field-manager</code> name orphans every field it owned.</strong> SSA tracks ownership by manager <em>name</em>. Pick one, put it in a constant, and treat renaming it as a migration with an explicit <code>--force-conflicts</code> pass (<a href="https://kubernetes.io/docs/reference/using-api/server-side-apply/">server-side apply</a>).</p>
+</li>
+<li>
+<p><strong>Client-side apply hits the 262144-byte annotation limit on large CRDs.</strong> SSA does not use <code>last-applied-configuration</code> at all, which is why Argo CD documents it as the fix (<a href="https://argo-cd.readthedocs.io/en/stable/user-guide/sync-options/#server-side-apply">sync options</a>).</p>
+</li>
+<li>
+<p><strong>Helm 4 latches the apply method per release.</strong> New installs get SSA; anything created by Helm 3 stays on client-side apply after the binary upgrade unless you pass <code>--server-side</code> (<a href="https://helm.sh/community/hips/hip-0023">HIP-0023</a>). Mixed estates therefore have two conflict models running side by side.</p>
+</li>
+<li>
+<p><strong><code>--dry-run=client</code> does not simulate SSA correctly.</strong> HIP-0023 says so explicitly: use <code>--dry-run=server</code>. Since 3.13, that flag works on <code>helm template</code> too (<a href="https://helm.sh/blog/helm-3.13/">Helm 3.13</a>).</p>
+</li>
+<li>
+<p><strong><code>helm registry login</code> in Helm 4 takes a domain, not a URL.</strong> Scheme and path are rejected. CI scripts that pass <code>https://registry.internal/v2/</code> break on upgrade (<a href="https://helm.sh/docs/overview/">Helm 4 overview</a>).</p>
+</li>
+<li>
+<p><strong><code>--post-renderer</code> now takes a plugin name, not an executable path.</strong> Post-renderers became plugins in Helm 4 (<a href="https://helm.sh/community/hips/hip-0026">HIP-0026</a>). Any kustomize-post-render script breaks on upgrade.</p>
+</li>
+<li>
+<p><strong><code>chart-testing</code> (ct) does not support Helm 4</strong> — v3.14.0 still vendors <code>helm.sh/helm/v3</code>. If it is in your pipeline you need a pinned Helm 3 binary for that step, or a replacement built from <code>helm lint</code> + <code>helm unittest</code> + <code>kubeconform</code>.</p>
+</li>
+<li>
+<p><strong><code>kubeval</code> is dead.</strong> Its README opens with <em>"NOTE: This project is no longer maintained, a good replacement is kubeconform."</em> Anything still calling <code>kubeval</code> is validating against a frozen schema set.</p>
+</li>
+<li>
+<p><strong><code>.helmignore</code> does not support <code>**</code> and its <code>!</code> negation is undocumented-to-contradictory.</strong> It uses Go's <code>filepath.Match</code>, not <code>fnmatch</code> (<a href="https://helm.sh/docs/chart_template_guide/helm_ignore_file/">helmignore</a>). Verify with <code>helm package</code> and <code>tar tzf</code>, do not assume gitignore semantics.</p>
+</li>
+<li>
+<p><strong>Helm 3 support ends soon.</strong> Final limited feature release 2026-09-09, security fixes through 2027-02-10 (<a href="https://helm.sh/blog/helm-v3-end-of-life/">Helm 3 EOL</a>). Pin an explicit Helm 4 binary version in CI now, because "whatever the runner image ships" will change under you.</p>
+</li>
+</ol>
+<hr />
+<h2 id="how-this-shows-up-in-cell-lifecycle">How this shows up in cell lifecycle<a class="anchor" href="#how-this-shows-up-in-cell-lifecycle">#</a></h2>
+<p><strong>Cell provisioning.</strong> Terraform builds the cluster and installs exactly one thing: the GitOps agent. Everything after that is rendered manifests. The cell's identity — name, cloud, region, tier, Temporal version — is a values file, and cell provisioning is <code>make render</code> for a new cell plus a commit. That means creating a cell is a reviewable PR whose diff is the full set of Kubernetes objects that will exist, which is a far better review surface than "we ran a script."</p>
+<p><strong>The layering that works.</strong> A <code>temporal-lib</code> library chart owns naming, labels, security contexts, topology spread, and PDB defaults. Component charts (frontend, history, matching, worker) depend on it. A <code>values/base.yaml</code> plus <code>values/&lt;cloud&gt;.yaml</code> plus <code>values/cells/&lt;cell&gt;.yaml</code> stack gives you three reviewable levels of override. Per-cell structural deltas that do not fit the values interface become Kustomize patches on the rendered output rather than more <code>if</code> branches in the chart — this is the discipline that keeps templates readable at 300 cells.</p>
+<p><strong>Multi-cloud is a values-file problem, not a template problem.</strong> Storage classes, load balancer annotations, node selectors, and IRSA/Workload Identity/Azure Workload Identity annotations differ across AWS, GCP, and Azure. Put them in <code>values/aws.yaml</code>, <code>values/gcp.yaml</code>, <code>values/azure.yaml</code>. Resist adding <code>{{ if eq .Values.cloud "aws" }}</code> to templates; the moment you have three of those in one file the chart is unreviewable. The values interface should be cloud-neutral, and the cloud-specific facts should be data.</p>
+<p><strong>Upgrading a cell.</strong> Bump a chart version or a values key, run <code>make render</code>, and the PR diff <em>is</em> the change plan. Reviewers see the actual container image, the actual resource limits, the actual rollout strategy. Roll it out cell by cell by regenerating a subset — which is exactly the "render only these cells" capability your Makefile should expose. Rollback is <code>git revert</code>, which is more auditable than <code>helm rollback</code> and does not depend on a Secret in a cluster that might be the thing that is broken.</p>
+<p><strong>Tearing down a cell.</strong> With rendered manifests, teardown is deleting the cell's directory and letting the GitOps controller prune. This <em>only</em> works if pruning is correctly configured — which is why the pruning section is not optional reading. Verify on a test cell that removing a directory actually removes the objects, and that <code>Prune=confirm</code> or an equivalent guard exists for anything stateful. A namespace deletion that hangs on a finalizer is the common failure, and it will hang your teardown workflow.</p>
+<p><strong>Networking, when another team owns it.</strong> Gateway/Ingress/Service objects are the interface. In a rendered-manifest world the natural split is: the networking team owns a chart or a set of templates, you own the values that parameterize it per cell, and the rendered output makes the boundary auditable. Two teams touching the same objects is exactly the SSA field-ownership scenario — agree on distinct field managers and distinct object sets, and use <code>ignoreDifferences</code> (Argo) rather than fighting over fields.</p>
+<p><strong>Third-party charts are the hard part.</strong> cert-manager, Kyverno, Prometheus, the CNI — all shipped as Helm charts, many assuming hooks and release state. For each one, render it, read the output for hook annotations and <code>lookup</code> calls, and decide: strip and re-express as sync waves, or carve it out and let Flux <code>HelmRelease</code> manage it with real release state. A hybrid is legitimate — "our charts are rendered, these four vendor charts get real Helm releases" — as long as the boundary is written down.</p>
+<hr />
+<h2 id="learning-path">Learning path<a class="anchor" href="#learning-path">#</a></h2>
+<p><strong>Day 1 (3-5 hours).</strong> Read the <a href="https://helm.sh/docs/chart_template_guide/">Chart Template Guide</a> end to end — it is short and it is the actual reference. Run Labs 1 and 2; the <code>nindent</code> lab and the degraded-features lab together give you the two things you need immediately. Then <code>helm template</code> your team's real cell chart with the exact flags your pipeline uses and read the output — all of it. Grep it for <code>lookup</code>, <code>IsUpgrade</code>, <code>Capabilities</code>, and <code>helm.sh/hook</code> and ask what each one does in your pipeline. Find out which GitOps tool applies the output and whether pruning is on.</p>
+<p><strong>Week 1.</strong> Run Labs 3 through 6. Read the <a href="https://helm.sh/docs/chart_template_guide/values_files/">values files</a> and <a href="https://helm.sh/docs/chart_template_guide/subcharts_and_globals/">subcharts and globals</a> pages properly. Read the <a href="https://kubernetes.io/docs/reference/using-api/server-side-apply/">Kubernetes server-side apply doc</a> in full — it is the field-ownership model you now live in. Add a <code>values.schema.json</code> with <code>additionalProperties: false</code> to one chart that lacks one, and write three <code>helm unittest</code> cases for it. Read the <a href="https://akuity.io/blog/the-rendered-manifests-pattern">Akuity rendered-manifests writeup</a> and the <a href="https://github.com/argoproj/argo-cd/blob/master/docs/proposals/manifest-hydrator.md">Argo CD manifest-hydrator proposal</a>, then compare against what your team actually built and note the differences.</p>
+<p><strong>Month 1.</strong> Own the chart CI pipeline. Concretely: get <code>helm lint --strict</code> + <code>helm unittest</code> + <code>kubeconform</code> + <code>conftest</code> + a snapshot-diff gate running on every chart PR, and make the rendered-manifest staleness check blocking. Audit every third-party chart in the estate for hook and <code>lookup</code> dependence and write down the disposition of each. Verify pruning works by deleting a resource from a chart on a test cell and confirming it actually disappears — do not assume. Form an opinion on whether per-cell structural deltas should be more values keys or Kustomize patches, and write it down as a convention before the chart accumulates twenty conditionals. Then check whether <code>chart-testing</code>, <code>helm diff</code>, or any plugin in your pipeline is still pinned to Helm 3, and plan that migration ahead of the September 2026 final release.</p>
+<hr />
+<h2 id="references">References<a class="anchor" href="#references">#</a></h2>
+<ol>
+<li><a href="https://helm.sh/docs/">Helm documentation</a> — canonical. Watch for the <em>"This page has not yet been updated for Helm 4"</em> banner on core topic pages.</li>
+<li><a href="https://helm.sh/docs/overview/">Helm 4 Overview</a> — the authoritative list of breaking changes: flag renames, post-renderer plugins, domain-only registry login, SSA defaults, <code>helm template</code> flag deprecations. Full detail in the <a href="https://helm.sh/docs/changelog/">Helm 4 Changelog</a>.</li>
+<li><a href="https://helm.sh/blog/helm-4-released/">Helm 4 Released</a> — the 2025-11-12 release: Wasm plugins, kstatus, OCI digests, multi-doc values.</li>
+<li><a href="https://helm.sh/blog/helm-v3-end-of-life/">Helm 3 End of Life</a> — the extended timeline (final feature release 2026-09-09, security to 2027-02-10). Supersedes the dates in the Helm 4 release post. Patch versions at <a href="https://github.com/helm/helm/releases">helm/helm releases</a>.</li>
+<li><a href="https://helm.sh/community/hips/hip-0023">HIP-0023 — Server-Side Apply</a> — the rationale, apply-method latching, conflict handling, and why <code>--dry-run=client</code> is inaccurate under SSA. The <a href="https://helm.sh/community/hips/">HIP index</a> is the best source for <em>why</em> Helm 4 did what it did.</li>
+<li><a href="https://helm.sh/docs/topics/charts/">Charts</a> — <code>Chart.yaml</code> field reference, chart types, dependencies, <code>crds/</code> and its verbatim limitations, <code>values.schema.json</code>, <code>import-values</code>.</li>
+<li><a href="https://helm.sh/docs/chart_template_guide/">Chart Template Guide</a> — the primary learning resource; read it linearly once.</li>
+<li><a href="https://helm.sh/docs/chart_template_guide/function_list/">Template function list</a> — every function including <code>lookup</code>, <code>required</code>, <code>toYaml</code>, <code>nindent</code>, and the "always returns an empty response" statement.</li>
+<li><a href="https://helm.sh/docs/chart_template_guide/named_templates/">Named templates</a> — <code>include</code> vs <code>template</code>, the underscore-file rule, global template names, and the <code>nindent</code> correction example.</li>
+<li><a href="https://helm.sh/docs/howto/charts_tips_and_tricks/">Charts Tips and Tricks</a> — the canonical <code>{{- ... | nindent n }}</code> explanation, <code>tpl</code>, <code>required</code>, and <code>SOURCE_DATE_EPOCH</code> for reproducible packaging.</li>
+<li><a href="https://helm.sh/docs/chart_template_guide/values_files/">Values files</a> — the verbatim precedence order.</li>
+<li><a href="https://helm.sh/docs/chart_template_guide/subcharts_and_globals/">Subcharts and globals</a> — the four rules, including "globals require explicit declaration."</li>
+<li><a href="https://helm.sh/docs/chart_template_guide/builtin_objects/">Built-in objects</a> — <code>.Release</code>, <code>.Capabilities</code>, <code>.Chart</code>, <code>.Files</code>, <code>.Values</code>.</li>
+<li><a href="https://helm.sh/docs/helm/helm_template/"><code>helm template</code> reference</a> — <code>--api-versions</code>, <code>--kube-version</code>, <code>--is-upgrade</code>, <code>--include-crds</code>, <code>--no-hooks</code>, <code>--skip-tests</code>. Regenerated 2026-08-14.</li>
+<li><a href="https://helm.sh/docs/topics/charts_hooks/">Chart hooks</a> — the nine hook types, <code>hook-weight</code>, and <code>hook-delete-policy</code> with its <code>before-hook-creation</code> default.</li>
+<li><a href="https://github.com/helm/helm/issues/6443">helm/helm#6443</a> — the design discussion establishing that <code>helm template</code> includes hooks in output but never executes them. The docs never say this outright; this is the citation.</li>
+<li><a href="https://github.com/helm/helm/blob/main/pkg/cmd/template.go"><code>pkg/cmd/template.go</code></a> — source of truth for <code>helm template</code>'s real behavior: no <code>render</code> alias, hardcoded <code>release-name</code>, <code>--is-upgrade</code>, no cluster write path.</li>
+<li><a href="https://helm.sh/docs/topics/library_charts/">Library charts</a> — <code>type: library</code>, and the <code>.Files</code>/<code>.Values</code> scoping differences from application subcharts.</li>
+<li><a href="https://helm.sh/docs/topics/registries/">OCI registries</a> — <code>helm push</code>, <code>oci://</code> dependencies, media types, digest references. Classic repos are covered at <a href="https://helm.sh/docs/topics/chart_repository/">chart repository</a> and are <em>not</em> deprecated.</li>
+<li><a href="https://helm.sh/docs/chart_template_guide/debugging/">Debugging templates</a> — <code>--debug</code>, <code>--dry-run=server</code>, and template isolation. The <a href="https://helm.sh/blog/helm-3.13/">Helm 3.13 blog</a> is where <code>--dry-run=server</code> came from.</li>
+<li><a href="https://helm.sh/docs/helm/helm_get_manifest/"><code>helm get manifest</code></a> — reads Helm's release storage, not a re-render; the drift-detection tool for a mixed estate.</li>
+<li><a href="https://akuity.io/blog/the-rendered-manifests-pattern">The Rendered Manifests Pattern — Akuity</a> — the canonical writeup (Nicholas Morey, Akuity; first published 2023, revised July 2026). Secondary source, but the definitive articulation. <a href="https://github.com/akuity/rendered-manifest-pattern">Companion repo</a>.</li>
+<li><a href="https://github.com/argoproj/argo-cd/blob/master/docs/proposals/manifest-hydrator.md">Argo CD manifest-hydrator proposal</a> — the upstream design doc that turned the pattern into a feature; primary source.</li>
+<li><a href="https://argo-cd.readthedocs.io/en/latest/user-guide/source-hydrator/">Argo CD Source Hydrator</a> — the shipped feature, beta since v3.5.0.</li>
+<li><a href="https://argo-cd.readthedocs.io/en/stable/user-guide/helm/">Argo CD Helm support</a> — the <em>"Helm is only used to inflate charts with <code>helm template</code>"</em> statement and the full Helm→Argo hook mapping table.</li>
+<li><a href="https://argo-cd.readthedocs.io/en/stable/faq/#after-deploying-my-helm-application-with-argo-cd-i-cannot-see-it-with-helm-ls-and-other-helm-commands">Argo CD FAQ — why <code>helm ls</code> shows nothing</a> — the clearest statement of what Argo CD does and does not use from Helm.</li>
+<li><a href="https://argo-cd.readthedocs.io/en/stable/user-guide/sync-options/">Argo CD sync options</a> — <code>Prune=false</code>/<code>confirm</code>, <code>PruneLast</code>, <code>ServerSideApply</code>, <code>Replace</code>, <code>RespectIgnoreDifferences</code>, <code>ClientSideApplyMigration</code>. Automated pruning lives in <a href="https://argo-cd.readthedocs.io/en/stable/user-guide/auto_sync/">auto sync</a>.</li>
+<li><a href="https://argo-cd.readthedocs.io/en/stable/user-guide/resource_tracking/">Argo CD resource tracking</a> and the <a href="https://argo-cd.readthedocs.io/en/stable/operator-manual/upgrading/2.14-3.0/#use-annotation-based-tracking-by-default">3.0 tracking default change</a> — how pruning knows what it owns.</li>
+<li><a href="https://argo-cd.readthedocs.io/en/stable/user-guide/sync-waves/">Argo CD sync waves and phases</a> — the replacement for Helm hook ordering; note the older <code>resource_hooks</code> URL is now a stub.</li>
+<li><a href="https://github.com/argoproj/gitops-engine/blob/master/pkg/sync/common/types.go">gitops-engine sync types</a> — the authoritative list of valid sync options; settles the <code>Prune=true</code> myth.</li>
+<li><a href="https://fluxcd.io/flux/components/helm/helmreleases/">Flux HelmRelease</a> — the counterexample: real Helm release state, real hooks, <code>.disableHooks</code>.</li>
+<li><a href="https://fluxcd.io/flux/components/kustomize/kustomizations/#prune">Flux Kustomization prune</a> and <a href="https://fluxcd.io/flux/components/kustomize/kustomizations/#inventory">inventory</a> — server-side garbage collection with no annotations on managed objects.</li>
+<li><a href="https://fluxcd.io/blog/2026/02/flux-v2.8.0/">Flux v2.8.0 release</a> — Helm 4, SSA and kstatus as new defaults, and the <code>UseHelm3Defaults</code> gate.</li>
+<li><a href="https://kubernetes.io/docs/reference/using-api/server-side-apply/">Kubernetes — Server-Side Apply</a> — field managers, <code>managedFields</code>, conflicts, <code>--force-conflicts</code>, and migration from client-side apply. GA context in the <a href="https://kubernetes.io/blog/2021/08/06/server-side-apply-ga/">1.22 announcement</a>.</li>
+<li><a href="https://kubernetes.io/docs/tasks/manage-kubernetes-objects/declarative-config/#alternative-kubectl-apply-f-directory-prune">Kubernetes — declarative config and <code>--prune</code></a> — the verbatim alpha warning on <code>kubectl apply --prune</code>.</li>
+<li><a href="https://github.com/kubernetes/enhancements/blob/master/keps/sig-cli/3659-kubectl-apply-prune/kep.yaml">KEP-3659 — kubectl apply prune / ApplySet</a> — still <code>stage: alpha</code>, <code>beta: TBD</code>; the proof it has not moved since v1.27.</li>
+<li><a href="https://github.com/helm-unittest/helm-unittest">helm-unittest</a> — snapshot and assertion testing of rendered output; Helm 4 compatible since v1.1.0.</li>
+<li><a href="https://github.com/yannh/kubeconform">kubeconform</a> — fast schema validation of rendered manifests, with CRD schema locations. The successor to the unmaintained kubeval. See also <a href="https://github.com/helm/chart-testing">chart-testing (ct)</a>, which does <em>not</em> yet support Helm 4, and the <a href="https://github.com/databus23/helm-diff">helm-diff plugin</a>.</li>
+<li><a href="https://github.com/kubernetes-sigs/kustomize">Kustomize</a> — structural overlays; embedded in <code>kubectl</code> (v5.8.1 in Kubernetes v1.37). The best complement to templating-only Helm. For the rest of the landscape: <a href="https://timoni.sh/">Timoni</a>, <a href="https://github.com/grafana/tanka">Tanka</a>, <a href="https://cdk8s.io/">cdk8s</a>, <a href="https://kcl-lang.io/">KCL</a>, <a href="https://github.com/helmfile/helmfile">Helmfile</a>.</li>
+<li><a href="https://kubernetes.io/releases/1.37/">Kubernetes v1.37 release notes</a> — current Kubernetes, released 2026-08-26; use it to set <code>--kube-version</code> and <code>kubeconform -kubernetes-version</code> honestly.</li>
+</ol><p class="disclaimer"><strong>Disclaimer.</strong> I wrote this library before I joined Temporal, to ramp up on the areas my new role would likely touch. It contains no internal information &mdash; nothing here was sourced from Temporal&rsquo;s internal knowledge. Temporal is open source, so the programming model and server internals come from public code and documentation, and every statement about Temporal Cloud comes from Temporal&rsquo;s public docs and engineering blog, linked inline. Most of the library is general infrastructure technology &mdash; Go, gRPC, Kubernetes, Karpenter, Terraform, Helm, Vault, cert-manager, GitOps, observability &mdash; that has nothing to do with any one company. Where a guide goes beyond public sources, it says so and labels the claim as inference.</p></article><aside class="rail"><div class="rail-label">On this page</div><a href="#the-mental-model">The mental model</a><a href="#core-concepts">Core concepts</a><a class="h3" href="#chart-anatomy">Chart anatomy</a><a class="h3" href="#go-templates-and-sprig-in-the-depth-you-need">Go templates and Sprig, in the depth you need</a><a class="h3" href="#values">Values</a><a class="h3" href="#library-charts-and-dependencies">Library charts and dependencies</a><a class="h3" href="#the-rendered-manifest--templating-only-pattern">The rendered-manifest / templating-only pattern</a><a class="h3" href="#pruning-and-garbage-collection">Pruning and garbage collection</a><a class="h3" href="#server-side-apply-and-field-management">Server-side apply and field management</a><a class="h3" href="#chart-testing-and-linting--the-workflow-you-will-build">Chart testing and linting — the workflow you will build</a><a class="h3" href="#alternatives-honestly-compared">Alternatives, honestly compared</a><a class="h3" href="#debugging">Debugging</a><a href="#hands-on">Hands-on</a><a class="h3" href="#setup">Setup</a><a class="h3" href="#lab-1--build-a-chart-and-hit-the-nindent-bug-on-purpose">Lab 1 — Build a chart and hit the nindent bug on purpose</a><a class="h3" href="#lab-2--prove-what-dies-without-a-cluster">Lab 2 — Prove what dies without a cluster</a><a class="h3" href="#lab-3--schema-validate-your-values">Lab 3 — Schema-validate your values</a><a class="h3" href="#lab-4--unit-tests">Lab 4 — Unit tests</a><a class="h3" href="#lab-5--convert-to-a-rendered-manifest-workflow-with-a-ci-diff-gate">Lab 5 — Convert to a rendered-manifest workflow with a CI diff gate</a><a class="h3" href="#lab-6--apply-with-ssa-and-force-a-conflict">Lab 6 — Apply with SSA and force a conflict</a><a href="#production-gotchas">Production gotchas</a><a href="#how-this-shows-up-in-cell-lifecycle">How this shows up in cell lifecycle</a><a href="#learning-path">Learning path</a><a href="#references">References</a></aside></div></div><script>
+document.querySelectorAll('.codehilite').forEach(function(block){
+  var wrap=document.createElement('div'); wrap.className='codewrap';
+  block.parentNode.insertBefore(wrap,block); wrap.appendChild(block);
+  var b=document.createElement('button'); b.className='copybtn'; b.textContent='copy';
+  b.addEventListener('click',function(){
+    var txt=block.innerText;
+    if(navigator.clipboard&&navigator.clipboard.writeText){
+      navigator.clipboard.writeText(txt).then(function(){
+        b.textContent='copied'; setTimeout(function(){b.textContent='copy';},1200);
+      }).catch(function(){b.textContent='select manually';});
+    } else {
+      var ta=document.createElement('textarea'); ta.value=txt; document.body.appendChild(ta);
+      ta.select(); try{document.execCommand('copy'); b.textContent='copied';}catch(e){}
+      document.body.removeChild(ta); setTimeout(function(){b.textContent='copy';},1200);
+    }
+  });
+  wrap.appendChild(b);
+});
+
+document.querySelectorAll('.doc table').forEach(function(t){
+  if(t.parentNode.classList.contains('tablewrap'))return;
+  var w=document.createElement('div'); w.className='tablewrap';
+  t.parentNode.insertBefore(w,t); w.appendChild(t);
+});
+
+(function(){
+  var links=Array.prototype.slice.call(document.querySelectorAll('.rail a'));
+  if(!links.length)return;
+  var map={};
+  links.forEach(function(a){
+    var el=document.getElementById(a.getAttribute('href').slice(1));
+    if(el)map[a.getAttribute('href').slice(1)]=a;
+  });
+  var obs=new IntersectionObserver(function(entries){
+    entries.forEach(function(e){
+      var a=map[e.target.id]; if(!a)return;
+      if(e.isIntersecting){
+        links.forEach(function(x){x.classList.remove('here');});
+        a.classList.add('here');
+      }
+    });
+  },{rootMargin:'0px 0px -78% 0px',threshold:0});
+  Object.keys(map).forEach(function(id){
+    var el=document.getElementById(id); if(el)obs.observe(el);
+  });
+})();
+</script>
+<script>/* open external links in a new tab; links within the library stay in this tab */
+document.addEventListener('click',function(e){var a=e.target.closest&&e.target.closest('a[href]');if(!a)return;var h=a.getAttribute('href');if(!h||h.charAt(0)==='#'||h.indexOf('javascript:')===0||a.hasAttribute('download'))return;if(!/^https?:$/.test(a.protocol)||a.host===location.host)return;a.target='_blank';a.rel='noopener';},true);
+</script>
+</body>
+</html>

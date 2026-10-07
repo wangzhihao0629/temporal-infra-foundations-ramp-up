@@ -1,0 +1,1558 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Terraform — Platform Scale, Multi-Cloud, Many Cells - Temporal Cloud Infrastructure Ramp-Up</title>
+<link rel="stylesheet" href="style.css">
+<script>
+(function(){
+  try{
+    var t=localStorage.getItem('rampup-theme');
+    if(t){document.documentElement.setAttribute('data-theme',t);}
+  }catch(e){}
+  window.__toggleTheme=function(){
+    var el=document.documentElement;
+    var cur=el.getAttribute('data-theme');
+    if(!cur){
+      cur=window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';
+    }
+    var next=cur==='dark'?'light':'dark';
+    el.setAttribute('data-theme',next);
+    try{localStorage.setItem('rampup-theme',next);}catch(e){}
+  };
+})();
+</script>
+
+</head>
+<body>
+<div class="shell"><aside class="sidebar">
+  <div class="brand"><a href="../index.html">
+    <div class="brand-title">Temporal Cloud Infrastructure Ramp-Up</div>
+    <div class="brand-sub">New-role ramp-up &middot; public sources only</div>
+  </a></div>
+  <div class="nav-label">Guides</div>
+  <nav class="nav"><a href="01-golang.html"><span class="num">01</span><span>Go</span></a><a href="02-grpc.html"><span class="num">02</span><span>gRPC &amp; Protobuf</span></a><a href="03-multicloud-aws-gcp-azure.html"><span class="num">03</span><span>Multi-Cloud</span></a><a href="04-managed-kubernetes-eks-gke-aks.html"><span class="num">04</span><span>Managed Kubernetes</span></a><a href="05-cni-and-host-networking.html"><span class="num">05</span><span>CNI &amp; Host Networking</span></a><a href="06-karpenter.html"><span class="num">06</span><span>Karpenter</span></a><a href="07-kyverno.html"><span class="num">07</span><span>Kyverno</span></a><a href="08-terraform.html" class="active"><span class="num">08</span><span>Terraform</span></a><a href="09-helm.html"><span class="num">09</span><span>Helm</span></a><a href="10-vault.html"><span class="num">10</span><span>Vault</span></a><a href="11-cert-manager-and-pki.html"><span class="num">11</span><span>cert-manager &amp; PKI</span></a><a href="12-cell-lifecycle-synthesis.html"><span class="num">12</span><span>Cell Lifecycle</span></a><a href="13-gitops-argocd-flux.html"><span class="num">13</span><span>GitOps</span></a><a href="14-observability-for-cells.html"><span class="num">14</span><span>Observability</span></a><a href="15-temporal-programming-model.html"><span class="num">15</span><span>Temporal: Programming Model</span></a><a href="16-temporal-server-internals.html"><span class="num">16</span><span>Temporal Server Internals</span></a><a href="17-cell-based-architecture.html"><span class="num">17</span><span>Cell-Based Architecture</span></a></nav>
+  <div class="nav-label" style="margin-top:1rem">Practice</div>
+  <nav class="nav"><a href="../drill.html"><span class="num">&#9670;</span><span>Drill deck</span></a></nav>
+</aside><div class="main"><article class="doc"><div class="topbar">
+  <div class="crumbs"><span class="pill">Guide 08</span><span class="pill">40 refs</span><span class="pill">13,275 words</span></div>
+  <div style="display:flex;gap:.5rem;align-items:center">
+    <span>~66 min read</span>
+    <button class="iconbtn" onclick="__toggleTheme()">theme</button>
+  </div>
+</div><h1>Terraform — Platform Scale, Multi-Cloud, Many Cells</h1>
+<div class="lede"><p><strong>Why this matters.</strong> Cell lifecycle is, mechanically, the problem of applying the same infrastructure definition several hundred times across AWS, GCP, and Azure, with per-cell variation, and then being able to upgrade or delete any one of them without touching the other 299. Terraform is the tool most platform teams reach for, and the thing that actually determines whether that works is not HCL — it is state layout. State is where identity lives, state is what locks, state is what determines blast radius, and state is what you will be doing surgery on at 2 a.m. when a cell provision half-failed. You will be reading and writing modules on day one. The modules are the easy part. Read the state sections twice.</p></div>
+<p>Everything below was verified against primary sources on <strong>2026-08-29</strong>. Where I could not verify something, I say so.</p>
+<blockquote>
+<p><strong>Stale-content trap, read this first.</strong> Four things that most tutorials and most LLM-generated Terraform get wrong as of today:</p>
+<ol>
+<li><strong>CDK for Terraform is dead.</strong> HashiCorp's own page says it verbatim: <em>"The Cloud Development Kit for Terraform is deprecated as of December 10, 2025. HashiCorp no longer supports or maintains the Cloud Development Kit for Terraform"</em> (<a href="https://developer.hashicorp.com/terraform/cdktf">CDKTF docs</a>). The repo was <a href="https://github.com/hashicorp/terraform-cdk">archived on the same date</a>. Do not start anything on it.</li>
+<li><strong>S3 backend state locking no longer needs DynamoDB.</strong> <code>use_lockfile</code> landed in Terraform <a href="https://github.com/hashicorp/terraform/releases/tag/v1.10.0">1.10.0</a> and <code>dynamodb_table</code> is deprecated as of <a href="https://github.com/hashicorp/terraform/releases/tag/v1.11.0">1.11.0</a>. Every blog post that tells you to create a lock table is out of date (<a href="https://developer.hashicorp.com/terraform/language/backend/s3">S3 backend</a>).</li>
+<li><strong>Terraform Stacks is GA but is not an open-source feature.</strong> There is no <code>terraform stacks plan</code> and no <code>terraform stacks apply</code> in the CLI — plan and apply execute in HCP Terraform or Terraform Enterprise 2.0+ (<a href="https://developer.hashicorp.com/terraform/cli/commands/stacks"><code>terraform stacks</code> command reference</a>). If your org is not on HCP/TFE, Stacks is not on the menu.</li>
+<li><strong><code>tfsec</code> is retired.</strong> It was folded into Trivy in 2023; the maintainers wrote <em>"tfsec will continue to remain available for the time being, although our engineering attention will be directed at Trivy going forward"</em> (<a href="https://github.com/aquasecurity/tfsec/discussions/1994">tfsec discussion #1994</a>). Use <code>trivy config</code>.</li>
+</ol>
+<p>Current stable is <strong>Terraform 1.16.0, released 2026-08-26</strong> (<a href="https://github.com/hashicorp/terraform/releases/tag/v1.16.0">release tag</a>). Current OpenTofu stable is <strong>1.12.6, released 2026-08-19</strong> (<a href="https://github.com/opentofu/opentofu/releases/tag/v1.12.6">release tag</a>).</p>
+</blockquote>
+<hr />
+<h2 id="the-mental-model">The mental model<a class="anchor" href="#the-mental-model">#</a></h2>
+<p>Hold six ideas.</p>
+<p><strong>1. Terraform is a graph compiler with a persistent symbol table.</strong> Configuration is not a script. Terraform parses every <code>.tf</code> file in the directory, builds a DAG from the references between blocks, and walks it. Ordering in the file is meaningless; <code>depends_on</code> and expression references are the only ordering primitives. The "symbol table" — the mapping from configuration address (<code>module.cell.aws_eks_cluster.this</code>) to real-world object ID (<code>arn:aws:eks:...</code>) — is the state file. Everything hard about Terraform is a consequence of that table being persistent, shared, and mutable.</p>
+<p><strong>2. State is the source of truth for <em>identity</em>, not for <em>reality</em>.</strong> State says "the address <code>aws_eks_cluster.this</code> corresponds to object X." It also caches X's attributes, but that cache is refreshed at plan time and is not authoritative. When you delete a resource from configuration, Terraform does not "forget" it — it looks up the address in state, finds an object, and plans a destroy. This is why removing a <code>for_each</code> key deletes infrastructure, why <code>count</code> index shifts are catastrophic, and why <code>moved</code>/<code>import</code>/<code>removed</code> blocks exist at all: they are edits to the identity map that produce no infrastructure change.</p>
+<p><strong>3. The plan is a value, and it can be persisted.</strong> <code>terraform plan -out=tfplan</code> writes an opaque artifact containing the config, the prior state, and the resolved diff. <code>terraform apply tfplan</code> executes exactly that, with no re-planning and no confirmation prompt (<a href="https://developer.hashicorp.com/terraform/cli/commands/apply#saved-plan-mode">apply — saved plan mode</a>). This is the entire basis of plan-in-PR/apply-on-merge. It is also why plan files are sensitive artifacts: HashiCorp says <em>"You should therefore treat any saved plan files as potentially-sensitive artifacts"</em> (<a href="https://developer.hashicorp.com/terraform/cli/commands/plan#out-filename">plan <code>-out</code></a>).</p>
+<p><strong>4. Providers are plugins with their own configuration lifecycle, and provider configuration cannot depend on unknown values.</strong> The rule, verbatim: <em>"You can use expressions to configure provider arguments, but you can only reference values that Terraform knows before it applies your configuration"</em> (<a href="https://developer.hashicorp.com/terraform/language/block/provider#provider-specific-arguments">provider block</a>). This single sentence is why you cannot create a Kubernetes cluster and manage its resources in one apply, and it dictates the entire shape of a cell pipeline.</p>
+<p><strong>5. Blast radius equals state file.</strong> A <code>terraform apply</code> can only damage what is in the state it holds. One state per cell means a bad module change breaks one cell at a time. One state for all cells means a bad module change is a fleet-wide outage and a 40-minute plan. Choose deliberately, and choose before you have 300 cells, because splitting state later is manual surgery.</p>
+<p><strong>6. Terraform is a <em>convergence</em> tool with no notion of rollout.</strong> There is no canary, no wave, no progressive delivery, no health check that reverts. If you need "upgrade 5 cells, watch, then 50," that logic lives in your orchestrator — a pipeline, a Temporal workflow, Terragrunt, Stacks deployment groups — not in Terraform. Recognizing that boundary early saves you from trying to build rollout semantics out of <code>count</code> and <code>-target</code>.</p>
+<div class="codehilite"><pre><span></span><code>   .tf files ──► parse ──► build DAG ──► for each node:
+                              │            ┌─────────────────────────────┐
+                              │            │ state entry?                │
+                              │            │  no  → CREATE               │
+   ┌──────────────┐           │            │  yes → refresh from provider│
+   │ state (S3/…) ├───────────┤            │        diff vs config       │
+   │  addr → id   │           │            │        → NOOP/UPDATE/REPLACE│
+   └──────┬───────┘           │            │ config gone, state present  │
+          │                   │            │       → DESTROY             │
+          │                   ▼            └─────────────────────────────┘
+          │              plan artifact  ──────► apply ──► provider CRUD
+          │                                                    │
+          └────────────────── write new state ◄────────────────┘
+                    (lock held for the whole apply)
+</code></pre></div>
+
+<hr />
+<h2 id="core-concepts">Core concepts<a class="anchor" href="#core-concepts">#</a></h2>
+<h3 id="the-planapply-cycle-precisely">The plan/apply cycle, precisely<a class="anchor" href="#the-planapply-cycle-precisely">#</a></h3>
+<p><code>terraform init</code> resolves modules and providers, writes <code>.terraform/</code>, and creates or verifies <code>.terraform.lock.hcl</code>. <code>terraform plan</code> acquires a state lock (read), refreshes each managed resource against its provider, computes the diff, and releases. <code>terraform apply</code> acquires a write lock, walks the diff graph with a default concurrency of <strong>10</strong> (<code>-parallelism=n</code>, <a href="https://developer.hashicorp.com/terraform/cli/commands/apply#parallelism-n">documented default 10</a>), and persists new state after each resource completes — not at the end. That last detail is why a killed apply leaves partially-applied state rather than nothing, and why the lock matters more than people think.</p>
+<p>Three plan modes matter operationally:</p>
+<table>
+<thead>
+<tr>
+<th>Mode</th>
+<th>Invocation</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Normal</td>
+<td><code>terraform plan</code></td>
+<td>Refresh, then diff config vs refreshed state</td>
+</tr>
+<tr>
+<td>Refresh-only</td>
+<td><code>terraform plan -refresh-only</code></td>
+<td>Diff <em>state</em> vs reality; propose state updates only. Added in v0.15.4 (<a href="https://developer.hashicorp.com/terraform/cli/commands/plan#planning-modes">planning modes</a>)</td>
+</tr>
+<tr>
+<td>Destroy</td>
+<td><code>terraform plan -destroy</code></td>
+<td>Plan destruction of everything in state</td>
+</tr>
+</tbody>
+</table>
+<p><code>terraform refresh</code> still exists but is deprecated: <em>"This command is deprecated. Instead, add the <code>-refresh-only</code> flag to <code>terraform apply</code> and <code>terraform plan</code> commands."</em> The docs also spell out why, and it is a genuinely important failure mode: <em>"If you have misconfigured credentials for one or more providers, Terraform may be misled into thinking that all of the managed objects have been deleted, causing it to remove all of the tracked objects without any confirmation prompt"</em> (<a href="https://developer.hashicorp.com/terraform/cli/commands/refresh">refresh</a>).</p>
+<p>For automation, <code>-detailed-exitcode</code> is the contract: <strong>0</strong> = success, empty diff; <strong>1</strong> = error; <strong>2</strong> = success, non-empty diff (<a href="https://developer.hashicorp.com/terraform/cli/commands/plan#detailed-exitcode">plan <code>-detailed-exitcode</code></a>). Note it is documented on <code>plan</code> only.</p>
+<h3 id="hcl-in-the-depth-you-actually-need">HCL, in the depth you actually need<a class="anchor" href="#hcl-in-the-depth-you-actually-need">#</a></h3>
+<h4 id="resources-data-sources-locals-outputs">Resources, data sources, locals, outputs</h4>
+<div class="codehilite"><pre><span></span><code># A resource is a managed object: Terraform creates, updates, and destroys it.
+resource &quot;aws_eks_cluster&quot; &quot;this&quot; {
+  name     = local.cell_name
+  role_arn = aws_iam_role.cluster.arn
+  version  = var.kubernetes_version
+
+  vpc_config {
+    subnet_ids              = var.private_subnet_ids
+    endpoint_private_access = true
+    endpoint_public_access  = false
+  }
+}
+
+# A data source is a read. It is refreshed on every plan and is a plan-time
+# dependency — if it cannot be read, the plan fails.
+data &quot;aws_caller_identity&quot; &quot;current&quot; {}
+
+# Locals are named expressions, evaluated lazily, scoped to the module.
+locals {
+  account_id = data.aws_caller_identity.current.account_id
+  cell_name  = &quot;${var.cell_prefix}-${var.cloud}-${var.region}-${var.cell_index}&quot;
+
+  # Locals are the right place for the cross-cutting policy of a module.
+  common_tags = merge(var.extra_tags, {
+    &quot;example.com/cell&quot;        = local.cell_name
+    &quot;example.com/managed-by&quot;  = &quot;terraform&quot;
+    &quot;example.com/cell-tier&quot;   = var.cell_tier
+  })
+}
+
+# Outputs are the module&#39;s public API. Type them (Terraform 1.15+) and mark
+# anything secret.
+output &quot;cluster_endpoint&quot; {
+  description = &quot;EKS API server endpoint for this cell.&quot;
+  value       = aws_eks_cluster.this.endpoint
+  type        = string
+}
+</code></pre></div>
+
+<p>Typed <code>output</code> blocks and <code>deprecated</code> markers on variables and outputs both landed in <strong>1.15.0</strong> (<a href="https://github.com/hashicorp/terraform/blob/v1.15/CHANGELOG.md">v1.15 changelog</a>). <code>deprecated</code> is genuinely useful for a platform team: you can retire a module input across 300 callers with a warning instead of a breakage.</p>
+<h4 id="variables-validation-and-the-type-system">Variables, validation, and the type system</h4>
+<div class="codehilite"><pre><span></span><code>variable &quot;cell&quot; {
+  description = &quot;Full specification of one cell.&quot;
+
+  type = object({
+    name   = string
+    cloud  = string
+    region = string
+
+    # optional() with a default is the single most useful type-system feature
+    # for module interfaces. Terraform 1.3+.
+    kubernetes_version = optional(string, &quot;1.34&quot;)
+    node_pools = optional(map(object({
+      instance_type = string
+      min_size      = optional(number, 1)
+      max_size      = optional(number, 10)
+      spot          = optional(bool, false)
+      taints        = optional(list(object({
+        key    = string
+        value  = string
+        effect = string
+      })), [])
+    })), {})
+
+    # Nested optional objects need a default at every level you want to omit.
+    networking = optional(object({
+      pod_cidr      = optional(string, &quot;10.244.0.0/16&quot;)
+      service_cidr  = optional(string, &quot;10.96.0.0/12&quot;)
+      enable_ipv6   = optional(bool, false)
+    }), {})
+  })
+
+  validation {
+    condition     = contains([&quot;aws&quot;, &quot;gcp&quot;, &quot;azure&quot;], var.cell.cloud)
+    error_message = &quot;cell.cloud must be one of aws, gcp, azure.&quot;
+  }
+
+  validation {
+    condition     = can(regex(&quot;^[a-z0-9-]{3,32}$&quot;, var.cell.name))
+    error_message = &quot;cell.name must be 3-32 chars of [a-z0-9-].&quot;
+  }
+
+  # Terraform 1.9+ lets a validation reference other variables and data
+  # sources, which is how you express cross-field invariants.
+  validation {
+    condition = !var.cell.networking.enable_ipv6 || var.cell.cloud != &quot;azure&quot;
+    error_message = &quot;IPv6 cells are not supported on Azure yet.&quot;
+  }
+}
+</code></pre></div>
+
+<p>Version floors worth memorizing, all from the <a href="https://developer.hashicorp.com/terraform/language/validate#requirements">validation requirements table</a>:</p>
+<table>
+<thead>
+<tr>
+<th>Feature</th>
+<th>Since</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>variable</code> <code>validation</code> blocks</td>
+<td>0.13.0</td>
+<td>Single-variable only until 1.9</td>
+</tr>
+<tr>
+<td>Cross-variable / data-source validation</td>
+<td>1.9.0</td>
+<td>Lets you validate <code>var.a</code> against <code>var.b</code></td>
+</tr>
+<tr>
+<td><code>precondition</code> / <code>postcondition</code></td>
+<td>1.2.0</td>
+<td>Inside <code>lifecycle</code> on a resource, or in <code>output</code></td>
+</tr>
+<tr>
+<td><code>check</code> blocks with <code>assert</code></td>
+<td>1.5.0</td>
+<td>Non-blocking assertions; produce warnings, not errors (<a href="https://developer.hashicorp.com/terraform/language/block/check">check</a>)</td>
+</tr>
+<tr>
+<td><code>optional()</code> attributes with defaults</td>
+<td>1.3.0</td>
+<td><a href="https://developer.hashicorp.com/terraform/language/expressions/type-constraints#optional-object-type-attributes">type constraints</a></td>
+</tr>
+<tr>
+<td><code>nullable = false</code> on a variable</td>
+<td>1.1.0</td>
+<td>Rejects an explicit <code>null</code>; distinct from having a default</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Where the type system bites in module interfaces.</strong> Three specific traps:</p>
+<ul>
+<li><strong>Object types are structural and strict.</strong> If a caller passes an extra attribute not in your <code>object({...})</code>, the plan fails. That is usually what you want, but it means adding an attribute to a shared module's input object is a <em>non-breaking</em> change while removing one is breaking — the reverse of what people assume.</li>
+<li><strong><code>optional()</code> defaults do not propagate into nested objects unless you also default the nesting level.</strong> In the example above, omitting <code>networking</code> entirely works only because <code>networking</code> itself has <code>optional(..., {})</code>. Without that outer default, omitting it yields <code>null</code> and <code>var.cell.networking.pod_cidr</code> explodes.</li>
+<li><strong><code>map</code> vs <code>object</code> in a <code>for_each</code> source.</strong> <code>for_each</code> requires a map or a set of strings. It cannot take a list, and it <em>does not implicitly convert</em> a list or tuple to a set — you must wrap with <code>toset()</code> (<a href="https://developer.hashicorp.com/terraform/language/meta-arguments/for_each"><code>for_each</code></a>). It also cannot take unknown or sensitive values, which is the root of the most common "Invalid for_each argument" failure.</li>
+</ul>
+<h4 id="for_each-vs-count--and-the-index-shift-disaster"><code>for_each</code> vs <code>count</code> — and the index-shift disaster</h4>
+<p>The current docs state the choice mildly: <em>"Use <code>for_each</code> when some instance arguments must have distinct values that can't be directly derived from an integer. Use the <code>count</code> argument when you want to create nearly identical instances"</em> (<a href="https://developer.hashicorp.com/terraform/language/meta-arguments/for_each"><code>for_each</code></a>, <a href="https://developer.hashicorp.com/terraform/language/meta-arguments/count"><code>count</code></a>).</p>
+<p>That undersells it. The reason <code>for_each</code> is almost always right is identity. <code>count</code> addresses instances by <em>position</em> — <code>aws_subnet.this[0]</code>, <code>[1]</code>, <code>[2]</code>. <code>for_each</code> addresses them by <em>key</em> — <code>aws_subnet.this["us-east-1a"]</code>. When the input list changes shape, position-addressed resources get reassigned to different real-world objects.</p>
+<p>HashiCorp documented this explicitly, though the section was removed from the current docs and now survives only at a pinned version URL: <em>"If an element was removed from the middle of the list, every instance after that element would see its <code>subnet_id</code> value change, resulting in more remote object changes than intended"</em> (<a href="https://developer.hashicorp.com/terraform/language/v1.11.x/meta-arguments/count#when-to-use-for_each-instead-of-count">v1.11.x count docs — When to Use <code>for_each</code> Instead of <code>count</code></a>). Since a changed <code>subnet_id</code> on most resources forces replacement, "more remote object changes than intended" means, in practice, "Terraform destroys and recreates every node pool after the one you removed."</p>
+<div class="codehilite"><pre><span></span><code># WRONG for anything with identity. Removing &quot;cell-b&quot; from the list renumbers
+# cell-c into index 1 and Terraform plans to replace it.
+variable &quot;cells&quot; { type = list(string) }
+
+resource &quot;aws_eks_cluster&quot; &quot;bad&quot; {
+  count = length(var.cells)
+  name  = var.cells[count.index]
+}
+
+# RIGHT. Removing &quot;cell-b&quot; destroys exactly one cluster.
+resource &quot;aws_eks_cluster&quot; &quot;good&quot; {
+  for_each = toset(var.cells)
+  name     = each.key
+}
+
+# For richer per-instance config, key on a stable identifier and carry the
+# object as the value.
+variable &quot;cell_specs&quot; {
+  type = map(object({
+    region = string
+    tier   = string
+  }))
+}
+
+resource &quot;aws_eks_cluster&quot; &quot;fleet&quot; {
+  for_each = var.cell_specs
+  name     = each.key
+  tags     = { tier = each.value.tier }
+}
+</code></pre></div>
+
+<p>The one case where <code>count</code> is genuinely correct is the boolean toggle — <code>count = var.enabled ? 1 : 0</code> — because there is only ever index 0 and its identity never shifts. Even there, be aware you have committed to <code>aws_thing.this[0]</code> as the address forever.</p>
+<p><strong><code>for_each</code> keys must be known at plan time.</strong> If your keys come from another resource's computed attributes, the plan fails with "The <code>for_each</code> value depends on resource attributes that cannot be determined until apply." The fix is either to key on something static (a variable) or to split the apply into two stages. Terraform has an experimental "deferred actions" feature that would relax this — <code>-allow-deferral</code> on plan, allowing unknown <code>count</code>/<code>for_each</code> — but it is explicitly listed under <code>EXPERIMENTS</code> and is <strong>not in stable 1.16</strong> (<a href="https://raw.githubusercontent.com/hashicorp/terraform/main/CHANGELOG.md">main CHANGELOG</a>). It <em>is</em> GA inside Terraform Stacks as "deferred changes" (<a href="https://developer.hashicorp.com/terraform/cloud-docs/stacks/deploy/runs#deferred-changes">Stacks runs</a>), which is one of the few concrete reasons to care about Stacks.</p>
+<h4 id="dynamic-blocks"><code>dynamic</code> blocks</h4>
+<p><code>dynamic</code> generates repeatable <em>nested blocks</em> (not resources) from a collection.</p>
+<div class="codehilite"><pre><span></span><code>resource &quot;aws_security_group&quot; &quot;cell&quot; {
+  name   = local.cell_name
+  vpc_id = var.vpc_id
+
+  dynamic &quot;ingress&quot; {
+    for_each = var.ingress_rules   # map(object({...}))
+    content {
+      description = ingress.value.description
+      from_port   = ingress.value.port
+      to_port     = ingress.value.port
+      protocol    = &quot;tcp&quot;
+      cidr_blocks = ingress.value.cidrs
+    }
+  }
+}
+</code></pre></div>
+
+<p>HashiCorp's own caution is worth quoting because it is routinely ignored: <em>"Overuse of <code>dynamic</code> blocks can make configuration hard to read and maintain, so we recommend using them only when you need to hide details in order to build a clean user interface for a re-usable module. Always write nested blocks out literally where possible"</em> (<a href="https://developer.hashicorp.com/terraform/language/expressions/dynamic-blocks#best-practices-for-dynamic-blocks">dynamic blocks</a>). In a cell module the honest test is: is this block varying <em>per cell</em>, or am I just avoiding typing? If it does not vary, write it out.</p>
+<h4 id="moved-import-removed--state-edits-as-code"><code>moved</code>, <code>import</code>, <code>removed</code> — state edits as code</h4>
+<p>These three blocks replace the CLI state commands for the common cases, and they are reviewable, plannable, and idempotent. Version floors: <code>moved</code> in <strong>1.1</strong>, <code>import</code> in <strong>1.5</strong>, <code>removed</code> in <strong>1.7</strong>, <code>import</code> with <code>for_each</code> in <strong>1.7</strong>, and <code>import</code> blocks <em>inside modules</em> only in <strong>1.16</strong>.</p>
+<div class="codehilite"><pre><span></span><code># Refactoring: you renamed a resource or moved it into a submodule.
+# Terraform updates the state address; no infrastructure changes.
+moved {
+  from = aws_eks_cluster.this
+  to   = module.control_plane.aws_eks_cluster.this
+}
+
+# Adopting existing infrastructure. -generate-config-out will write the
+# resource block for you from the live object.
+import {
+  to = aws_eks_cluster.legacy_cell
+  id = &quot;temporal-cell-042&quot;
+}
+
+# Bulk import, 1.7+.
+import {
+  for_each = var.adopted_cells   # map(string) of address key -&gt; real id
+  to       = aws_eks_cluster.fleet[each.key]
+  id       = each.value
+}
+
+# Stop managing something without destroying it.
+removed {
+  from = aws_iam_role.old_cluster_role
+  lifecycle { destroy = false }
+}
+</code></pre></div>
+
+<p>Generate config for an import with:</p>
+<div class="codehilite"><pre><span></span><code>terraform plan -generate-config-out<span class="o">=</span>generated.tf
+</code></pre></div>
+
+<p>The docs now actively steer you here: <em>"Instead of using the <code>terraform state rm</code> command, you can use <code>removed</code> blocks to remove resources"</em> (<a href="https://developer.hashicorp.com/terraform/cli/commands/state/rm"><code>terraform state rm</code></a>). Notably, the <code>terraform state mv</code> page does <strong>not</strong> carry the equivalent steer toward <code>moved</code>, and <code>terraform state replace-provider</code> has no block equivalent at all.</p>
+<h4 id="lifecycle"><code>lifecycle</code></h4>
+<p>The full v1.16 argument set is <code>create_before_destroy</code>, <code>prevent_destroy</code>, <code>ignore_changes</code>, <code>replace_triggered_by</code>, <code>precondition</code>, <code>postcondition</code>, <code>action_trigger</code>, and <code>destroy</code> (<a href="https://developer.hashicorp.com/terraform/language/meta-arguments/lifecycle">lifecycle</a>).</p>
+<div class="codehilite"><pre><span></span><code>resource &quot;aws_eks_cluster&quot; &quot;this&quot; {
+  # ...
+
+  lifecycle {
+    # Never let a plan destroy this. Terraform errors instead of planning.
+    prevent_destroy = true
+
+    # Do not diff on fields mutated by controllers or by humans out of band.
+    ignore_changes = [
+      tags[&quot;kubernetes.io/cluster/autoscaler&quot;],
+      vpc_config[0].security_group_ids,
+    ]
+
+    # Force replacement when an upstream marker changes, even though no
+    # attribute of this resource changed.
+    replace_triggered_by = [terraform_data.cell_generation]
+
+    precondition {
+      condition     = length(var.private_subnet_ids) &gt;= 2
+      error_message = &quot;EKS requires subnets in at least two AZs.&quot;
+    }
+  }
+}
+</code></pre></div>
+
+<p>Two caveats the docs call out and people miss:</p>
+<ul>
+<li><em>"All <code>lifecycle</code> settings affect how Terraform constructs and traverses the dependency graph. As a result, only literal values can be used"</em> — you cannot compute <code>prevent_destroy</code> from a variable in Terraform (OpenTofu 1.12 added dynamic <code>prevent_destroy</code>; Terraform has not).</li>
+<li><em>"Except for <code>create_before_destroy</code>, Terraform does not explicitly record a resource's <code>lifecycle</code> rule to state."</em> So removing <code>prevent_destroy</code> from config and re-planning immediately allows the destroy — it is a guard on the plan, not a property of the object.</li>
+</ul>
+<p><code>create_before_destroy</code> is the one that will bite you at cell scale: it is <em>contagious</em>. If resource A has it, every resource A depends on must effectively also create-before-destroy, and Terraform propagates it through the graph. Turning it on for a node group can silently change the replacement order of the whole VPC subtree. Name-collision failures (<code>AlreadyExists</code>) are the usual symptom, so pair it with a <code>random_id</code>/<code>name_prefix</code> naming scheme.</p>
+<p><code>destroy = false</code> is new in <strong>1.16.0</strong>: <em>"Set to <code>false</code> to remove a resource from state without destroying the actual infrastructure resource."</em> OpenTofu shipped the same thing in 1.12 (2026-05-14), so this is parity, not a Terraform first.</p>
+<h4 id="provisioners-and-why-to-avoid-them">Provisioners, and why to avoid them</h4>
+<p>The current docs say <em>"You should exhaust all alternatives before using provisioners in your configurations"</em> and <em>"Terraform is primarily designed for immutable infrastructure operations, so we strongly recommend using purpose-built solutions to perform post-apply operations"</em> (<a href="https://developer.hashicorp.com/terraform/language/provisioners">provisioners</a>). The famous "Provisioners are a Last Resort" heading was removed in 1.16 but the classic phrasing lives on at <a href="https://developer.hashicorp.com/terraform/language/v1.11.x/resources/provisioners/syntax#provisioners-are-a-last-resort">the v1.11.x URL</a>.</p>
+<p>The engineering reason is sharper than "they're discouraged": <strong>a provisioner's effect is not in state.</strong> Terraform records that the resource exists; it records nothing about whether your <code>local-exec</code> succeeded or what it did. So a provisioner is invisible to plan, cannot be diffed, cannot be reconciled, and on failure taints the resource — forcing a full replace of the underlying infrastructure to retry a shell command. In a cell pipeline that means a failed <code>kubectl apply</code> provisioner replaces your EKS cluster.</p>
+<p>The alternatives, in preference order: a real provider resource; an out-of-band step in your pipeline that runs <em>after</em> Terraform; a <code>terraform_data</code> resource with a <code>triggers_replace</code> to sequence things without shelling out; and only then a provisioner. Note the docs now point at <a href="https://developer.hashicorp.com/terraform/language/resources/terraform-data"><code>terraform_data</code></a> rather than <code>null_resource</code> for the "provisioner without a resource" pattern — <code>null_resource</code> is no longer referenced in 1.16 docs at all.</p>
+<h4 id="templatefile-and-encoding-functions"><code>templatefile</code> and encoding functions</h4>
+<div class="codehilite"><pre><span></span><code># Prefer this:
+locals {
+  cell_config = yamlencode({
+    cellName = local.cell_name
+    region   = var.region
+    services = [for s in var.services : { name = s.name, replicas = s.replicas }]
+  })
+}
+
+# Over hand-rolled string templating of structured data.
+resource &quot;local_file&quot; &quot;cell_config&quot; {
+  filename = &quot;${path.module}/out/${local.cell_name}.yaml&quot;
+  content  = local.cell_config
+}
+</code></pre></div>
+
+<p>HashiCorp's guidance on <code>templatefile</code> says the quiet part out loud: <em>"If the string you want to generate will be in JSON or YAML syntax, it's often tricky and tedious to write a template that will generate valid JSON or YAML that will be interpreted correctly when using lots of individual interpolation sequences and directives."</em> Instead: <em>"you can write a template that consists only of a single interpolated call to either <code>jsonencode</code> or <code>yamlencode</code>"</em> (<a href="https://developer.hashicorp.com/terraform/language/functions/templatefile#generating-json-or-yaml-from-a-template">templatefile</a>). The recommended template filename extension is <code>.tftpl</code>.</p>
+<p><code>templatefile</code> is still the right tool for genuinely textual output — cloud-init, an nginx config, a shell bootstrap script:</p>
+<div class="codehilite"><pre><span></span><code>user_data = templatefile(&quot;${path.module}/templates/node-bootstrap.sh.tftpl&quot;, {
+  cluster_name     = aws_eks_cluster.this.name
+  cluster_endpoint = aws_eks_cluster.this.endpoint
+  cluster_ca       = aws_eks_cluster.this.certificate_authority[0].data
+  extra_kubelet_args = join(&quot; &quot;, var.kubelet_args)
+})
+</code></pre></div>
+
+<p>Note the difference from <code>file()</code>: <code>templatefile</code> reads and renders at plan time, so the file must exist in the module. There is no way to template a file that Terraform itself will generate later in the same apply — another instance of the "known at plan time" rule.</p>
+<h3 id="state-management-at-scale">State management at scale<a class="anchor" href="#state-management-at-scale">#</a></h3>
+<p>This is the section that determines whether a 300-cell platform works.</p>
+<h4 id="backends-and-locking">Backends and locking</h4>
+<table>
+<thead>
+<tr>
+<th>Backend</th>
+<th>Locking mechanism</th>
+<th>Extra infrastructure</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>s3</code></td>
+<td><code>use_lockfile = true</code> writes <code>&lt;key&gt;.tflock</code> in the same bucket</td>
+<td><strong>None</strong> since TF 1.10</td>
+<td><code>dynamodb_table</code> deprecated in 1.11.0; both can be set simultaneously for migration (<a href="https://developer.hashicorp.com/terraform/language/backend/s3">s3 backend</a>)</td>
+</tr>
+<tr>
+<td><code>gcs</code></td>
+<td>Lock object <code>&lt;prefix&gt;/&lt;name&gt;.tflock</code>, created with a <code>DoesNotExist</code> precondition</td>
+<td>None</td>
+<td>Docs: <em>"This backend supports state locking"</em> (<a href="https://developer.hashicorp.com/terraform/language/backend/gcs">gcs backend</a>)</td>
+</tr>
+<tr>
+<td><code>azurerm</code></td>
+<td>Blob lease (<code>LeaseDuration: -1</code>), lock info in blob metadata <code>terraformlockid</code></td>
+<td>None</td>
+<td><em>"supports state locking and consistency checking with Azure Blob Storage native capabilities"</em> (<a href="https://developer.hashicorp.com/terraform/language/backend/azurerm">azurerm backend</a>)</td>
+</tr>
+<tr>
+<td><code>http</code></td>
+<td>Optional, via <code>lock_address</code>/<code>unlock_address</code></td>
+<td>Your server</td>
+<td>The escape hatch for a bespoke state service</td>
+</tr>
+<tr>
+<td><code>remote</code> / <code>cloud</code></td>
+<td>Server-side</td>
+<td>HCP Terraform / TFE</td>
+<td>Also gives run history, RBAC, drift detection</td>
+</tr>
+</tbody>
+</table>
+<p>Note all three hyperscaler backends now do locking natively, in-bucket. The S3 lockfile needs <code>s3:GetObject</code>, <code>s3:PutObject</code>, and <code>s3:DeleteObject</code> on the <code>.tflock</code> key.</p>
+<div class="codehilite"><pre><span></span><code>terraform {
+  required_version = &quot;~&gt; 1.16&quot;
+
+  backend &quot;s3&quot; {
+    bucket       = &quot;temporal-cloud-tfstate-us-east-1&quot;
+    key          = &quot;cells/aws/us-east-1/cell-042/terraform.tfstate&quot;
+    region       = &quot;us-east-1&quot;
+    encrypt      = true
+    kms_key_id   = &quot;arn:aws:kms:us-east-1:111122223333:key/…&quot;
+    use_lockfile = true
+
+    # Cross-account: the state bucket lives in the platform account,
+    # the cell lives elsewhere.
+    assume_role = {
+      role_arn = &quot;arn:aws:iam::111122223333:role/TerraformStateAccess&quot;
+    }
+  }
+
+  required_providers {
+    aws = { source = &quot;hashicorp/aws&quot;, version = &quot;~&gt; 6.62&quot; }
+  }
+}
+</code></pre></div>
+
+<p>Note the <code>key</code> layout. Encode cloud, region, and cell identity into the state key path so that one bucket can hold the whole fleet with an obvious naming convention and IAM prefix policies per environment.</p>
+<p><strong>Backend configuration cannot use variables in Terraform.</strong> This is the single most annoying limitation for per-cell root modules and the reason <code>-backend-config</code> exists:</p>
+<div class="codehilite"><pre><span></span><code>terraform init -backend-config<span class="o">=</span>backends/aws-us-east-1-cell-042.hcl
+</code></pre></div>
+
+<p>OpenTofu removed this limitation in 1.8 — variables and locals work in backend config (<a href="https://opentofu.org/docs/language/settings/backends/configuration/#variables-and-locals">OpenTofu backend configuration</a>). It is one of the few genuine reasons a platform team switches.</p>
+<h4 id="workspaces-vs-directories">Workspaces vs directories</h4>
+<p>CLI workspaces give you multiple states behind one backend and one configuration. HashiCorp is direct about the limit: <em>"CLI workspaces within a working directory use the same backend, so they are not a suitable isolation mechanism for this scenario"</em> and <em>"Workspaces alone are not a suitable tool for system decomposition because each subsystem should have its own separate configuration and backend"</em> (<a href="https://developer.hashicorp.com/terraform/cli/workspaces#when-not-to-use-multiple-workspaces">when not to use multiple workspaces</a>). The state docs add: <em>"Workspaces are not appropriate for system decomposition or deployments requiring separate credentials and access controls"</em> (<a href="https://developer.hashicorp.com/terraform/language/state/workspaces">workspaces</a>).</p>
+<p>For a multi-cloud cell fleet this is disqualifying. One backend means one bucket, one set of credentials, and one blast-radius domain across AWS, GCP, and Azure. Use directories (or generated root modules) per cell, with a distinct backend config each. Workspaces are fine for ephemeral dev/test variants of a single component.</p>
+<h4 id="terraform_remote_state-vs-data-sources"><code>terraform_remote_state</code> vs data sources</h4>
+<p><code>terraform_remote_state</code> reads another configuration's outputs from its state. It works, and it is a coupling you should minimize:</p>
+<blockquote>
+<p><em>"Although <code>terraform_remote_state</code> only exposes output values, its user must have access to the entire state snapshot, which often includes some sensitive information."</em>
+<em>"…any user or server which has enough access to read the root module output values will also always have access to the full state snapshot data by direct network requests."</em>
+<em>"When possible, we recommend explicitly publishing data for external consumption to a separate location instead of accessing it via remote state."</em></p>
+</blockquote>
+<p>— <a href="https://developer.hashicorp.com/terraform/language/state/remote-state-data">remote state data source</a></p>
+<p>For a cell platform the "separate location" is usually SSM Parameter Store / GCP Secret Manager / Azure App Configuration, or a small "cell registry" table. Layer N writes its outputs there; layer N+1 reads with a normal data source. You get per-key IAM, you decouple the state layout from the consumption contract, and you can reshape state later without breaking readers.</p>
+<div class="codehilite"><pre><span></span><code># Publish, in the network layer.
+resource &quot;aws_ssm_parameter&quot; &quot;cell_vpc&quot; {
+  name = &quot;/temporal/cells/${var.cell_name}/vpc&quot;
+  type = &quot;String&quot;
+  value = jsonencode({
+    vpc_id             = aws_vpc.this.id
+    private_subnet_ids = aws_subnet.private[*].id
+  })
+}
+
+# Consume, in the cluster layer — no state access required.
+data &quot;aws_ssm_parameter&quot; &quot;cell_vpc&quot; {
+  name = &quot;/temporal/cells/${var.cell_name}/vpc&quot;
+}
+
+locals {
+  vpc = jsondecode(data.aws_ssm_parameter.cell_vpc.value)
+}
+</code></pre></div>
+
+<h4 id="state-surgery">State surgery</h4>
+<p>You will still need the CLI sometimes. The commands, with their docs:</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># Inspect. -json landed in 1.16.</span>
+terraform state list
+terraform state show -json aws_eks_cluster.this
+
+<span class="c1"># Move an address (prefer a `moved` block when the change is in config).</span>
+terraform state mv <span class="s1">&#39;aws_eks_cluster.this&#39;</span> <span class="s1">&#39;module.cp.aws_eks_cluster.this&#39;</span>
+
+<span class="c1"># Forget an object (prefer a `removed` block).</span>
+terraform state rm <span class="s1">&#39;aws_iam_role.old&#39;</span>
+
+<span class="c1"># Repoint a provider after a fork/rename — no block equivalent exists.</span>
+terraform state replace-provider hashicorp/aws registry.opentofu.org/hashicorp/aws
+
+<span class="c1"># Pull/push for offline surgery. Always keep the original.</span>
+terraform state pull &gt; backup-<span class="k">$(</span>date +%s<span class="k">)</span>.tfstate
+terraform state push fixed.tfstate
+</code></pre></div>
+
+<p>Rules I would enforce on a platform team:</p>
+<ol>
+<li>Never run <code>state mv</code>/<code>rm</code> against shared state without a <code>state pull</code> backup committed to a ticket first.</li>
+<li>Never run them from a laptop against production. Run them through the same pipeline that holds the lock.</li>
+<li>Prefer <code>moved</code>/<code>removed</code>/<code>import</code> blocks so the change is reviewed in a PR and reproducible, then delete the blocks in a follow-up once every state has converged. Leaving <code>moved</code> blocks in place forever is harmless but noisy; leaving <code>import</code> blocks is worse, because they re-plan an import every run.</li>
+</ol>
+<h4 id="blast-radius-and-state-splitting-for-hundreds-of-cells">Blast radius and state splitting for hundreds of cells</h4>
+<p>The decision is a spectrum:</p>
+<table>
+<thead>
+<tr>
+<th>Layout</th>
+<th>Plan time</th>
+<th>Blast radius</th>
+<th>Cross-cell change cost</th>
+<th>Verdict</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>One state, all cells</td>
+<td>Minutes-to-hours; unusable past ~50 cells</td>
+<td>Entire fleet</td>
+<td>One PR, one apply</td>
+<td>Never</td>
+</tr>
+<tr>
+<td>One state per cloud/region</td>
+<td>Tens of seconds</td>
+<td>Every cell in the region</td>
+<td>One apply per region</td>
+<td>Acceptable for shared regional infra only</td>
+</tr>
+<tr>
+<td><strong>One state per cell</strong></td>
+<td>Seconds</td>
+<td>One cell</td>
+<td>300 applies, orchestrated</td>
+<td><strong>This is the answer</strong></td>
+</tr>
+<tr>
+<td>One state per cell per layer (network / cluster / addons)</td>
+<td>Seconds</td>
+<td>One layer of one cell</td>
+<td>900 applies</td>
+<td>Right when layers have different change cadence or different owners</td>
+</tr>
+</tbody>
+</table>
+<p>For cell lifecycle, per-cell state is not a preference, it is a requirement: provision, upgrade, and teardown are per-cell operations, and they must be independently lockable so two cells can be upgraded concurrently. The layered split matters when networking is shared with another team — separate state means separate ownership boundaries and separate IAM, and the interface between them becomes an explicit published contract rather than a shared state file.</p>
+<p>The second-order consequence: with 300 states you now need an orchestrator that knows which cells exist, what version each is on, and in what order to touch them. That inventory is not Terraform's job. Options are Terragrunt, HCP Stacks, a hand-rolled matrix in CI, or — given where you work — a Temporal workflow driving <code>terraform</code> per cell with retries, concurrency limits, and human approval gates. That last option is the one worth arguing for internally, because rollout orchestration with durable state and human-in-the-loop is exactly the problem Temporal solves and exactly the problem Terraform does not.</p>
+<h3 id="module-design">Module design<a class="anchor" href="#module-design">#</a></h3>
+<h4 id="composition-over-inheritance-thin-root-modules">Composition over inheritance, thin root modules</h4>
+<p>The rule from <a href="https://developer.hashicorp.com/terraform/language/modules/develop/composition">module composition</a>: modules should be flat and composed by the root, not deeply nested and parameterized. A root module for a cell should read like a wiring diagram:</p>
+<div class="codehilite"><pre><span></span><code># cells/aws/us-east-1/cell-042/main.tf  — a thin root module
+module &quot;network&quot; {
+  source = &quot;git::ssh://git@github.com/temporalio/tf-modules.git//aws/cell-network?ref=v4.2.0&quot;
+
+  cell_name   = local.cell.name
+  region      = local.cell.region
+  cidr_block  = local.cell.networking.vpc_cidr
+}
+
+module &quot;cluster&quot; {
+  source = &quot;git::ssh://git@github.com/temporalio/tf-modules.git//aws/cell-cluster?ref=v4.2.0&quot;
+
+  cell_name          = local.cell.name
+  kubernetes_version = local.cell.kubernetes_version
+  private_subnet_ids = module.network.private_subnet_ids
+  vpc_id             = module.network.vpc_id
+}
+</code></pre></div>
+
+<p>Three properties to hold:</p>
+<ul>
+<li><strong>The root module contains no <code>resource</code> blocks</strong>, only <code>module</code>, <code>locals</code>, <code>provider</code>, <code>terraform</code>, and <code>output</code>. If a resource creeps into a root module it will not exist in any other cell, and you have just created a snowflake.</li>
+<li><strong>Modules do not call <code>terraform_remote_state</code>.</strong> Data crosses module boundaries as inputs and outputs, resolved by the root. A module that reads remote state cannot be tested and cannot be reused in a different state layout.</li>
+<li><strong>Nesting depth of two, maximum.</strong> Root → component module → (optionally) a small shared helper. Beyond that, changing a leaf input means threading a variable through four <code>variables.tf</code> files, and nobody does it correctly under time pressure.</li>
+</ul>
+<h4 id="providers-in-modules--the-configuration_aliases-rule">Providers in modules — the <code>configuration_aliases</code> rule</h4>
+<p>This is the rule that most often surprises people writing their first shared module. Verbatim:</p>
+<blockquote>
+<p><em>"A module intended to be called by one or more other modules must not contain any <code>provider</code> blocks."</em>
+<em>"Provider configurations can be defined only in a root Terraform module."</em></p>
+</blockquote>
+<p>— <a href="https://developer.hashicorp.com/terraform/language/modules/develop/providers">providers within modules</a></p>
+<p>The reason is destruction ordering: if a module declares its own provider, Terraform cannot destroy the module's resources after the module is removed from configuration, because the provider configuration went away with it. So the module would be un-removable.</p>
+<p>A module that needs <em>multiple</em> configurations of the same provider — the classic multi-region or multi-account case — declares <code>configuration_aliases</code> (added in 0.15.0) and the root passes them in:</p>
+<div class="codehilite"><pre><span></span><code># modules/aws/cell-replicated/versions.tf
+terraform {
+  required_providers {
+    aws = {
+      source                = &quot;hashicorp/aws&quot;
+      version               = &quot;~&gt; 6.62&quot;
+      configuration_aliases = [aws.primary, aws.replica]
+    }
+  }
+}
+
+# Inside the module, select explicitly.
+resource &quot;aws_s3_bucket&quot; &quot;primary&quot; {
+  provider = aws.primary
+  bucket   = &quot;${var.cell_name}-primary&quot;
+}
+
+resource &quot;aws_s3_bucket&quot; &quot;replica&quot; {
+  provider = aws.replica
+  bucket   = &quot;${var.cell_name}-replica&quot;
+}
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code># Root module wires them.
+provider &quot;aws&quot; {
+  alias  = &quot;use1&quot;
+  region = &quot;us-east-1&quot;
+  assume_role { role_arn = var.cell_role_arn }
+}
+
+provider &quot;aws&quot; {
+  alias  = &quot;usw2&quot;
+  region = &quot;us-west-2&quot;
+  assume_role { role_arn = var.cell_role_arn }
+}
+
+module &quot;cell&quot; {
+  source = &quot;../../modules/aws/cell-replicated&quot;
+  providers = {
+    aws.primary = aws.use1
+    aws.replica = aws.usw2
+  }
+}
+</code></pre></div>
+
+<p>Two consequences for a many-cell platform. First, <strong>provider configurations do not <code>for_each</code></strong> in Terraform — you cannot generate N provider blocks for N regions from a map. You must write them out, or generate the root module file. (OpenTofu added provider <code>for_each</code> in 1.9, which is arguably its most valuable divergence for exactly this use case: <a href="https://opentofu.org/docs/language/providers/configuration/#for_each-multiple-instances-of-a-provider-configuration">provider <code>for_each</code></a>.) Second, this is precisely the gap Terragrunt and Stacks fill by generating provider blocks or supporting <code>for_each</code> on components.</p>
+<h4 id="versioning-and-registries">Versioning and registries</h4>
+<p>Pin module versions. For a private setup you have three options: the HCP Terraform private registry, a Git ref, or an OCI artifact (OpenTofu only). Git refs are the pragmatic default for an internal platform:</p>
+<div class="codehilite"><pre><span></span><code>source = &quot;git::ssh://git@github.com/temporalio/tf-modules.git//aws/cell-cluster?ref=v4.2.0&quot;
+</code></pre></div>
+
+<p>Note the <code>//</code> separating repo from subdirectory and the <code>?ref=</code> pinning to a tag. <strong>The <code>version</code> argument works only for registry modules</strong>, not Git or local sources — a common source of "why isn't my version constraint doing anything."</p>
+<p>Also note: <code>.terraform.lock.hcl</code> <strong>tracks providers only, not module versions</strong> (<a href="https://developer.hashicorp.com/terraform/language/files/dependency-lock">dependency lock file</a>). Module reproducibility is entirely on your <code>ref=</code> discipline, so use immutable tags, never branches.</p>
+<p>Terraform 1.15 added variables and locals in <code>source</code> and <code>version</code>, which finally lets you parameterize the module version per cell — very useful for staged rollouts of a module upgrade:</p>
+<div class="codehilite"><pre><span></span><code>module &quot;cluster&quot; {
+  source  = &quot;app.terraform.io/temporal/cell-cluster/aws&quot;
+  version = var.cell.module_versions.cluster   # 1.15+
+  # ...
+}
+</code></pre></div>
+
+<h4 id="testing">Testing</h4>
+<p><code>terraform test</code> went GA in <strong>1.6.0</strong>, with provider and module mocking in <strong>1.7.0</strong>. Tests live in <code>.tftest.hcl</code> files, by default in a <code>tests/</code> directory (<a href="https://developer.hashicorp.com/terraform/language/tests">tests</a>).</p>
+<div class="codehilite"><pre><span></span><code># tests/naming.tftest.hcl — a plan-only unit test, no cloud calls
+mock_provider &quot;aws&quot; {}
+
+variables {
+  cell = {
+    name   = &quot;cell-042&quot;
+    cloud  = &quot;aws&quot;
+    region = &quot;us-east-1&quot;
+  }
+}
+
+run &quot;cell_name_is_propagated_to_tags&quot; {
+  command = plan
+
+  assert {
+    condition     = aws_eks_cluster.this.tags[&quot;example.com/cell&quot;] == &quot;cell-042&quot;
+    error_message = &quot;cell tag not propagated&quot;
+  }
+}
+
+run &quot;rejects_bad_cloud&quot; {
+  command = plan
+  variables {
+    cell = { name = &quot;cell-042&quot;, cloud = &quot;digitalocean&quot;, region = &quot;nyc3&quot; }
+  }
+  expect_failures = [var.cell]
+}
+</code></pre></div>
+
+<p>By default each <code>run</code> block executes <code>command = apply</code> and runs sequentially. For a module you will want <code>command = plan</code> plus <code>mock_provider</code> for the fast unit tests, and a much smaller set of real-apply integration tests gated behind a nightly job with real credentials.</p>
+<p>Where Terratest still earns its place: it is Go, so it can assert on things outside Terraform's world — hit the cluster API after apply, run <code>kubectl</code>, poll for a healthy Temporal frontend, then destroy (<a href="https://terratest.gruntwork.io/">Terratest</a>). For a cell module, the right split is <code>terraform test</code> for configuration logic (naming, tagging, validation, conditional resources) and Terratest for "does a provisioned cell actually work."</p>
+<h3 id="multi-cloud-multi-region-multi-account">Multi-cloud, multi-region, multi-account<a class="anchor" href="#multi-cloud-multi-region-multi-account">#</a></h3>
+<h4 id="cross-account-and-cross-project-authentication">Cross-account and cross-project authentication</h4>
+<div class="codehilite"><pre><span></span><code># AWS: assume-role, including role chaining (multiple blocks, in order).
+provider &quot;aws&quot; {
+  alias  = &quot;cell&quot;
+  region = var.region
+
+  assume_role {
+    role_arn     = &quot;arn:aws:iam::${var.cell_account_id}:role/CellProvisioner&quot;
+    session_name = &quot;tf-${var.cell_name}&quot;
+    external_id  = var.external_id
+  }
+
+  # Guardrail: fail fast if credentials resolve to the wrong account.
+  allowed_account_ids = [var.cell_account_id]
+
+  default_tags { tags = local.common_tags }
+}
+
+# AWS from CI with OIDC, no long-lived keys.
+provider &quot;aws&quot; {
+  alias  = &quot;cell_oidc&quot;
+  region = var.region
+  assume_role_with_web_identity {
+    role_arn                = var.ci_role_arn
+    web_identity_token_file = &quot;/var/run/secrets/oidc/token&quot;
+    session_name            = &quot;tf-${var.cell_name}&quot;
+  }
+}
+
+# GCP: service account impersonation. Requires
+# roles/iam.serviceAccountTokenCreator on the target SA.
+provider &quot;google&quot; {
+  alias                       = &quot;cell&quot;
+  project                     = var.gcp_project_id
+  region                      = var.region
+  impersonate_service_account = &quot;cell-provisioner@${var.gcp_project_id}.iam.gserviceaccount.com&quot;
+}
+
+# Azure: one provider per subscription; OIDC from CI.
+provider &quot;azurerm&quot; {
+  alias           = &quot;cell&quot;
+  subscription_id = var.azure_subscription_id
+  tenant_id       = var.azure_tenant_id
+  use_oidc        = true
+  features {}
+}
+</code></pre></div>
+
+<p>References: <a href="https://registry.terraform.io/providers/hashicorp/aws/latest/docs#assume_role-configuration-block">AWS provider <code>assume_role</code></a> (current v6.62.0), <a href="https://registry.terraform.io/providers/hashicorp/google/latest/docs/guides/provider_reference">Google provider reference</a> (v8.0.0), <a href="https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs">AzureRM provider</a> (v5.3.0). AzureRM notes that <code>subscription_id</code> <em>"is required when performing a plan or apply operation, but is not required to run <code>terraform validate</code>"</em> — useful for CI validation stages without credentials. Azure has no dedicated multi-subscription guide; provider aliases are the documented approach, plus <code>auxiliary_tenant_ids</code> (max 3) for cross-tenant.</p>
+<h4 id="generating-per-cell-root-modules">Generating per-cell root modules</h4>
+<p>With no provider <code>for_each</code> and no variables in backend config, the honest answer for N nearly-identical cells is that <em>something</em> generates the root module. Your realistic options:</p>
+<p><strong>1. Generate <code>.tf</code> files from a cell inventory.</strong> A small program (Go, since you're a Go shop) reads a YAML/JSON fleet registry and emits <code>cells/&lt;cloud&gt;/&lt;region&gt;/&lt;cell&gt;/main.tf</code> + <code>backend.hcl</code>. Committed, reviewable, greppable. Downside: generated code in Git, and a second tool to maintain.</p>
+<p><strong>2. Terragrunt.</strong> Its entire reason for existing is DRY root modules — it generates the backend block and provider blocks and calls one module per "unit." Current version <strong>1.1.4 (2026-08-27)</strong>; it hit 1.0 on 2026-03-30 with an explicit backwards-compatibility guarantee (<a href="https://www.gruntwork.io/blog/terragrunt-1-0-released">Terragrunt 1.0</a>). Positioning has shifted: <em>"Terragrunt is a flexible orchestration tool that allows Infrastructure as Code written in OpenTofu/Terraform to scale."</em> Two things to know: it now defaults to <strong>OpenTofu</strong> if <code>tofu</code> is on <code>PATH</code>, and it has its own Stacks concept — <code>terragrunt.stack.hcl</code> with <code>unit</code> and <code>stack</code> blocks, stable since v0.78.0 (<a href="https://docs.terragrunt.com/features/stacks/explicit/">Terragrunt Stacks</a>). Docs moved to <code>docs.terragrunt.com</code>.</p>
+<p><strong>3. HCP Terraform Stacks.</strong> GA since 2025-09-25. A <code>.tfcomponent.hcl</code> file declares <code>component</code> blocks (which <em>do</em> support <code>for_each</code>, and whose providers <em>do</em> support <code>for_each</code>), and a <code>.tfdeploy.hcl</code> declares <code>deployment</code> blocks — one per cell. Deferred changes are GA here, so a cluster and its Kubernetes resources genuinely can live in one Stack. <strong>But</strong>: it requires HCP Terraform or TFE 2.0+, the <code>orchestrate</code> block was deprecated at GA in favor of <code>deployment_group</code>, and there are hard limits of 500 deployments, 100 components, and 10,000 resources per Stack (<a href="https://developer.hashicorp.com/terraform/language/stacks">Stacks overview</a>, <a href="https://developer.hashicorp.com/terraform/language/stacks/update-GA">beta→GA changes</a>). 500 deployments is a real ceiling for a cell fleet.</p>
+<p><strong>4. Your CI matrix.</strong> A single parameterized root module, <code>terraform init -backend-config=...</code> per cell, driven by a job matrix. Zero extra tools. Loses you a dependency graph across cells and any notion of ordering.</p>
+<h4 id="the-tooling-landscape-honestly">The tooling landscape, honestly</h4>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>Model</th>
+<th>Best at</th>
+<th>Real cost</th>
+<th>Verdict for cell lifecycle</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Terraform (plain)</strong></td>
+<td>HCL, per-directory state</td>
+<td>Everything; universal knowledge</td>
+<td>No fleet orchestration, no provider <code>for_each</code>, no vars in backend config</td>
+<td>The substrate. You will use it regardless</td>
+</tr>
+<tr>
+<td><strong>OpenTofu</strong></td>
+<td>Fork of Terraform</td>
+<td>State encryption, provider <code>for_each</code>, vars in backend config, <code>-exclude</code>, OCI registries</td>
+<td>Provider registry redirection; smaller (but real) ecosystem; some org-level license politics</td>
+<td>Strong candidate. The provider <code>for_each</code> + backend-vars combination directly removes two of your biggest per-cell pain points</td>
+</tr>
+<tr>
+<td><strong>Terragrunt</strong></td>
+<td>Wrapper that generates + orchestrates</td>
+<td>DRY root modules, dependency graphs across units, <code>run-all</code></td>
+<td>A second DSL; error messages get one layer removed from Terraform's; commercial "Scale" tier for the good CI bits</td>
+<td>The pragmatic answer for N cells if you are not on HCP</td>
+</tr>
+<tr>
+<td><strong>HCP Terraform Stacks</strong></td>
+<td>First-class multi-component + multi-deployment</td>
+<td><code>for_each</code> on components <em>and</em> providers, deferred changes, one plan across a dependency graph</td>
+<td><strong>HCP/TFE only</strong>, 500-deployment ceiling, vendor lock, GA-broke-beta-configs precedent</td>
+<td>Only if you are already on HCP and under 500 cells</td>
+</tr>
+<tr>
+<td><strong>CDKTF</strong></td>
+<td>TypeScript/Python → HCL JSON</td>
+<td>—</td>
+<td><strong>Deprecated and archived 2025-12-10</strong></td>
+<td>Do not use</td>
+</tr>
+<tr>
+<td><strong>Pulumi</strong></td>
+<td>Real languages, own engine, own state</td>
+<td>Programmatic generation of N stacks; genuine loops and abstractions; <code>pulumi package add hcl module</code> runs TF modules</td>
+<td>Whole-ecosystem switch; your providers are TF providers bridged anyway; team retraining</td>
+<td>Not worth it if the team knows HCL; genuinely good if the fleet logic is complex enough to want a real language (<a href="https://www.pulumi.com/docs/">Pulumi</a>)</td>
+</tr>
+<tr>
+<td><strong>Crossplane</strong></td>
+<td>Kubernetes controllers reconciling cloud resources</td>
+<td>Continuous reconciliation, no state file, self-service APIs via XRs</td>
+<td>Cloud infra now depends on a management cluster; v2 removed claims and native patch-and-transform, so v1 material is misleading</td>
+<td>Complementary, not a replacement. A management cluster provisioning cells is a real pattern; but you need Terraform to build the management cluster (<a href="https://docs.crossplane.io/latest/whats-new/">Crossplane v2</a>, <a href="https://www.cncf.io/projects/crossplane/">CNCF graduated 2025-10-28</a>)</td>
+</tr>
+</tbody>
+</table>
+<p>One note on Crossplane since it comes up constantly: <strong>v2 is a big break from everything written before August 2025.</strong> Composite resources are namespaced by default, <em>claims are gone</em> (<em>"The new namespaced and cluster scoped XRs in Crossplane v2 don't support claims"</em>), and native patch-and-transform composition was removed in favor of function pipelines. Current release is v2.4.0 (2026-08-20). Any tutorial predating v2.0 (2025-08-12) teaches an API that no longer exists.</p>
+<p><em>See also: <a href="03-multicloud-aws-gcp-azure.html#resource-hierarchy-and-tenancy">resource hierarchy and tenancy</a> and <a href="03-multicloud-aws-gcp-azure.html#quotas-limits-and-regional-capacity">quotas, limits, and regional capacity</a> — the account/project/subscription boundary you pick there is what fixes your state split here, and the per-region quotas are what a fleet apply actually fails on.</em></p>
+<h3 id="kubernetes-and-terraform-where-to-stop">Kubernetes and Terraform: where to stop<a class="anchor" href="#kubernetes-and-terraform-where-to-stop">#</a></h3>
+<p>This is the most consequential architectural decision in the guide, and I will be opinionated: <strong>stop Terraform at the cluster boundary.</strong></p>
+<p>The mechanical reason is the provider-configuration rule. Terraform's <code>kubernetes</code> provider needs an endpoint and credentials; if those come from a cluster resource in the same configuration, they are unknown at plan time. HashiCorp's own provider docs contain the warning in capital letters:</p>
+<blockquote>
+<p><strong>"WARNING</strong> When using interpolation to pass credentials to the Kubernetes provider from other resources, these resources SHOULD NOT be created in the same Terraform module where Kubernetes provider resources are also used."</p>
+<p><em>"The most reliable way to configure the Kubernetes provider is to ensure that the cluster itself and the Kubernetes provider resources can be managed with separate <code>apply</code> operations."</em></p>
+</blockquote>
+<p>— <a href="https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs">hashicorp/kubernetes provider</a></p>
+<p><code>kubernetes_manifest</code> makes it worse, because it reads the cluster's OpenAPI schema during planning: <em>"This resource requires API access during planning time. This means the cluster has to be accessible at plan time and thus cannot be created in the same apply operation"</em> (<a href="https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/manifest">kubernetes_manifest</a>). A destroyed or unreachable cell therefore cannot even be <em>planned</em>, which turns teardown into a puzzle.</p>
+<p>The design reason is stronger than the mechanical one. Kubernetes objects want continuous reconciliation, drift correction, pruning by ownership, and rollout semantics with health gates. Terraform gives you point-in-time convergence with a lock, no health awareness, and a destroy path that deletes things in dependency order and then waits. Those are different tools for different jobs. GitOps controllers (Argo CD, Flux) do the second job natively.</p>
+<p>The line I would draw for a cell:</p>
+<div class="codehilite"><pre><span></span><code>Terraform owns:                          GitOps owns:
+  VPC / subnets / peering                  every namespace
+  IAM roles, workload identity             every Deployment / StatefulSet
+  the managed cluster itself               CRDs and their controllers
+  node pools (or Karpenter&#39;s IAM)          cert-manager, Kyverno, the mesh
+  KMS keys, buckets, databases             Temporal server components
+  DNS zones, load balancer prereqs         HPA/PDB/NetworkPolicy
+  the *bootstrap* GitOps agent  ───────►   ...and then everything else
+</code></pre></div>
+
+<p>The one Kubernetes object Terraform should create is the bootstrap: install the Argo CD or Flux agent and register the cell with the fleet's config repo. After that, Terraform's job is done and reconciliation takes over. This keeps the <code>kubernetes</code> provider usage to a handful of objects created immediately after cluster creation, in a <em>separate</em> apply stage from the cluster itself.</p>
+<p>If you must manage more Kubernetes from Terraform, know the provider landscape as of today:</p>
+<table>
+<thead>
+<tr>
+<th>Provider</th>
+<th>Version</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>hashicorp/kubernetes</code></td>
+<td>v3.2.1 (2026-07-01)</td>
+<td>v3.0.0 (2025-12-03) moved to protocol v6, requires Terraform ≥1.0, deprecated all non-<code>_v1</code> resources. <code>kubernetes_manifest</code> uses SSA. <code>kubernetes_resource</code>/<code>kubernetes_resources</code> are <strong>data sources only</strong></td>
+</tr>
+<tr>
+<td><code>hashicorp/helm</code></td>
+<td>v3.2.0 (2026-06-04)</td>
+<td><strong>Embeds Helm 3.18.5, not Helm 4</strong> (verified in <code>go.mod</code>). v3 reshaped <code>kubernetes {}</code> → <code>kubernetes = {}</code>, <code>registry {}</code> → <code>registries = [...]</code>, and <code>set</code> into a list of objects. <code>set_wo</code> write-only support added in 3.0.0</td>
+</tr>
+<tr>
+<td><code>alekc/kubectl</code></td>
+<td>2.4.1 stable, 3.0.0-beta3</td>
+<td>The maintained fork; v3 adds an ephemeral <code>kubectl_manifest</code> and <code>lazy_load</code> to sidestep plan-time cluster access</td>
+</tr>
+<tr>
+<td><code>gavinbunney/kubectl</code></td>
+<td>1.19.0 (2025-01-10)</td>
+<td>Dormant (not archived). Do not start new work here</td>
+</tr>
+</tbody>
+</table>
+<p>The provider-level <code>ignore_annotations</code> / <code>ignore_labels</code> regex settings on the <code>kubernetes</code> provider are worth knowing — they suppress diffs on metadata that controllers mutate, which is otherwise a permanent source of phantom plans.</p>
+<p><em>See also: <a href="13-gitops-argocd-flux.html#bootstrap-the-chicken-and-egg">bootstrap: the chicken-and-egg</a> for the mechanics on the other side of that handoff — <code>flux bootstrap</code> self-managing by construction, Argo CD's app-of-apps-on-itself, and why keeping the bootstrap apply path alive is the recovery route.</em></p>
+<h3 id="cicd">CI/CD<a class="anchor" href="#cicd">#</a></h3>
+<p>The canonical shape:</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># .github/workflows/cell.yml (abridged)</span><span class="w"></span>
+<span class="nt">jobs</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">plan</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">permissions</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> id-token</span><span class="p">:</span><span class="w"> </span><span class="nv">write</span><span class="p p-Indicator">,</span><span class="nt"> contents</span><span class="p">:</span><span class="w"> </span><span class="nv">read</span><span class="p p-Indicator">,</span><span class="nt"> pull-requests</span><span class="p">:</span><span class="w"> </span><span class="nv">write</span><span class="w"> </span><span class="p p-Indicator">}</span><span class="w"></span>
+<span class="w">    </span><span class="nt">strategy</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="nt">matrix</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> cell</span><span class="p">:</span><span class="w"> </span><span class="nv">$</span><span class="p p-Indicator">{{</span><span class="w"> </span><span class="nv">fromJSON(needs.discover.outputs.cells)</span><span class="w"> </span><span class="p p-Indicator">}}</span><span class="w"> </span><span class="p p-Indicator">}</span><span class="w"></span>
+<span class="w">      </span><span class="nt">max-parallel</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">10</span><span class="w"></span>
+<span class="w">    </span><span class="nt">steps</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">uses</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">hashicorp/setup-terraform@v3</span><span class="w"></span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">run</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">terraform init -backend-config=cells/${{ matrix.cell }}/backend.hcl</span><span class="w"></span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">run</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">terraform validate</span><span class="w"></span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">id</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">plan</span><span class="w"></span>
+<span class="w">        </span><span class="nt">run</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">|</span><span class="w"></span>
+<span class="w">          </span><span class="no">terraform plan -out=tfplan -detailed-exitcode -lock-timeout=5m</span><span class="w"></span>
+<span class="w">          </span><span class="no">echo &quot;exit=$?&quot; &gt;&gt; &quot;$GITHUB_OUTPUT&quot;</span><span class="w"></span>
+<span class="w">        </span><span class="nt">continue-on-error</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span><span class="w"></span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">run</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">terraform show -json tfplan &gt; tfplan.json</span><span class="w"></span>
+<span class="w">      </span><span class="c1"># Policy gate on the machine-readable plan, not on the HCL.</span><span class="w"></span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">run</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">conftest test --policy policy/ tfplan.json</span><span class="w"></span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">run</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">trivy config --exit-code 1 --severity HIGH,CRITICAL .</span><span class="w"></span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">uses</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">actions/upload-artifact@v4</span><span class="w"></span>
+<span class="w">        </span><span class="nt">with</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> name</span><span class="p">:</span><span class="w"> </span><span class="nv">tfplan-$</span><span class="p p-Indicator">{{</span><span class="w"> </span><span class="nv">matrix.cell</span><span class="w"> </span><span class="p p-Indicator">}},</span><span class="nt"> path</span><span class="p">:</span><span class="w"> </span><span class="nv">tfplan</span><span class="w"> </span><span class="p p-Indicator">}</span><span class="w"></span>
+
+<span class="w">  </span><span class="nt">apply</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">needs</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">plan</span><span class="w"></span>
+<span class="w">    </span><span class="nt">if</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">github.ref == &#39;refs/heads/main&#39;</span><span class="w"></span>
+<span class="w">    </span><span class="nt">environment</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">production</span><span class="w">        </span><span class="c1"># human approval gate</span><span class="w"></span>
+<span class="w">    </span><span class="nt">steps</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">uses</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">actions/download-artifact@v4</span><span class="w"></span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">run</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">terraform init -backend-config=cells/${{ matrix.cell }}/backend.hcl</span><span class="w"></span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">run</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">terraform apply -lock-timeout=10m tfplan</span><span class="w"></span>
+</code></pre></div>
+
+<p>Points that matter:</p>
+<ul>
+<li><strong>Apply the saved plan, not a fresh one.</strong> <em>"When you pass a saved plan file to <code>terraform apply</code>, Terraform performs the operations in the saved plan without prompting you for confirmation"</em> (<a href="https://developer.hashicorp.com/terraform/cli/commands/apply#saved-plan-mode">apply</a>). This is what makes the PR review meaningful. Store the artifact with the same access controls as state — it contains input variables in cleartext.</li>
+<li><strong>Gate on plan JSON, not HCL.</strong> <code>terraform show -json tfplan</code> produces the documented <a href="https://developer.hashicorp.com/terraform/internals/json-format">JSON output format</a>. Policy over the <em>plan</em> catches "this apply will delete a production cell," which no static HCL scanner can see. Careful with <code>format_version</code>: the docs prose says <code>"1.0"</code> but current source declares <code>FormatVersion = "1.2"</code> — read the field, don't hardcode a comparison.</li>
+<li><strong><code>-refresh=false</code> is a scale optimization with teeth.</strong> It skips the provider read for every resource, which on a 500-resource cell is the difference between 90 seconds and 8. The docs warn: <em>"setting <code>refresh=false</code> causes Terraform to ignore external changes, which could result in an incomplete or incorrect plan."</em> My rule: <code>-refresh=false</code> for the fast PR plan, full refresh on the apply-path plan and on the scheduled drift job.</li>
+<li><strong><code>-target</code> is a smell.</strong> <em>"Use <code>-target=ADDRESS</code> in exceptional circumstances only, such as recovering from mistakes or working around Terraform limitations"</em> (<a href="https://developer.hashicorp.com/terraform/cli/commands/plan#target-address">plan <code>-target</code></a>). The longer form names the real cost: <em>"this can lead to undetected configuration drift and confusion about how the true state of resources relates to configuration."</em> If your pipeline routinely uses <code>-target</code>, you have a state-splitting problem, not a targeting need. Split the state.</li>
+<li><strong><code>taint</code> is deprecated</strong> in favor of <code>-replace=ADDRESS</code> on plan/apply (<a href="https://developer.hashicorp.com/terraform/cli/commands/taint">taint</a>).</li>
+<li><strong>Drift on a schedule.</strong> A nightly job per cell: <code>terraform plan -detailed-exitcode -lock-timeout=0</code>; exit 2 opens a ticket with the plan attached. HCP Terraform has this built in as health assessments, available on <strong>Standard and Premium</strong> editions, requiring remote/agent execution and at least one successful apply (<a href="https://developer.hashicorp.com/terraform/cloud-docs/workspaces/health#drift-detection">workspace health</a>). Note their caveat: <em>"Configuration drift differs from state drift. Drift detection does not detect state drift."</em></li>
+</ul>
+<p><strong>Policy-as-code options today:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>Where it runs</th>
+<th>Input</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="https://developer.hashicorp.com/sentinel">Sentinel</a></td>
+<td>HCP Terraform / TFE runs</td>
+<td>Plan, config, state, run data</td>
+<td>Enforcement is an HCP/TFE feature; the standalone CLI only tests against mocks. Free tier: one policy set, five policies</td>
+</tr>
+<tr>
+<td><a href="https://developer.hashicorp.com/terraform/policy">Terraform Policy</a> (<strong>beta</strong>)</td>
+<td><code>tfpolicy</code> CLI locally + HCP at run time</td>
+<td>Provider-aware HCL policy</td>
+<td>HashiCorp's stated direction: <em>"We recommend using Terraform policy to enforce governance in Terraform workflows."</em> Requires Terraform 1.16+. Beta — do not put it in a production gate yet</td>
+</tr>
+<tr>
+<td><a href="https://www.conftest.dev/">Conftest</a> / OPA</td>
+<td>Anywhere, including your own CI</td>
+<td><code>tfplan.json</code></td>
+<td>v0.69.0 (2026-08-03). The portable choice; works identically for Terraform, Kubernetes, and Helm output</td>
+</tr>
+<tr>
+<td><a href="https://www.checkov.io/">Checkov</a></td>
+<td>CI</td>
+<td>HCL <em>and</em> plan JSON</td>
+<td>v3.3.15 (2026-08-27). Bridgecrew, now Palo Alto / Prisma Cloud. Large built-in rule set</td>
+</tr>
+<tr>
+<td><a href="https://trivy.dev/docs/latest/scanner/misconfiguration/">Trivy</a></td>
+<td>CI</td>
+<td>HCL</td>
+<td>The successor to tfsec; <code>trivy config &lt;dir&gt;</code></td>
+</tr>
+</tbody>
+</table>
+<p>For a multi-cloud platform I would run Conftest over plan JSON as the <em>blocking</em> gate (because your invariants are org-specific: cell naming, mandatory tags, no public endpoints, no destroy of tier-1 cells) and Trivy or Checkov as an advisory scan for CVE-class misconfigurations.</p>
+<h3 id="the-opentofu-fork">The OpenTofu fork<a class="anchor" href="#the-opentofu-fork">#</a></h3>
+<p><strong>What happened.</strong> HashiCorp relicensed from MPL 2.0 to the Business Source License 1.1 on 2023-08-10 (<a href="https://www.hashicorp.com/en/blog/hashicorp-adopts-business-source-license">announcement</a>). Terraform 1.6.0 was the first BUSL release; the <a href="https://github.com/hashicorp/terraform/blob/main/LICENSE">LICENSE file</a> covers <em>"Terraform Version 1.6.0 or later"</em>, with a four-year Change Date after which each version reverts to MPL 2.0. The Licensor is now <strong>International Business Machines Corporation</strong> — IBM completed its acquisition of HashiCorp on 2025-02-27, and hashicorp.com now brands as "HashiCorp, an IBM company." No further licensing change has occurred since.</p>
+<p><strong>What BUSL means for you.</strong> It forbids offering the software as a competing commercial hosted service. Internal use by a company building its own product is fine. But: your legal team will ask, your vendors will ask, and if Temporal Cloud ever bundles infrastructure-provisioning-as-a-service the question stops being academic. Read <a href="https://www.hashicorp.com/license-faq">the license FAQ</a> rather than trusting a summary.</p>
+<p><strong>OpenTofu today.</strong> Latest stable <strong>1.12.6 (2026-08-19)</strong>, with 1.13 in beta. Governed under the Linux Foundation since <a href="https://www.linuxfoundation.org/press/announcing-opentofu">2023-09-20</a>. It remains a drop-in replacement — same HCL, same providers, state compatible.</p>
+<p><strong>Feature divergence, verified:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Capability</th>
+<th>OpenTofu</th>
+<th>Terraform 1.16</th>
+<th>Why a cell platform cares</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="https://opentofu.org/docs/language/state/encryption/">Client-side state encryption</a></td>
+<td><strong>1.7</strong> (external key providers in 1.10)</td>
+<td>Not available</td>
+<td>Directly solves the plaintext-secrets-in-state problem, with your own KMS</td>
+</tr>
+<tr>
+<td><a href="https://opentofu.org/docs/language/providers/configuration/#for_each-multiple-instances-of-a-provider-configuration">Provider <code>for_each</code></a></td>
+<td><strong>1.9</strong></td>
+<td>Not available</td>
+<td>Generate N region/account provider configs from a map — exactly the N-cells problem</td>
+</tr>
+<tr>
+<td>Variables/locals in <strong>backend</strong> config</td>
+<td><strong>1.8</strong></td>
+<td>Not available</td>
+<td>Removes the <code>-backend-config</code> file generation step per cell</td>
+</tr>
+<tr>
+<td>Variables/locals in module <code>source</code>/<code>version</code></td>
+<td>1.8</td>
+<td><strong>1.15</strong> — parity</td>
+<td>—</td>
+</tr>
+<tr>
+<td><a href="https://opentofu.org/docs/v1.9/intro/whats-new/#the-exclude-flag"><code>-exclude</code> flag</a> (+ <code>-target-file</code>/<code>-exclude-file</code> in 1.10)</td>
+<td><strong>1.9</strong></td>
+<td>Not available</td>
+<td>"Apply everything except this one broken resource" — the inverse of <code>-target</code>, and less dangerous</td>
+</tr>
+<tr>
+<td><a href="https://opentofu.org/docs/cli/oci_registries/">OCI registries for providers and modules</a></td>
+<td><strong>1.10</strong></td>
+<td>Not available</td>
+<td>One artifact store for charts, images, and modules</td>
+</tr>
+<tr>
+<td><code>lifecycle { enabled = ... }</code>, dynamic <code>prevent_destroy</code></td>
+<td>1.11 / 1.12</td>
+<td>Not available</td>
+<td>Per-cell protection driven by cell tier</td>
+</tr>
+<tr>
+<td><code>mock_provider</code> / <code>override_*</code> in tests</td>
+<td>1.8</td>
+<td><strong>1.7</strong> — Terraform first</td>
+<td>Not an OpenTofu differentiator; the common claim is backwards</td>
+</tr>
+<tr>
+<td><code>deprecated</code> on variables/outputs</td>
+<td>1.10</td>
+<td><strong>1.15</strong> — parity</td>
+<td>—</td>
+</tr>
+<tr>
+<td><code>lifecycle { destroy = false }</code></td>
+<td>1.12</td>
+<td><strong>1.16</strong> — parity</td>
+<td>—</td>
+</tr>
+<tr>
+<td>Stacks</td>
+<td>Not available</td>
+<td>Terraform + <strong>HCP/TFE only</strong></td>
+<td>Not usable with the OSS CLI either way</td>
+</tr>
+</tbody>
+</table>
+<p><strong>What a platform team should actually conclude.</strong> The divergence is now real but narrow, and it runs in OpenTofu's favor on the specific axes a many-cell platform cares about: state encryption, provider <code>for_each</code>, and backend-config variables. Terraform's counterweights are Stacks (HCP-gated), the enormous default-choice gravity of the registry and every tutorial, and IBM's investment in the ecosystem. Migration is genuinely low-risk today — <code>tofu</code> reads Terraform state, the module code is unchanged, and the main operational work is repointing the provider registry and updating CI. The thing that will actually decide it at your company is not features: it is whether legal has an opinion about BUSL and whether your vendors' modules are published to the Terraform registry, the OpenTofu registry, or both.</p>
+<h3 id="performance-at-scale">Performance at scale<a class="anchor" href="#performance-at-scale">#</a></h3>
+<p>At 300 cells the numbers that matter are per-cell plan time and total wall-clock across the fleet.</p>
+<ul>
+<li><strong><code>-parallelism</code></strong> defaults to 10. Raising it helps CPU-light, API-latency-bound plans; it also raises your cloud API rate-limit exposure, and rate-limit errors during apply are far worse than a slow apply. Measure before raising.</li>
+<li><strong>Provider plugin cache.</strong> Set <code>TF_PLUGIN_CACHE_DIR</code> or <code>plugin_cache_dir</code> in <code>.terraformrc</code> so <code>terraform init</code> hardlinks instead of re-downloading 600 MB of AWS provider per cell. Two documented gotchas: <em>"This directory must already exist before Terraform will cache plugins; Terraform will not create the directory itself"</em> and <em>"The plugin cache directory is not guaranteed to be concurrency safe"</em> (<a href="https://developer.hashicorp.com/terraform/cli/config/config-file#provider-plugin-cache">provider plugin cache</a>). That second one matters if your CI runs 20 cells in parallel on one runner with a shared cache volume — use per-job caches or a mirror instead.</li>
+<li><strong>Provider mirrors.</strong> For hermetic, fast, egress-free builds, run a <code>network_mirror</code> or bake a <code>filesystem_mirror</code> into your CI image (<a href="https://developer.hashicorp.com/terraform/cli/config/config-file#provider-installation">provider installation</a>). Build it with <code>terraform providers mirror -platform=linux_amd64 ./mirror</code>.</li>
+<li><strong>Lock file, all platforms.</strong> If engineers are on macOS ARM and CI is Linux AMD64, <code>terraform init</code> on one platform writes hashes only for that platform and CI then fails. Fix once: <code>terraform providers lock -platform=linux_amd64 -platform=darwin_arm64 -platform=darwin_amd64</code>.</li>
+<li><strong>Huge-plan slowness is a state-size problem.</strong> Plan time scales with the number of resources in state, because every one is refreshed. The mitigations, in order of effectiveness: split state (biggest win by far), <code>-refresh=false</code> on non-authoritative plans, and reducing resource count per cell (one <code>aws_iam_role_policy</code> with a document beats twelve <code>aws_iam_role_policy_attachment</code>s).</li>
+<li><strong><code>terraform init</code> is the hidden cost in CI.</strong> Module downloads over SSH plus provider resolution can exceed plan time. Cache <code>.terraform/</code> keyed on a hash of <code>.terraform.lock.hcl</code> plus module refs.</li>
+</ul>
+<h3 id="secrets-in-terraform">Secrets in Terraform<a class="anchor" href="#secrets-in-terraform">#</a></h3>
+<p>The uncomfortable truth, stated by HashiCorp:</p>
+<blockquote>
+<p><em>"If you are developing with Terraform locally, Terraform stores your state in a plaintext file, which includes any secret values you defined in your configuration."</em>
+<em>"Terraform stores values with the <code>sensitive</code> argument in both state and plan files, and anyone who can access those files can access your sensitive values."</em></p>
+</blockquote>
+<p>— <a href="https://developer.hashicorp.com/terraform/language/manage-sensitive-data">Manage sensitive data</a></p>
+<p><code>sensitive = true</code> redacts from CLI output only. The docs are explicit for both directions: <em>"Terraform still stores the values of sensitive variables in your state"</em> and <em>"If you use the <code>terraform output</code> CLI command with the <code>-json</code> or <code>-raw</code> flags, Terraform displays sensitive outputs in plain text."</em></p>
+<p>The mitigation stack, in order:</p>
+<ol>
+<li><strong>Encrypt the state store and lock down access.</strong> SSE-KMS on the S3 bucket with a CMK, bucket policy denying unencrypted <code>PutObject</code>, versioning on, access logging on, and IAM that grants state access only to the pipeline role. This is table stakes and it is not sufficient.</li>
+<li><strong>Do not put secrets in state at all.</strong> Prefer resources that generate secrets in the cloud and expose only ARNs — an <code>aws_secretsmanager_secret</code> whose value is written by a separate process, a <code>google_secret_manager_secret</code> version created out of band.</li>
+<li><strong>Ephemeral values and write-only arguments.</strong> These are the real fix and they are recent. <strong>Terraform 1.10.0</strong> added ephemeral resources (the <a href="https://developer.hashicorp.com/terraform/language/block/ephemeral"><code>ephemeral</code> block</a>) and <code>ephemeral = true</code> on variables and outputs — values that are re-read each phase and <em>never persisted to state</em>. <strong>Terraform 1.11.0</strong> added <a href="https://developer.hashicorp.com/terraform/language/manage-sensitive-data/write-only">write-only arguments</a> (<code>*_wo</code> with a <code>*_wo_version</code> companion), which send a value to the provider without storing it.</li>
+</ol>
+<div class="codehilite"><pre><span></span><code># Fetch a secret at apply time, never persist it.
+ephemeral &quot;vault_kv_secret_v2&quot; &quot;cell_db&quot; {
+  mount = &quot;secret&quot;
+  name  = &quot;cells/${var.cell_name}/database&quot;
+}
+
+resource &quot;aws_db_instance&quot; &quot;cell&quot; {
+  identifier = local.cell_name
+  # Write-only: sent to the provider, not stored in state (Terraform 1.11+).
+  password_wo         = ephemeral.vault_kv_secret_v2.cell_db.data.password
+  password_wo_version = var.db_password_version   # bump to trigger a rotation
+}
+</code></pre></div>
+
+<p>The <code>_wo_version</code> companion exists because <em>"Terraform does not store write-only arguments in state files, so Terraform has no way of knowing if a write-only argument value has changed"</em> — you increment the version to signal a change. The <a href="https://registry.terraform.io/providers/hashicorp/vault/latest/docs">Vault provider</a> (v5.11.0, 2026-08-14) ships <strong>24 ephemeral resources</strong> including <code>vault_kv_secret_v2</code>, <code>vault_aws_access_credentials</code>, <code>vault_database_secret</code>, and <code>vault_kubernetes_credentials</code>. Note that <code>vault_kubernetes_service_account_token</code> is a <em>data source</em>, not ephemeral — the ephemeral equivalent is <code>vault_kubernetes_credentials</code>.</p>
+<ol start="4">
+<li><strong>If you need encryption at rest that you control, that is OpenTofu's state encryption</strong>, which is the strongest single argument for the fork on a security-conscious platform team.</li>
+</ol>
+<p><em>See also: <a href="10-vault.html#terraforms-vault-provider-and-the-state-problem">Terraform's Vault provider and the state problem</a> for the Vault-side view of the same hazard, and why "configure Vault with Terraform" and "read secrets with Terraform" are different decisions with different blast radii.</em></p>
+<hr />
+<h2 id="hands-on">Hands-on<a class="anchor" href="#hands-on">#</a></h2>
+<p><strong>Cost.</strong> Labs 1 through 5 use only the <code>local</code>, <code>random</code>, <code>null</code>, and <code>terraform</code> built-in providers plus LocalStack, and cost <strong>$0</strong>. Lab 6 uses AWS free-tier-eligible resources (S3, DynamoDB-free since we use native locking, IAM) and should cost <strong>under $0.10/month</strong> if you destroy afterward — but S3 requests and KMS keys are not free, so run <code>terraform destroy</code> and verify. I flag the costed step explicitly.</p>
+<h3 id="setup">Setup<a class="anchor" href="#setup">#</a></h3>
+<div class="codehilite"><pre><span></span><code><span class="c1"># macOS. Terraform is not in homebrew-core -- it was disabled there when the</span>
+<span class="c1"># licence changed to BUSL -- so it comes from HashiCorp&#39;s own tap.</span>
+brew install hashicorp/tap/terraform
+brew install opentofu tflint
+
+<span class="c1"># Verify — you should see 1.16.x</span>
+terraform version
+tofu version
+
+mkdir -p ~/tf-lab <span class="o">&amp;&amp;</span> <span class="nb">cd</span> ~/tf-lab
+</code></pre></div>
+
+<h3 id="lab-1--reproduce-the-count-index-shift-disaster">Lab 1 — Reproduce the <code>count</code> index-shift disaster<a class="anchor" href="#lab-1--reproduce-the-count-index-shift-disaster">#</a></h3>
+<p>This is the single most valuable 15 minutes in the guide. You will watch Terraform destroy and recreate resources it had no business touching.</p>
+<div class="codehilite"><pre><span></span><code>mkdir -p <span class="m">01</span>-index-shift <span class="o">&amp;&amp;</span> <span class="nb">cd</span> <span class="m">01</span>-index-shift
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code># main.tf
+terraform {
+  required_providers {
+    local  = { source = &quot;hashicorp/local&quot;,  version = &quot;~&gt; 2.5&quot; }
+    random = { source = &quot;hashicorp/random&quot;, version = &quot;~&gt; 3.6&quot; }
+  }
+}
+
+variable &quot;cells&quot; {
+  type    = list(string)
+  default = [&quot;cell-a&quot;, &quot;cell-b&quot;, &quot;cell-c&quot;, &quot;cell-d&quot;]
+}
+
+# The wrong way: positional identity.
+resource &quot;random_pet&quot; &quot;by_count&quot; {
+  count  = length(var.cells)
+  prefix = var.cells[count.index]
+}
+
+# The right way: keyed identity.
+resource &quot;random_pet&quot; &quot;by_foreach&quot; {
+  for_each = toset(var.cells)
+  prefix   = each.key
+}
+
+output &quot;count_ids&quot;   { value = [for r in random_pet.by_count : r.id] }
+output &quot;foreach_ids&quot; { value = { for k, r in random_pet.by_foreach : k =&gt; r.id } }
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code>terraform init <span class="o">&amp;&amp;</span> terraform apply -auto-approve
+terraform state list      <span class="c1"># note the addresses: [0]..[3] vs [&quot;cell-a&quot;]..[&quot;cell-d&quot;]</span>
+
+<span class="c1"># Now remove cell-b from the middle.</span>
+terraform plan -var<span class="o">=</span><span class="s1">&#39;cells=[&quot;cell-a&quot;,&quot;cell-c&quot;,&quot;cell-d&quot;]&#39;</span>
+</code></pre></div>
+
+<p>Read the plan carefully. The <code>for_each</code> resources show <strong>1 to destroy</strong>. The <code>count</code> resources show <strong>2 to change (replace), 1 to destroy</strong> — because <code>by_count[1]</code> must become <code>cell-c</code> and <code>by_count[2]</code> must become <code>cell-d</code>. Now imagine those are EKS clusters.</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># Prove the fix is a state edit, not an infrastructure change:</span>
+terraform apply -var<span class="o">=</span><span class="s1">&#39;cells=[&quot;cell-a&quot;,&quot;cell-c&quot;,&quot;cell-d&quot;]&#39;</span> -auto-approve
+terraform state list
+</code></pre></div>
+
+<p>Extension: add a <code>moved</code> block converting a <code>count</code> resource to <code>for_each</code> and confirm the plan becomes a no-op.</p>
+<h3 id="lab-2--module-interfaces-optional-and-validation">Lab 2 — Module interfaces, <code>optional()</code>, and validation<a class="anchor" href="#lab-2--module-interfaces-optional-and-validation">#</a></h3>
+<div class="codehilite"><pre><span></span><code><span class="nb">cd</span> ~/tf-lab <span class="o">&amp;&amp;</span> mkdir -p <span class="m">02</span>-modules/modules/cell <span class="o">&amp;&amp;</span> <span class="nb">cd</span> <span class="m">02</span>-modules
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code># modules/cell/main.tf
+terraform {
+  required_providers { local = { source = &quot;hashicorp/local&quot;, version = &quot;~&gt; 2.5&quot; } }
+}
+
+variable &quot;cell&quot; {
+  type = object({
+    name    = string
+    tier    = optional(string, &quot;standard&quot;)
+    regions = optional(list(string), [&quot;us-east-1&quot;])
+    limits  = optional(object({
+      max_namespaces = optional(number, 100)
+      max_pods       = optional(number, 5000)
+    }), {})
+  })
+  validation {
+    condition     = contains([&quot;standard&quot;, &quot;dedicated&quot;, &quot;isolated&quot;], var.cell.tier)
+    error_message = &quot;cell.tier must be standard, dedicated, or isolated.&quot;
+  }
+}
+
+resource &quot;local_file&quot; &quot;manifest&quot; {
+  filename = &quot;${path.root}/out/${var.cell.name}.yaml&quot;
+  content  = yamlencode({
+    cell = var.cell.name, tier = var.cell.tier,
+    limits = var.cell.limits, regions = var.cell.regions
+  })
+}
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code># main.tf (root)
+locals {
+  fleet = {
+    &quot;cell-001&quot; = { name = &quot;cell-001&quot; }                                # all defaults
+    &quot;cell-002&quot; = { name = &quot;cell-002&quot;, tier = &quot;dedicated&quot; }
+    &quot;cell-003&quot; = { name = &quot;cell-003&quot;, tier = &quot;isolated&quot;,
+                   limits = { max_namespaces = 10 } }                 # partial nested
+  }
+}
+
+module &quot;cells&quot; {
+  source   = &quot;./modules/cell&quot;
+  for_each = local.fleet
+  cell     = each.value
+}
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code>terraform init <span class="o">&amp;&amp;</span> terraform apply -auto-approve
+cat out/*.yaml
+</code></pre></div>
+
+<p>Now break it on purpose — set <code>tier = "gold"</code> and confirm the validation error, then omit the <code>limits</code> default in the module and observe the <code>null</code> deref. Understanding <em>why</em> the nested default is required is the whole point.</p>
+<h3 id="lab-3--moved-import-removed">Lab 3 — <code>moved</code>, <code>import</code>, <code>removed</code><a class="anchor" href="#lab-3--moved-import-removed">#</a></h3>
+<div class="codehilite"><pre><span></span><code><span class="nb">cd</span> ~/tf-lab <span class="o">&amp;&amp;</span> mkdir -p <span class="m">03</span>-state-blocks <span class="o">&amp;&amp;</span> <span class="nb">cd</span> <span class="m">03</span>-state-blocks
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code># main.tf
+terraform {
+  required_providers { local = { source = &quot;hashicorp/local&quot;, version = &quot;~&gt; 2.5&quot; } }
+}
+
+resource &quot;local_file&quot; &quot;config&quot; {
+  filename = &quot;${path.module}/cell.conf&quot;
+  content  = &quot;cell=042\n&quot;
+}
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code>terraform init <span class="o">&amp;&amp;</span> terraform apply -auto-approve
+
+<span class="c1"># 1. Rename with a `moved` block: rename the resource to local_file.cell_config</span>
+<span class="c1">#    and add:</span>
+<span class="c1">#      moved { from = local_file.config, to = local_file.cell_config }</span>
+terraform plan     <span class="c1"># should be &quot;No changes&quot; plus a move notice</span>
+
+<span class="c1"># 2. `removed`: comment out the resource, add a removed block with</span>
+<span class="c1">#    lifecycle { destroy = false }, apply, then confirm the file still exists.</span>
+ls -la cell.conf
+terraform state list    <span class="c1"># empty</span>
+
+<span class="c1"># 3. `import` it back:</span>
+<span class="c1">#      import { to = local_file.cell_config, id = &quot;./cell.conf&quot; }</span>
+terraform plan -generate-config-out<span class="o">=</span>generated.tf
+cat generated.tf
+terraform apply -auto-approve
+</code></pre></div>
+
+<p>That loop — move, forget, adopt — is exactly what you do when refactoring a shared cell module across 300 states, and doing it once locally is worth more than reading about it three times.</p>
+<h3 id="lab-4--remote-state-native-s3-locking-and-a-lock-collision-localstack-free">Lab 4 — Remote state, native S3 locking, and a lock collision (LocalStack, free)<a class="anchor" href="#lab-4--remote-state-native-s3-locking-and-a-lock-collision-localstack-free">#</a></h3>
+<div class="codehilite"><pre><span></span><code><span class="nb">cd</span> ~/tf-lab <span class="o">&amp;&amp;</span> mkdir -p <span class="m">04</span>-backend <span class="o">&amp;&amp;</span> <span class="nb">cd</span> <span class="m">04</span>-backend
+<span class="c1"># Needs docker, and the AWS CLI for the bucket call: brew install awscli</span>
+docker run -d --name localstack -p <span class="m">4566</span>:4566 localstack/localstack
+<span class="k">until</span> curl -sf http://localhost:4566/_localstack/health &gt;/dev/null<span class="p">;</span> <span class="k">do</span> sleep <span class="m">1</span><span class="p">;</span> <span class="k">done</span>
+
+<span class="nb">export</span> <span class="nv">AWS_ACCESS_KEY_ID</span><span class="o">=</span><span class="nb">test</span> <span class="nv">AWS_SECRET_ACCESS_KEY</span><span class="o">=</span><span class="nb">test</span> <span class="nv">AWS_DEFAULT_REGION</span><span class="o">=</span>us-east-1
+aws --endpoint-url<span class="o">=</span>http://localhost:4566 s3 mb s3://tfstate
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code># main.tf
+terraform {
+  backend &quot;s3&quot; {
+    bucket       = &quot;tfstate&quot;
+    key          = &quot;cells/cell-042/terraform.tfstate&quot;
+    region       = &quot;us-east-1&quot;
+    use_lockfile = true          # native S3 locking, Terraform 1.10+
+
+    # LocalStack wiring
+    access_key                  = &quot;test&quot;
+    secret_key                  = &quot;test&quot;
+    skip_credentials_validation = true
+    skip_metadata_api_check     = true
+    skip_requesting_account_id  = true
+    use_path_style              = true
+    endpoints = { s3 = &quot;http://localhost:4566&quot; }
+  }
+  required_providers {
+    time = { source = &quot;hashicorp/time&quot;, version = &quot;~&gt; 0.12&quot; }
+  }
+}
+
+# A slow apply, so you can race two terminals against the lock.
+resource &quot;time_sleep&quot; &quot;slow&quot; { create_duration = &quot;60s&quot; }
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code>terraform init
+terraform apply -auto-approve <span class="p">&amp;</span>      <span class="c1"># terminal 1</span>
+sleep <span class="m">5</span>
+terraform apply -auto-approve        <span class="c1"># terminal 2 → &quot;Error acquiring the state lock&quot;</span>
+
+<span class="c1"># Inspect the lock object itself.</span>
+aws --endpoint-url<span class="o">=</span>http://localhost:4566 s3 ls s3://tfstate/cells/cell-042/
+<span class="c1"># → terraform.tfstate.tflock while held</span>
+
+<span class="c1"># Practice recovery (only ever with the ID from the error message):</span>
+<span class="c1"># terraform force-unlock &lt;LOCK_ID&gt;</span>
+</code></pre></div>
+
+<p>Do the <code>force-unlock</code> at least once in the lab so that you have muscle memory before you need it in production, and internalize that the correct response to a stuck lock is <em>find out who holds it</em>, not unlock reflexively.</p>
+<h3 id="lab-5--terraform-test-with-mocked-providers">Lab 5 — <code>terraform test</code> with mocked providers<a class="anchor" href="#lab-5--terraform-test-with-mocked-providers">#</a></h3>
+<div class="codehilite"><pre><span></span><code><span class="nb">cd</span> ~/tf-lab/02-modules <span class="o">&amp;&amp;</span> mkdir -p modules/cell/tests
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code># modules/cell/tests/defaults.tftest.hcl
+mock_provider &quot;local&quot; {}
+
+variables {
+  cell = { name = &quot;cell-999&quot; }
+}
+
+run &quot;defaults_applied&quot; {
+  command = plan
+  assert {
+    condition     = strcontains(local_file.manifest.content, &quot;tier: standard&quot;)
+    error_message = &quot;tier default was not applied&quot;
+  }
+}
+
+run &quot;rejects_unknown_tier&quot; {
+  command   = plan
+  variables { cell = { name = &quot;cell-999&quot;, tier = &quot;gold&quot; } }
+  expect_failures = [var.cell]
+}
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="nb">cd</span> modules/cell <span class="o">&amp;&amp;</span> terraform init <span class="o">&amp;&amp;</span> terraform <span class="nb">test</span>
+</code></pre></div>
+
+<p>Add a failing assertion and confirm the output tells you which <code>run</code> block and which assertion failed. This is the harness you will actually build for the cell module.</p>
+<h3 id="lab-6--plan-json-and-a-policy-gate">Lab 6 — Plan JSON and a policy gate<a class="anchor" href="#lab-6--plan-json-and-a-policy-gate">#</a></h3>
+<div class="codehilite"><pre><span></span><code><span class="nb">cd</span> ~/tf-lab/01-index-shift
+terraform plan -out<span class="o">=</span>tfplan
+terraform show -json tfplan <span class="p">|</span> jq <span class="s1">&#39;.format_version, (.resource_changes | length)&#39;</span>
+terraform show -json tfplan <span class="p">|</span> jq -r <span class="s1">&#39;</span>
+<span class="s1">  .resource_changes[] | select(.change.actions | index(&quot;delete&quot;))</span>
+<span class="s1">  | &quot;DELETE \(.address)&quot;&#39;</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code># policy/cells.rego
+package main
+
+deny contains msg if {
+  some rc in input.resource_changes
+  &quot;delete&quot; in rc.change.actions
+  startswith(rc.address, &quot;random_pet.by_count&quot;)
+  msg := sprintf(&quot;refusing to delete tier-1 resource %v&quot;, [rc.address])
+}
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code>brew install conftest
+mkdir -p policy    <span class="c1"># then save the rego above as policy/cells.rego</span>
+terraform show -json tfplan &gt; tfplan.json
+conftest <span class="nb">test</span> --policy policy/ tfplan.json
+</code></pre></div>
+
+<p>That is the whole CI gate in miniature: plan to a file, render to JSON, evaluate policy over the <em>diff</em>, then apply the saved plan.</p>
+<h3 id="lab-7--costed-optional">Lab 7 — costed, optional<a class="anchor" href="#lab-7--costed-optional">#</a></h3>
+<p>If you want a real backend: create an S3 bucket with versioning and SSE-KMS in your own account, set <code>use_lockfile = true</code>, and run Lab 3 against it. <strong>Cost: an AWS KMS CMK is $1/month prorated, plus per-request charges.</strong> Use SSE-S3 instead of a CMK to stay at effectively $0, and <code>terraform destroy</code> plus manual bucket deletion when done. Do not use a company account.</p>
+<hr />
+<h2 id="production-gotchas">Production gotchas<a class="anchor" href="#production-gotchas">#</a></h2>
+<ol>
+<li>
+<p><strong>Removing a <code>for_each</code> key destroys infrastructure; there is no "unmanage" default.</strong> The safe removal sequence is: add a <code>removed</code> block with <code>lifecycle { destroy = false }</code>, apply, <em>then</em> delete the config. Getting this backwards is the most common way to accidentally delete a cell. (<a href="https://developer.hashicorp.com/terraform/language/block/removed"><code>removed</code> block</a>)</p>
+</li>
+<li>
+<p><strong><code>prevent_destroy</code> is not recorded in state.</strong> <em>"Except for <code>create_before_destroy</code>, Terraform does not explicitly record a resource's <code>lifecycle</code> rule to state"</em> (<a href="https://developer.hashicorp.com/terraform/language/meta-arguments/lifecycle">lifecycle</a>). Deleting the <code>lifecycle</code> block and applying in the same PR bypasses the guard silently. Real protection is IAM plus a plan-JSON policy that rejects deletes on tier-1 addresses.</p>
+</li>
+<li>
+<p><strong><code>create_before_destroy</code> is contagious through the dependency graph.</strong> Terraform propagates it to dependencies, silently reordering replacements far from where you set it. Always pair it with <code>name_prefix</code> or a <code>random_id</code> suffix, or you will hit <code>AlreadyExists</code> on the create half.</p>
+</li>
+<li>
+<p><strong>Provider configuration cannot depend on unknown values, and no amount of <code>depends_on</code> fixes it.</strong> <em>"You can use expressions to configure provider arguments, but you can only reference values that Terraform knows before it applies your configuration"</em> (<a href="https://developer.hashicorp.com/terraform/language/block/provider#provider-specific-arguments">provider block</a>). This is a hard architectural constraint, not a bug to work around.</p>
+</li>
+<li>
+<p><strong><code>kubernetes_manifest</code> requires cluster reachability at <em>plan</em> time.</strong> <em>"This resource requires API access during planning time"</em> (<a href="https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/manifest">kubernetes_manifest</a>). A cell whose control plane is down or already deleted cannot be planned, which turns disaster recovery and teardown into state surgery.</p>
+</li>
+<li>
+<p><strong>The Terraform <code>helm</code> provider embeds Helm 3, not Helm 4</strong> — v3.2.0's <code>go.mod</code> pins <code>helm.sh/helm/v3 v3.18.5</code>. If your charts start using Helm 4 features, the provider will not render them. Verified against <a href="https://raw.githubusercontent.com/hashicorp/terraform-provider-helm/v3.2.0/go.mod">the provider's go.mod</a>.</p>
+</li>
+<li>
+<p><strong>Never run <code>terraform apply</code> and expect atomicity.</strong> State is written incrementally as each resource completes. A killed apply leaves a partially-created cell and a stale lock. Your orchestrator must handle "resume from partial" as a first-class case, not an exception.</p>
+</li>
+<li>
+<p><strong><code>terraform refresh</code> can delete everything.</strong> <em>"If you have misconfigured credentials for one or more providers, Terraform may be misled into thinking that all of the managed objects have been deleted, causing it to remove all of the tracked objects without any confirmation prompt"</em> (<a href="https://developer.hashicorp.com/terraform/cli/commands/refresh">refresh</a>). Use <code>plan -refresh-only</code> and review, never <code>apply -refresh-only -auto-approve</code> in automation.</p>
+</li>
+<li>
+<p><strong>The plugin cache is not concurrency-safe.</strong> <em>"The plugin cache directory is not guaranteed to be concurrency safe"</em> (<a href="https://developer.hashicorp.com/terraform/cli/config/config-file#provider-plugin-cache">CLI config</a>). A CI runner doing 20 parallel cell inits against one cache volume will corrupt it. Use a filesystem mirror baked into the image instead.</p>
+</li>
+<li>
+<p><strong>The lock file is per-platform unless you say otherwise.</strong> <code>terraform providers lock -platform=linux_amd64 -platform=darwin_arm64</code> once, or CI will fail with checksum errors the first time a Mac user runs <code>init</code> (<a href="https://developer.hashicorp.com/terraform/cli/commands/providers/lock#platform-os_arch">providers lock</a>).</p>
+</li>
+<li>
+<p><strong><code>.terraform.lock.hcl</code> does not lock module versions.</strong> It covers providers only (<a href="https://developer.hashicorp.com/terraform/language/files/dependency-lock">dependency lock file</a>). Pin module sources to immutable tags; a <code>ref=main</code> module source means your 300 cells are not running the same code.</p>
+</li>
+<li>
+<p><strong>Plan files contain secrets in cleartext.</strong> <em>"You should therefore treat any saved plan files as potentially-sensitive artifacts"</em> (<a href="https://developer.hashicorp.com/terraform/cli/commands/plan#out-filename">plan <code>-out</code></a>). CI artifact stores are usually more readable than state buckets. Encrypt them or use short retention.</p>
+</li>
+<li>
+<p><strong><code>sensitive = true</code> does not keep anything out of state.</strong> <em>"Terraform still stores the values of sensitive variables in your state"</em>, and <code>terraform output -json</code> prints them in the clear (<a href="https://developer.hashicorp.com/terraform/language/manage-sensitive-data">manage sensitive data</a>). Use ephemeral resources (1.10) and write-only arguments (1.11), or OpenTofu state encryption.</p>
+</li>
+<li>
+<p><strong><code>terraform_remote_state</code> grants full state read, not just outputs.</strong> <em>"any user or server which has enough access to read the root module output values will also always have access to the full state snapshot data by direct network requests"</em> (<a href="https://developer.hashicorp.com/terraform/language/state/remote-state-data">remote state</a>). Publish to a parameter store instead.</p>
+</li>
+<li>
+<p><strong>Workspaces share a backend and are therefore not an isolation boundary.</strong> <em>"CLI workspaces within a working directory use the same backend, so they are not a suitable isolation mechanism"</em> (<a href="https://developer.hashicorp.com/terraform/cli/workspaces#when-not-to-use-multiple-workspaces">workspaces</a>). Do not use them for prod/staging or for cells.</p>
+</li>
+<li>
+<p><strong>Routine <code>-target</code> use means your state is too big.</strong> <em>"Use <code>-target=ADDRESS</code> in exceptional circumstances only"</em> (<a href="https://developer.hashicorp.com/terraform/cli/commands/plan#target-address">plan</a>). Treat every <code>-target</code> in a runbook as a state-splitting ticket.</p>
+</li>
+<li>
+<p><strong>Plan JSON's <code>format_version</code> is not what the docs say.</strong> The prose says <code>"1.0"</code>; current source declares <code>FormatVersion = "1.2"</code> in <a href="https://raw.githubusercontent.com/hashicorp/terraform/main/internal/command/jsonplan/plan.go"><code>internal/command/jsonplan/plan.go</code></a>. Parse the field, do not assert equality with a hardcoded string.</p>
+</li>
+<li>
+<p><strong>Terraform Stacks will not run on the open-source CLI.</strong> The <code>terraform stacks</code> subcommands are <code>init</code>, <code>validate</code>, <code>create</code>, <code>fmt</code>, <code>list</code>, <code>version</code>, <code>providers-lock</code>, and deployment-management groups. There is no <code>plan</code> and no <code>apply</code> (<a href="https://developer.hashicorp.com/terraform/cli/commands/stacks">stacks CLI</a>). Anyone proposing Stacks is implicitly proposing HCP Terraform or TFE 2.0+.</p>
+</li>
+<li>
+<p><strong>Stacks has a 500-deployment ceiling</strong> (<a href="https://developer.hashicorp.com/terraform/language/stacks">Stacks constraints</a>), and its GA release discarded beta configurations and state history (<a href="https://developer.hashicorp.com/terraform/language/stacks/update-GA">beta→GA</a>). For a fleet that might exceed 500 cells, that is a design-time disqualifier, and the beta precedent is a reason to be cautious about future migrations.</p>
+</li>
+<li>
+<p><strong>Provisioner failures taint the resource.</strong> A failed <code>local-exec</code> marks the whole resource for replacement, so a transient script error causes Terraform to plan the destruction of real infrastructure. Combined with the fact that provisioner effects are invisible to state, this is why the docs say <em>"You should exhaust all alternatives before using provisioners"</em> (<a href="https://developer.hashicorp.com/terraform/language/provisioners">provisioners</a>).</p>
+</li>
+<li>
+<p><strong><code>for_each</code> cannot take unknown or sensitive values, and does not convert lists to sets.</strong> The error "The <code>for_each</code> value depends on resource attributes that cannot be determined until apply" is not fixable with <code>depends_on</code>; it is a signal to split the apply or key on static input (<a href="https://developer.hashicorp.com/terraform/language/meta-arguments/for_each"><code>for_each</code></a>).</p>
+</li>
+<li>
+<p><strong>CDKTF is archived.</strong> If you inherit a CDKTF codebase, budget for a migration; there will be no upstream fixes (<a href="https://developer.hashicorp.com/terraform/cdktf">CDKTF</a>).</p>
+</li>
+</ol>
+<hr />
+<h2 id="how-this-shows-up-in-cell-lifecycle">How this shows up in cell lifecycle<a class="anchor" href="#how-this-shows-up-in-cell-lifecycle">#</a></h2>
+<p><strong>Provisioning a cell.</strong> A cell provision is a sequence of Terraform applies against a per-cell state, ordered because provider configuration cannot depend on unknown values: (1) accounts/projects and IAM, (2) network — often owned by a separate networking team, so it is its own state and its own module, (3) the managed cluster (EKS/GKE/AKS), (4) a <em>separate</em> apply for the GitOps bootstrap that installs the Argo/Flux agent and registers the cell. Steps 3 and 4 must be separate applies. Everything after step 4 is not Terraform's problem.</p>
+<p><strong>Upgrading a cell.</strong> Terraform gives you a diff and a lock; it does not give you a rollout. Cell upgrades — a Kubernetes minor bump, a node image roll — need ordering, concurrency limits, health gates between waves, and the ability to pause. Encode the cell's desired module version in the fleet inventory (Terraform 1.15's variables-in-<code>version</code> makes this natural), and let an orchestrator advance cells through it. At a company that builds Temporal, a Temporal workflow driving per-cell applies with retries, heartbeats, and a signal-based approval gate is the natural fit, and it is a defensible platform design rather than a cute use of the home product.</p>
+<p><strong>Tearing down a cell.</strong> This is where per-cell state pays for itself: <code>terraform destroy</code> against one state, with no chance of touching a neighbor. Two traps. First, <code>prevent_destroy</code> on tier-1 resources will block the destroy — so the teardown runbook needs a documented, reviewed way to lift it, not an ad-hoc edit. Second, if you kept <code>kubernetes</code> or <code>helm</code> resources in the cell's state, destroy requires a <em>reachable</em> cluster; if the control plane is already gone the plan itself fails. That is the concrete operational cost of not stopping at the cluster boundary.</p>
+<p><strong>Multi-cloud.</strong> Three clouds means three provider ecosystems with genuinely different resource models, not a single abstraction. Do not build a "cloud-agnostic cell module" with a <code>var.cloud</code> switch — you will end up with a module where two-thirds of the resources are <code>count = var.cloud == "aws" ? 1 : 0</code>, which is unreadable and untestable. Build <code>modules/aws/cell</code>, <code>modules/gcp/cell</code>, <code>modules/azure/cell</code> with a <em>common input object schema and a common output contract</em>, enforced by <code>terraform test</code> in CI. Same interface, three implementations. That is the composition the docs are describing.</p>
+<p><strong>Networking as shared ownership.</strong> Split state at the ownership boundary. If a networking team owns the network state, you consume its outputs through a published contract — parameter store keys, not <code>terraform_remote_state</code>. This gives both teams independent apply cadence, independent locks, and a review surface that is an explicit interface change rather than "someone touched a shared state file."</p>
+<p><strong>The inventory is the real system.</strong> With 300 per-cell states, the highest-leverage artifact is not any module — it is the fleet registry: which cells exist, on which cloud/region/account, at what module version, at what Kubernetes version, in what lifecycle phase. Terraform consumes it; it does not own it. Build it deliberately.</p>
+<hr />
+<h2 id="learning-path">Learning path<a class="anchor" href="#learning-path">#</a></h2>
+<p><strong>Day 1 (4-6 hours).</strong> Install Terraform 1.16 and OpenTofu side by side. Read <a href="https://developer.hashicorp.com/terraform/language/state">the state docs</a> end to end — it is short and it is the whole game. Run Labs 1 and 3; the index-shift lab and the moved/import/removed lab together give you the correct mental model of state as an identity map. Then read your team's cell module top to bottom and write down every question; specifically, find out where they split state, whether they use workspaces, and where the Terraform-to-GitOps boundary sits. Skim <a href="https://developer.hashicorp.com/terraform/language/modules/develop/composition">module composition</a> and <a href="https://developer.hashicorp.com/terraform/language/modules/develop/providers">providers within modules</a>.</p>
+<p><strong>Week 1.</strong> Run Labs 2, 4, 5, and 6. Read the whole <a href="https://developer.hashicorp.com/terraform/language/meta-arguments/lifecycle"><code>lifecycle</code></a> page and the <a href="https://developer.hashicorp.com/terraform/language/manage-sensitive-data">manage sensitive data</a> page. Do a real, reviewed, small change to a production cell module end to end so you see the team's actual pipeline: what the plan output looks like in a PR, what the policy gate rejects, who approves, how apply is triggered. Write one <code>terraform test</code> file for an existing module that has none. Find out which of Terragrunt / Stacks / a home-grown generator your team uses for N cells, and read its config as carefully as you read the HCL. Ask what happens today when an apply dies halfway.</p>
+<p><strong>Month 1.</strong> Own a state-layout decision. Concretely: audit whether any cell state is large enough that plan time is hurting, and either split it or document why not. Build or improve the drift-detection job (<code>plan -detailed-exitcode</code> per cell, nightly, ticket on exit 2) — this is high-value, low-risk, and immediately visible. Read the full <a href="https://developer.hashicorp.com/terraform/internals/json-format">json-format spec</a> and write one Conftest policy that encodes a real platform invariant, then get it into the blocking gate. Form and write down an opinion on OpenTofu with the specific gaps named (state encryption, provider <code>for_each</code>, backend-config variables) so the conversation is about tradeoffs rather than vibes. Finally, sketch the cell-upgrade orchestration you would build — waves, health gates, resume-from-partial — because that is the senior-level gap Terraform structurally does not fill.</p>
+<hr />
+<h2 id="references">References<a class="anchor" href="#references">#</a></h2>
+<ol>
+<li><a href="https://developer.hashicorp.com/terraform">Terraform documentation</a> — canonical docs. Use the version selector; version-less search results are frequently stale.</li>
+<li><a href="https://github.com/hashicorp/terraform/releases/tag/v1.16.0">Terraform v1.16.0 release</a> — current stable, 2026-08-26. <code>import</code> in modules, <code>lifecycle { destroy = false }</code>, <code>state show -json</code>, <code>graph -format=mermaid</code>. Cite the tag, not the branch CHANGELOG, which still says "Unreleased."</li>
+<li><a href="https://raw.githubusercontent.com/hashicorp/terraform/main/CHANGELOG.md">Terraform CHANGELOG (main)</a> — the only reliable source for what shipped vs. what is still an experiment (see "deferred actions"). Per-version history at <a href="https://github.com/hashicorp/terraform/blob/v1.15/CHANGELOG.md">v1.15</a> and <a href="https://github.com/hashicorp/terraform/blob/v1.14/CHANGELOG.md">v1.14</a>.</li>
+<li><a href="https://developer.hashicorp.com/terraform/language/meta-arguments/for_each"><code>for_each</code> meta-argument</a> — keying rules, the unknown/sensitive restrictions, no implicit list→set conversion.</li>
+<li><a href="https://developer.hashicorp.com/terraform/language/v1.11.x/meta-arguments/count#when-to-use-for_each-instead-of-count"><code>count</code> — When to Use <code>for_each</code> Instead (v1.11.x)</a> — the index-shift explanation, removed from current docs; cite the pinned URL.</li>
+<li><a href="https://developer.hashicorp.com/terraform/language/meta-arguments/lifecycle"><code>lifecycle</code> meta-argument</a> — all eight arguments, the literal-values-only rule, and the "not recorded to state" caveat.</li>
+<li><a href="https://developer.hashicorp.com/terraform/language/block/moved"><code>moved</code> block</a> / <a href="https://developer.hashicorp.com/terraform/language/block/removed"><code>removed</code> block</a> / <a href="https://developer.hashicorp.com/terraform/language/import"><code>import</code> block</a> — config-driven state edits; added in 1.1, 1.7, and 1.5 respectively.</li>
+<li><a href="https://developer.hashicorp.com/terraform/language/provisioners">Provisioners</a> — the current "exhaust all alternatives" wording; the classic "last resort" phrasing is at <a href="https://developer.hashicorp.com/terraform/language/v1.11.x/resources/provisioners/syntax#provisioners-are-a-last-resort">the v1.11.x URL</a>.</li>
+<li><a href="https://developer.hashicorp.com/terraform/language/expressions/type-constraints#optional-object-type-attributes">Type constraints and <code>optional()</code></a> — optional object attributes with defaults, 1.3+.</li>
+<li><a href="https://developer.hashicorp.com/terraform/language/validate">Validation overview</a> — the one-stop version table for <code>validation</code>, preconditions/postconditions, and <a href="https://developer.hashicorp.com/terraform/language/block/check"><code>check</code> blocks</a>.</li>
+<li><a href="https://developer.hashicorp.com/terraform/language/expressions/dynamic-blocks#best-practices-for-dynamic-blocks"><code>dynamic</code> blocks</a> — including the explicit "always write nested blocks out literally where possible."</li>
+<li><a href="https://developer.hashicorp.com/terraform/language/functions/templatefile#generating-json-or-yaml-from-a-template"><code>templatefile</code></a> — and the guidance to use <code>jsonencode</code>/<code>yamlencode</code> for structured output.</li>
+<li><a href="https://developer.hashicorp.com/terraform/language/backend/s3">S3 backend</a> — <code>use_lockfile</code>, the DynamoDB deprecation, cross-account <code>assume_role</code> for state access.</li>
+<li><a href="https://developer.hashicorp.com/terraform/language/backend/gcs">GCS backend</a> and <a href="https://developer.hashicorp.com/terraform/language/backend/azurerm">AzureRM backend</a> — native locking on the other two clouds, plus <code>use_azuread_auth</code>.</li>
+<li><a href="https://developer.hashicorp.com/terraform/cli/workspaces#when-not-to-use-multiple-workspaces">CLI workspaces — when not to use them</a> — the shared-backend argument against workspaces-as-environments; see also <a href="https://developer.hashicorp.com/terraform/language/state/workspaces">state workspaces</a>.</li>
+<li><a href="https://developer.hashicorp.com/terraform/language/state/remote-state-data">Remote state data source</a> — the full-state-access caveat and the recommendation to publish data explicitly.</li>
+<li><a href="https://developer.hashicorp.com/terraform/cli/commands/state/rm"><code>terraform state rm</code></a> and <a href="https://developer.hashicorp.com/terraform/language/state/remove">state removal</a> — the docs' own steer toward <code>removed</code> blocks. See also <a href="https://developer.hashicorp.com/terraform/cli/commands/state/mv"><code>state mv</code></a>.</li>
+<li><a href="https://developer.hashicorp.com/terraform/language/modules/develop/composition">Module composition</a> and <a href="https://developer.hashicorp.com/terraform/language/modules/develop/structure">standard module structure</a> — the flat-composition argument and the conventional file layout.</li>
+<li><a href="https://developer.hashicorp.com/terraform/language/modules/develop/providers">Providers within modules</a> — the "must not contain any <code>provider</code> blocks" rule and <code>configuration_aliases</code>; the <a href="https://developer.hashicorp.com/terraform/language/block/provider#alias"><code>provider</code> block reference</a> covers aliases.</li>
+<li><a href="https://developer.hashicorp.com/terraform/language/tests">Terraform tests</a> and <a href="https://developer.hashicorp.com/terraform/language/tests/mocking">test mocking</a> — <code>.tftest.hcl</code>, <code>run</code> blocks, <code>mock_provider</code>, <code>override_*</code>. GA in 1.6, mocking in 1.7.</li>
+<li><a href="https://terratest.gruntwork.io/">Terratest</a> — Go-based integration testing (Gruntwork, third-party); the right tool for post-apply assertions against a live cell.</li>
+<li><a href="https://developer.hashicorp.com/terraform/language/stacks">Terraform Stacks overview</a> and <a href="https://developer.hashicorp.com/terraform/cli/commands/stacks"><code>terraform stacks</code> CLI</a> — read together, these prove Stacks needs HCP/TFE and show the 500-deployment limit. <a href="https://developer.hashicorp.com/terraform/language/stacks/update-GA">Beta→GA changes</a> cover the file extensions and the <code>orchestrate</code> deprecation.</li>
+<li><a href="https://opentofu.org/docs/">OpenTofu documentation</a> — start here; <a href="https://opentofu.org/docs/language/state/encryption/">state encryption</a> and <a href="https://opentofu.org/docs/language/providers/configuration/#for_each-multiple-instances-of-a-provider-configuration">provider <code>for_each</code></a> are the two pages that matter most for a cell platform.</li>
+<li><a href="https://github.com/opentofu/opentofu/releases/tag/v1.12.6">OpenTofu v1.12.6 release</a> — current stable, 2026-08-19. Governance: <a href="https://www.linuxfoundation.org/press/announcing-opentofu">Linux Foundation launch announcement</a>.</li>
+<li><a href="https://www.hashicorp.com/en/blog/hashicorp-adopts-business-source-license">HashiCorp adopts BUSL</a>, the <a href="https://www.hashicorp.com/license-faq">license FAQ</a>, and the <a href="https://github.com/hashicorp/terraform/blob/main/LICENSE">Terraform LICENSE</a> — BUSL 1.1, covers 1.6.0+, Licensor now IBM, Change License MPL 2.0.</li>
+<li><a href="https://docs.terragrunt.com/">Terragrunt documentation</a> and <a href="https://docs.terragrunt.com/features/stacks/explicit/">Terragrunt Stacks</a> — the DRY-root-module answer for N cells; note it defaults to the <code>tofu</code> binary.</li>
+<li><a href="https://developer.hashicorp.com/terraform/cdktf">CDKTF deprecation notice</a> — the verbatim deprecation, 2025-12-10. Secondary confirmation: <a href="https://github.com/hashicorp/terraform-cdk">the archived repo</a>.</li>
+<li><a href="https://docs.crossplane.io/latest/whats-new/">Crossplane — what's new</a> and <a href="https://www.cncf.io/projects/crossplane/">CNCF project page</a> — v2's namespaced XRs, removal of claims, function-only composition; graduated 2025-10-28.</li>
+<li><a href="https://www.pulumi.com/docs/">Pulumi documentation</a> — the alternative engine; see also <a href="https://www.pulumi.com/docs/iac/guides/building-extending/using-existing-tools/use-terraform-module/">running Terraform modules from Pulumi</a>.</li>
+<li><a href="https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs">hashicorp/kubernetes provider</a> — the capitalized WARNING about stacking cluster creation with Kubernetes resources; the single best citation for "stop at the cluster boundary." The <a href="https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/manifest"><code>kubernetes_manifest</code> resource</a> documents the plan-time API access requirement verbatim.</li>
+<li><a href="https://registry.terraform.io/providers/hashicorp/helm/latest/docs">hashicorp/helm provider</a> and its <a href="https://registry.terraform.io/providers/hashicorp/helm/latest/docs/guides/v3-upgrade-guide">v3 upgrade guide</a> — the block→attribute syntax break; confirm the embedded Helm version in <code>go.mod</code> before assuming Helm 4 support.</li>
+<li><a href="https://developer.hashicorp.com/terraform/cli/commands/plan"><code>terraform plan</code></a> and <a href="https://developer.hashicorp.com/terraform/cli/commands/apply"><code>terraform apply</code></a> — <code>-out</code>, <code>-refresh=false</code>, <code>-target</code>, <code>-replace</code>, <code>-detailed-exitcode</code>, saved-plan mode, and the <code>-parallelism</code> default of 10, all with the official warnings.</li>
+<li><a href="https://developer.hashicorp.com/terraform/internals/json-format">JSON output format</a> — the plan/state JSON schema for policy gates; cross-check <code>format_version</code> against <a href="https://raw.githubusercontent.com/hashicorp/terraform/main/internal/command/jsonplan/plan.go">the source constant</a>.</li>
+<li><a href="https://developer.hashicorp.com/terraform/cli/config/config-file">CLI configuration file</a> — <code>TF_PLUGIN_CACHE_DIR</code>, its concurrency warning, and <code>provider_installation</code> mirrors.</li>
+<li><a href="https://developer.hashicorp.com/terraform/language/files/dependency-lock">Dependency lock file</a> and <a href="https://developer.hashicorp.com/terraform/cli/commands/providers/lock#platform-os_arch"><code>terraform providers lock</code></a> — providers only, and the multi-platform hash problem.</li>
+<li><a href="https://developer.hashicorp.com/terraform/language/manage-sensitive-data">Manage sensitive data</a> — the plaintext-state statement and <code>sensitive</code> limits; <a href="https://developer.hashicorp.com/terraform/language/manage-sensitive-data/write-only">write-only arguments</a> (1.11) and <a href="https://developer.hashicorp.com/terraform/language/block/ephemeral">ephemeral resources</a> (1.10) are the only in-Terraform fix.</li>
+<li><a href="https://registry.terraform.io/providers/hashicorp/vault/latest/docs">hashicorp/vault provider</a> — 24 ephemeral resources; the practical partner to write-only arguments.</li>
+<li><a href="https://developer.hashicorp.com/terraform/cli/commands/refresh"><code>terraform refresh</code></a> — deprecated, plus the "may remove all tracked objects without confirmation" warning worth quoting in a runbook. Fleet drift: <a href="https://developer.hashicorp.com/terraform/cloud-docs/workspaces/health#drift-detection">HCP Terraform workspace health</a>.</li>
+<li><a href="https://github.com/aquasecurity/tfsec/discussions/1994">tfsec → Trivy announcement</a> and <a href="https://trivy.dev/docs/latest/scanner/misconfiguration/">Trivy misconfiguration scanning</a> — the retirement, and where the rules went. Alternatives: <a href="https://www.conftest.dev/">Conftest</a>, <a href="https://www.checkov.io/">Checkov</a>, <a href="https://developer.hashicorp.com/sentinel">Sentinel</a>, and the beta <a href="https://developer.hashicorp.com/terraform/policy">Terraform Policy</a>.</li>
+<li><a href="https://registry.terraform.io/providers/hashicorp/aws/latest/docs#assume_role-configuration-block">AWS provider <code>assume_role</code></a>, <a href="https://registry.terraform.io/providers/hashicorp/google/latest/docs/guides/provider_reference">Google provider reference</a>, <a href="https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs">AzureRM provider</a> — cross-account, impersonation, and multi-subscription/OIDC configuration for the three clouds.</li>
+</ol><p class="disclaimer"><strong>Disclaimer.</strong> I wrote this library before I joined Temporal, to ramp up on the areas my new role would likely touch. It contains no internal information &mdash; nothing here was sourced from Temporal&rsquo;s internal knowledge. Temporal is open source, so the programming model and server internals come from public code and documentation, and every statement about Temporal Cloud comes from Temporal&rsquo;s public docs and engineering blog, linked inline. Most of the library is general infrastructure technology &mdash; Go, gRPC, Kubernetes, Karpenter, Terraform, Helm, Vault, cert-manager, GitOps, observability &mdash; that has nothing to do with any one company. Where a guide goes beyond public sources, it says so and labels the claim as inference.</p></article><aside class="rail"><div class="rail-label">On this page</div><a href="#the-mental-model">The mental model</a><a href="#core-concepts">Core concepts</a><a class="h3" href="#the-planapply-cycle-precisely">The plan/apply cycle, precisely</a><a class="h3" href="#hcl-in-the-depth-you-actually-need">HCL, in the depth you actually need</a><a class="h3" href="#state-management-at-scale">State management at scale</a><a class="h3" href="#module-design">Module design</a><a class="h3" href="#multi-cloud-multi-region-multi-account">Multi-cloud, multi-region, multi-account</a><a class="h3" href="#kubernetes-and-terraform-where-to-stop">Kubernetes and Terraform: where to stop</a><a class="h3" href="#cicd">CI/CD</a><a class="h3" href="#the-opentofu-fork">The OpenTofu fork</a><a class="h3" href="#performance-at-scale">Performance at scale</a><a class="h3" href="#secrets-in-terraform">Secrets in Terraform</a><a href="#hands-on">Hands-on</a><a class="h3" href="#setup">Setup</a><a class="h3" href="#lab-1--reproduce-the-count-index-shift-disaster">Lab 1 — Reproduce the count index-shift disaster</a><a class="h3" href="#lab-2--module-interfaces-optional-and-validation">Lab 2 — Module interfaces, optional(), and validation</a><a class="h3" href="#lab-3--moved-import-removed">Lab 3 — moved, import, removed</a><a class="h3" href="#lab-4--remote-state-native-s3-locking-and-a-lock-collision-localstack-free">Lab 4 — Remote state, native S3 locking, and a lock collision (LocalStack, free)</a><a class="h3" href="#lab-5--terraform-test-with-mocked-providers">Lab 5 — terraform test with mocked providers</a><a class="h3" href="#lab-6--plan-json-and-a-policy-gate">Lab 6 — Plan JSON and a policy gate</a><a class="h3" href="#lab-7--costed-optional">Lab 7 — costed, optional</a><a href="#production-gotchas">Production gotchas</a><a href="#how-this-shows-up-in-cell-lifecycle">How this shows up in cell lifecycle</a><a href="#learning-path">Learning path</a><a href="#references">References</a></aside></div></div><script>
+document.querySelectorAll('.codehilite').forEach(function(block){
+  var wrap=document.createElement('div'); wrap.className='codewrap';
+  block.parentNode.insertBefore(wrap,block); wrap.appendChild(block);
+  var b=document.createElement('button'); b.className='copybtn'; b.textContent='copy';
+  b.addEventListener('click',function(){
+    var txt=block.innerText;
+    if(navigator.clipboard&&navigator.clipboard.writeText){
+      navigator.clipboard.writeText(txt).then(function(){
+        b.textContent='copied'; setTimeout(function(){b.textContent='copy';},1200);
+      }).catch(function(){b.textContent='select manually';});
+    } else {
+      var ta=document.createElement('textarea'); ta.value=txt; document.body.appendChild(ta);
+      ta.select(); try{document.execCommand('copy'); b.textContent='copied';}catch(e){}
+      document.body.removeChild(ta); setTimeout(function(){b.textContent='copy';},1200);
+    }
+  });
+  wrap.appendChild(b);
+});
+
+document.querySelectorAll('.doc table').forEach(function(t){
+  if(t.parentNode.classList.contains('tablewrap'))return;
+  var w=document.createElement('div'); w.className='tablewrap';
+  t.parentNode.insertBefore(w,t); w.appendChild(t);
+});
+
+(function(){
+  var links=Array.prototype.slice.call(document.querySelectorAll('.rail a'));
+  if(!links.length)return;
+  var map={};
+  links.forEach(function(a){
+    var el=document.getElementById(a.getAttribute('href').slice(1));
+    if(el)map[a.getAttribute('href').slice(1)]=a;
+  });
+  var obs=new IntersectionObserver(function(entries){
+    entries.forEach(function(e){
+      var a=map[e.target.id]; if(!a)return;
+      if(e.isIntersecting){
+        links.forEach(function(x){x.classList.remove('here');});
+        a.classList.add('here');
+      }
+    });
+  },{rootMargin:'0px 0px -78% 0px',threshold:0});
+  Object.keys(map).forEach(function(id){
+    var el=document.getElementById(id); if(el)obs.observe(el);
+  });
+})();
+</script>
+<script>/* open external links in a new tab; links within the library stay in this tab */
+document.addEventListener('click',function(e){var a=e.target.closest&&e.target.closest('a[href]');if(!a)return;var h=a.getAttribute('href');if(!h||h.charAt(0)==='#'||h.indexOf('javascript:')===0||a.hasAttribute('download'))return;if(!/^https?:$/.test(a.protocol)||a.host===location.host)return;a.target='_blank';a.rel='noopener';},true);
+</script>
+</body>
+</html>

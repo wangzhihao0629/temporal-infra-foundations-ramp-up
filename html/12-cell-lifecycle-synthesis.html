@@ -1,0 +1,1560 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>The Cell as a System — How Fifteen Tools Become One Job - Temporal Cloud Infrastructure Ramp-Up</title>
+<link rel="stylesheet" href="style.css">
+<script>
+(function(){
+  try{
+    var t=localStorage.getItem('rampup-theme');
+    if(t){document.documentElement.setAttribute('data-theme',t);}
+  }catch(e){}
+  window.__toggleTheme=function(){
+    var el=document.documentElement;
+    var cur=el.getAttribute('data-theme');
+    if(!cur){
+      cur=window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';
+    }
+    var next=cur==='dark'?'light':'dark';
+    el.setAttribute('data-theme',next);
+    try{localStorage.setItem('rampup-theme',next);}catch(e){}
+  };
+})();
+</script>
+
+</head>
+<body>
+<div class="shell"><aside class="sidebar">
+  <div class="brand"><a href="../index.html">
+    <div class="brand-title">Temporal Cloud Infrastructure Ramp-Up</div>
+    <div class="brand-sub">New-role ramp-up &middot; public sources only</div>
+  </a></div>
+  <div class="nav-label">Guides</div>
+  <nav class="nav"><a href="01-golang.html"><span class="num">01</span><span>Go</span></a><a href="02-grpc.html"><span class="num">02</span><span>gRPC &amp; Protobuf</span></a><a href="03-multicloud-aws-gcp-azure.html"><span class="num">03</span><span>Multi-Cloud</span></a><a href="04-managed-kubernetes-eks-gke-aks.html"><span class="num">04</span><span>Managed Kubernetes</span></a><a href="05-cni-and-host-networking.html"><span class="num">05</span><span>CNI &amp; Host Networking</span></a><a href="06-karpenter.html"><span class="num">06</span><span>Karpenter</span></a><a href="07-kyverno.html"><span class="num">07</span><span>Kyverno</span></a><a href="08-terraform.html"><span class="num">08</span><span>Terraform</span></a><a href="09-helm.html"><span class="num">09</span><span>Helm</span></a><a href="10-vault.html"><span class="num">10</span><span>Vault</span></a><a href="11-cert-manager-and-pki.html"><span class="num">11</span><span>cert-manager &amp; PKI</span></a><a href="12-cell-lifecycle-synthesis.html" class="active"><span class="num">12</span><span>Cell Lifecycle</span></a><a href="13-gitops-argocd-flux.html"><span class="num">13</span><span>GitOps</span></a><a href="14-observability-for-cells.html"><span class="num">14</span><span>Observability</span></a><a href="15-temporal-programming-model.html"><span class="num">15</span><span>Temporal: Programming Model</span></a><a href="16-temporal-server-internals.html"><span class="num">16</span><span>Temporal Server Internals</span></a><a href="17-cell-based-architecture.html"><span class="num">17</span><span>Cell-Based Architecture</span></a></nav>
+  <div class="nav-label" style="margin-top:1rem">Practice</div>
+  <nav class="nav"><a href="../drill.html"><span class="num">&#9670;</span><span>Drill deck</span></a></nav>
+</aside><div class="main"><article class="doc"><div class="topbar">
+  <div class="crumbs"><span class="pill">Guide 12</span><span class="pill">50 refs</span><span class="pill">18,037 words</span></div>
+  <div style="display:flex;gap:.5rem;align-items:center">
+    <span>~90 min read</span>
+    <button class="iconbtn" onclick="__toggleTheme()">theme</button>
+  </div>
+</div><h1>The Cell as a System — How Fifteen Tools Become One Job</h1>
+<div class="lede"><p><strong>Why this matters.</strong> The other sixteen guides in this library each teach a tool, a system, or a signal. None of them teaches <em>the job</em>. The job is a single verb applied to a single noun: <strong>converge a cell</strong>. A cell is a self-contained unit of Temporal Cloud capacity, and cell-lifecycle work owns its whole life — bring it into existence in AWS, GCP, or Azure; keep it identical to its several hundred siblings; move it forward one version at a time without anyone noticing; and eventually delete it without leaving a load balancer, a disk, an ENI, a DNS record, an IAM role, or a KMS key behind. Every tool in guides 01–11 is a <em>stage in that pipeline</em>; <a href="13-gitops-argocd-flux.html">13</a> and <a href="14-observability-for-cells.html">14</a> are the loop and the gate that keep the pipeline running; <a href="15-temporal-programming-model.html">15</a> and <a href="16-temporal-server-internals.html">16</a> are the workload the whole thing exists to carry. And the interesting engineering is almost never inside a stage. It is in the ordering between them, in the six or seven places where the ordering is circular and someone had to break the cycle, and in the tests and gates that let a person ship a change to three hundred cells on a Tuesday afternoon without their pulse rising. This guide is the map. Read it first, and re-read it every time one of the other guides starts to feel like trivia.</p></div>
+<p><strong>On sourcing.</strong> Temporal has published a meaningful amount about how Temporal Cloud is built, and I quote it directly and link it. Everywhere I go beyond what Temporal has said publicly, I mark the claim as <em>industry pattern</em> or <em>inference</em> and say so in the sentence. Nothing in this guide is an internal Temporal detail; I do not have any. Verified against primary sources on <strong>2026-08-29</strong>.</p>
+<hr />
+<h2 id="how-to-use-this-library">How to use this library<a class="anchor" href="#how-to-use-this-library">#</a></h2>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>Guide</th>
+<th>What it is for</th>
+<th>When you reach for it</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>01</td>
+<td><a href="01-golang.html">Go for Infrastructure Engineers</a></td>
+<td>The language every control-plane component, controller, operator, and Temporal workflow is written in</td>
+<td>Continuously. Reading Go is a bigger part of the job than writing it</td>
+</tr>
+<tr>
+<td>02</td>
+<td><a href="02-grpc.html">gRPC and Protocol Buffers</a></td>
+<td>Temporal's entire client/server contract, plus the LB, keepalive, and drain semantics that decide whether a cell upgrade is invisible</td>
+<td>Any incident that looks like an application error but is really a load balancer</td>
+</tr>
+<tr>
+<td>03</td>
+<td><a href="03-multicloud-aws-gcp-azure.html">AWS / GCP / Azure Foundations</a></td>
+<td>The three-column comparison substrate: tenancy, identity, network, ingress, state, keys</td>
+<td>Every time you write or review a per-cloud branch</td>
+</tr>
+<tr>
+<td>04</td>
+<td><a href="04-managed-kubernetes-eks-gke-aks.html">Managed Kubernetes: EKS / GKE / AKS</a></td>
+<td>The seam between Kubernetes and the cloud: version policy, node abstraction, upgrade mechanics, teardown ordering</td>
+<td>Cell provisioning and the never-ending upgrade pipeline</td>
+</tr>
+<tr>
+<td>05</td>
+<td><a href="05-cni-and-host-networking.html">CNI and Host-Level Networking</a></td>
+<td>The datapath from kernel primitives up. IPAM, MTU, conntrack, kube-proxy modes, eBPF</td>
+<td>The layer often co-owned with a networking team, and the one that produces the most confusing 3 a.m. pages</td>
+</tr>
+<tr>
+<td>06</td>
+<td><a href="06-karpenter.html">Karpenter</a></td>
+<td>What machines a cell is made of, and — more dangerously — when one gets deleted</td>
+<td>Node image upgrades, capacity policy, and every "why did that node go away" question</td>
+</tr>
+<tr>
+<td>07</td>
+<td><a href="07-kyverno.html">Kyverno</a></td>
+<td>Policy as code: <code>generate</code> rules as cell bootstrap, <code>validate</code> rules as the guardrail on everything else</td>
+<td>Encoding the invariants the other ten guides describe, so they become compile-time errors</td>
+</tr>
+<tr>
+<td>08</td>
+<td><a href="08-terraform.html">Terraform</a></td>
+<td>State layout, which is what actually determines blast radius across N cells</td>
+<td>Anything below the Kubernetes API server</td>
+</tr>
+<tr>
+<td>09</td>
+<td><a href="09-helm.html">Helm — As a Templating Engine</a></td>
+<td>Rendering manifests, and what you owe yourself once you throw away release state</td>
+<td>Anything above the Kubernetes API server</td>
+</tr>
+<tr>
+<td>10</td>
+<td><a href="10-vault.html">HashiCorp Vault</a></td>
+<td>Where a cell's secrets come from and where they go when the cell dies</td>
+<td>Bootstrap ordering, and the "cell will not unseal" class of outage</td>
+</tr>
+<tr>
+<td>11</td>
+<td><a href="11-cert-manager-and-pki.html">cert-manager and PKI</a></td>
+<td>Issuance, trust distribution, and rotation — three separate disciplines</td>
+<td>mTLS everywhere, and the one project that has no undo button</td>
+</tr>
+<tr>
+<td>12</td>
+<td><strong>This guide</strong></td>
+<td>The composition. The dependency DAG, the bootstrap paradoxes, the upgrade and teardown stories, the questions to ask</td>
+<td>First, and then repeatedly</td>
+</tr>
+<tr>
+<td>13</td>
+<td><a href="13-gitops-argocd-flux.html">GitOps: Argo CD and Flux</a></td>
+<td>The reconciler that owns everything above the API server: inventory, pruning, health assessment, and fanning one change across N cells</td>
+<td>Every convergence question, and every "why is this cell OutOfSync" page</td>
+</tr>
+<tr>
+<td>14</td>
+<td><a href="14-observability-for-cells.html">Observability for Cells</a></td>
+<td>Prometheus, OTel, SLOs — and the cell health gate that decides whether a freshly built cell may take traffic</td>
+<td>Defining "ready" and "healthy" as something a machine can evaluate</td>
+</tr>
+<tr>
+<td>15</td>
+<td><a href="15-temporal-programming-model.html">Temporal: the Programming Model</a></td>
+<td>The customer's seat: durable execution, determinism, versioning, workers and long polls</td>
+<td>Understanding what your cells actually carry, and why a customer's retry policy is your capacity problem</td>
+</tr>
+<tr>
+<td>16</td>
+<td><a href="16-temporal-server-internals.html">Temporal Server Internals</a></td>
+<td>Code level: History shards and the range-ID fence, Matching partitions, persistence, membership</td>
+<td>Sizing <code>numHistoryShards</code>, sequencing a rolling restart, and any shard-unavailability alert</td>
+</tr>
+<tr>
+<td>17</td>
+<td><a href="17-cell-based-architecture.html">Cell-Based Architecture</a></td>
+<td>The pattern itself: router, partition key, placement, migration, deployment waves, what may be shared between cells</td>
+<td>Any design discussion about routing, tenant placement, failover, or blast radius — and design reviews</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Suggested reading order.</strong></p>
+<ol>
+<li><strong>This guide, end to end.</strong> It will name things you have not learned yet. That is intentional; the names give the other guides somewhere to attach.</li>
+<li><strong><a href="03-multicloud-aws-gcp-azure.html">03</a> and <a href="04-managed-kubernetes-eks-gke-aks.html">04</a></strong> — the substrate. Read them as a pair; almost every fact in 04 is a consequence of a scoping rule in 03.</li>
+<li><strong><a href="05-cni-and-host-networking.html">05</a></strong> — the deepest and most load-bearing guide in the set, and the one whose material you co-own with another team. Do its Lab 1 with your hands.</li>
+<li><strong><a href="08-terraform.html">08</a> and <a href="09-helm.html">09</a></strong> — the delivery mechanics, below and above the API server respectively. The boundary between them is a design decision your team has already made; find out where they drew it.</li>
+<li><strong><a href="13-gitops-argocd-flux.html">13</a></strong> — immediately after 09, because 08 and 09 both stop mid-sentence and hand off to it. This is the component whose logs you will read most.</li>
+<li><strong><a href="11-cert-manager-and-pki.html">11</a> then <a href="10-vault.html">10</a></strong> — the trust and secret spine. In that order, because cert-manager gives you the vocabulary that makes Vault's PKI engine make sense.</li>
+<li><strong><a href="06-karpenter.html">06</a> and <a href="07-kyverno.html">07</a></strong> — the two cluster-level controllers that can, respectively, delete your cell's nodes and refuse to let your cell start.</li>
+<li><strong><a href="14-observability-for-cells.html">14</a></strong> — once you know what a cell is made of, this is how you decide whether one is healthy. Its cell health gate is the thing the whole pipeline terminates in.</li>
+<li><strong><a href="15-temporal-programming-model.html">15</a> then <a href="16-temporal-server-internals.html">16</a></strong> — in that order, always. 16 is the deepest and most role-specific guide in the library, and it assumes the customer-side vocabulary that 15 supplies. Read 15 in an evening; give 16 a week.</li>
+<li><strong><a href="01-golang.html">01</a> and <a href="02-grpc.html">02</a></strong> — continuously, as reference, from day one.</li>
+<li><strong>This guide again</strong>, after the other fifteen. It will read completely differently.</li>
+</ol>
+<hr />
+<h2 id="the-mental-model">The mental model<a class="anchor" href="#the-mental-model">#</a></h2>
+<p>Hold five ideas. Everything else in this guide is a consequence of one of them.</p>
+<p><strong>1. A cell is a blast radius with a bill attached.</strong> The whole point of a cell is that when something goes wrong inside it, the thing that went wrong is confined to it. AWS's <a href="https://docs.aws.amazon.com/wellarchitected/latest/reducing-scope-of-impact-with-cell-based-architecture/what-is-a-cell-based-architecture.html">cell-based architecture whitepaper</a> traces the idea to a ship's bulkhead: watertight compartments so a hull breach floods one section rather than the vessel. Translated: "If a workload uses 10 cells to service 100 requests, when a failure occurs in one cell, 90% of the overall requests would be unaffected." The cost of that property is that you now operate N copies of everything, and every operational task is multiplied by N. Which means the actual product of cell-lifecycle work is not a cell — it is <strong>the automation that makes N cells cost about as much attention as one</strong>.</p>
+<p><strong>2. Provisioning a cell is a distributed transaction with no rollback, so it is modelled as a workflow.</strong> Temporal has said this publicly and specifically: control-plane tasks "involve complex long-running processes with many interdependent steps," and each cell has an <em>entity workflow</em> that "manages its lifecycle, from provisioning to upgrades" (<a href="https://temporal.io/blog/building-durable-cloud-control-systems-with-temporal">Building durable cloud control systems with Temporal</a>). The engineering consequence is that every step in the cell DAG must be an <strong>idempotent, retryable, individually-timed activity</strong>, and the DAG itself must be <strong>deterministic and resumable from any point</strong>. This is not a stylistic preference; it is what makes a half-failed cell recoverable instead of garbage.</p>
+<p><strong>3. Level-triggered beats edge-triggered, everywhere, always.</strong> "Create a cell" is a tempting way to think about provisioning and it is wrong. The right frame is: there is a <strong>desired state</strong> for cell <code>usw2-07</code>, there is an <strong>observed state</strong>, and something converges the difference — repeatedly, forever, tolerating being interrupted at any instant. Provisioning is the first pass of the convergence loop. Upgrade is a change to the desired state. Teardown is setting the desired state to empty. One loop, three names. Every tool in this library that works well works this way (Kubernetes controllers, Karpenter, GitOps agents, Terraform's plan/apply); every tool that works badly is one where somebody bolted an imperative script on the side.</p>
+<p><strong>4. The interesting part is the ordering, and the ordering has cycles in it.</strong> You cannot install the autoscaler without a node; you cannot get a node without the autoscaler. You cannot issue a certificate without a CA; the CA needs a certificate. You cannot run the policy engine without a certificate; the certificate issuer must pass the policy engine. Each of these is a real cycle in the dependency graph, and each one is broken by a specific, deliberate, slightly ugly trick. Knowing those tricks — and knowing that they exist and are <em>supposed</em> to be there — is most of what separates someone who can debug a stuck cell from someone who cannot. There is a whole section on this below.</p>
+<p><strong>5. Cross-cell dependencies destroy the property you paid for.</strong> AWS says it plainly in <a href="https://docs.aws.amazon.com/wellarchitected/latest/reducing-scope-of-impact-with-cell-based-architecture/cell-design.html">Cell design</a>: "Cells should have no dependency on each other at all (that is, no cross-cell API calls, no shared resources like databases or S3 buckets.) Even the use of separate AWS accounts is encouraged." Every shared thing you add — a shared Vault, a shared observability backend, a shared registry, a shared DNS zone — is a correlated failure domain that spans every cell in the fleet. Some of these are unavoidable; the discipline is to <em>name each one out loud</em>, decide whether it is on the request path or only on the control path, and make sure the cell keeps serving when the shared thing is down.</p>
+<hr />
+<h2 id="core-concepts">Core concepts<a class="anchor" href="#core-concepts">#</a></h2>
+<h3 id="what-a-cell-is-and-why-a-multi-tenant-saas-converges-on-one">What a cell is, and why a multi-tenant SaaS converges on one<a class="anchor" href="#what-a-cell-is-and-why-a-multi-tenant-saas-converges-on-one">#</a></h3>
+<p>Start from the constraint, not the pattern. A managed service has to choose a tenancy model. Temporal's public account of that decision: single-tenancy — a dedicated cluster per customer — "offers simplicity and isolation," but "customers end up paying for unused capacity, and providers shoulder higher operational costs," so "multi-tenancy, though harder to implement, emerged as the clear winner" (<a href="https://temporal.io/blog/building-durable-cloud-control-systems-with-temporal">Temporal blog</a>).</p>
+<p>Having chosen multi-tenancy, you have imported a problem: every failure is now potentially everyone's failure. A bad deploy, a poison-pill request, a hot tenant, a corrupted index — all of them are, by default, global. Cells are the answer: you take the multi-tenant system and instantiate it N times, each instance complete and independent, and you route each tenant to exactly one instance.</p>
+<p>The AWS whitepaper decomposes that into three parts, and it is worth memorizing the decomposition because it is the vocabulary everyone uses:</p>
+<ul>
+<li><strong>Cell</strong> — "A complete workload, with everything needed to operate independently."</li>
+<li><strong>Cell router</strong> — "the <em>thinnest possible layer</em>, with the responsibility of routing requests to the right cell, and only that."</li>
+<li><strong>Control plane</strong> — "Responsible for administration tasks, such as provisioning cells, de-provisioning cells, and migrating cell customers."</li>
+</ul>
+<p>The router is deliberately dumb because it is the one component that is <em>not</em> cellular — it sees all traffic, so its blast radius is global, so it must be simple enough to be nearly bug-free. That principle generalizes: any component that spans cells must be radically simpler than the components inside cells.</p>
+<p>The <strong>partition key</strong> is the other half of the router's job. AWS: "The overall workload is partitioned by a partition key. This key needs to align with the <em>grain</em> of the service, or the natural way that a service's workload can be subdivided with minimal cross-cell interactions." For Temporal Cloud, the natural grain is publicly visible in the product: the Namespace. Temporal's namespace-provisioning workflow begins by "selecting a suitable cell within the chosen region" (<a href="https://temporal.io/blog/building-durable-cloud-control-systems-with-temporal">Temporal blog</a>). A <a href="https://docs.temporal.io/cloud/namespaces">Namespace</a> is described in the docs as "a unit of isolation within Temporal Cloud, providing security boundaries, Workflow management, unique identifiers, and gRPC endpoints." That is a partition key with the grain built in.</p>
+<h3 id="cell-vs-shard-vs-availability-zone-vs-region">Cell vs shard vs availability zone vs region<a class="anchor" href="#cell-vs-shard-vs-availability-zone-vs-region">#</a></h3>
+<p>These four words get used interchangeably by people who have not thought about it, and precisely by people who have. Be in the second group.</p>
+<table>
+<thead>
+<tr>
+<th>Concept</th>
+<th>What it partitions</th>
+<th>Who chose the boundary</th>
+<th>Failure semantics</th>
+<th>Can you add more?</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Availability zone</strong></td>
+<td>Physical infrastructure — power, cooling, network</td>
+<td>The cloud provider</td>
+<td>Correlated failure inside, independent across (mostly). Temporal Cloud replicates standard Namespace state across <strong>three AZs</strong> before acknowledging a write (<a href="https://docs.temporal.io/cloud/high-availability">HA docs</a>)</td>
+<td>No. Fixed per region</td>
+</tr>
+<tr>
+<td><strong>Region</strong></td>
+<td>Geography, jurisdiction, data residency</td>
+<td>The cloud provider</td>
+<td>Independent, but with real latency and cost between them</td>
+<td>Only by launching in a new one</td>
+</tr>
+<tr>
+<td><strong>Cell</strong></td>
+<td>A complete, independent instance of your workload</td>
+<td><strong>You</strong></td>
+<td>Independent by construction; you own how independent</td>
+<td>Yes — that is the point. Provisioning a cell is the scaling primitive</td>
+</tr>
+<tr>
+<td><strong>Shard</strong></td>
+<td>Data within one system, for throughput</td>
+<td>You, usually at install time</td>
+<td><em>Not</em> a fault boundary by default. A shard loss is a partial outage of one cell</td>
+<td>Often not. Temporal's History Shard count "cannot be changed" after the database is integrated (<a href="https://docs.temporal.io/temporal-service/temporal-server">Temporal Server docs</a>)</td>
+</tr>
+</tbody>
+</table>
+<p>The distinction that matters most for cell work: <strong>a shard is a throughput unit, a cell is a fault unit.</strong> Temporal's History Shards are the clearest example in your own stack. Each History Shard "maps to a single persistence partition" and "represents the number of concurrent database operations that can occur"; Temporal recommends "1 History Service process for every 500 History Shards," and the total is fixed for the life of the service. Shards buy you concurrency. They buy you nothing in blast radius — a wedged shard degrades every namespace whose workflows hash into it, within that cell. The cell is what stops that from spreading.</p>
+<p>A fourth relationship worth holding: <strong>cells nest inside regions, and both nest inside a cloud.</strong> Temporal Cloud publicly operates in <a href="https://docs.temporal.io/cloud/regions">multiple AWS and GCP regions</a>, and the <a href="https://docs.temporal.io/cloud/high-availability">High Availability docs</a> describe Multi-region Replication, Multi-cloud Replication, and — most relevant here — <strong>Same-region Replication</strong>, where "Temporal operates a 'cell architecture' and will replicate the Namespace across multiple cells in that region." That last sentence is the single most direct public confirmation that cells are a first-class, customer-visible construct, and that cell-to-cell failover within a region is a thing that happens automatically.</p>
+<h3 id="cell-sizing-the-three-way-tension">Cell sizing: the three-way tension<a class="anchor" href="#cell-sizing-the-three-way-tension">#</a></h3>
+<p>A cell has a maximum size, and choosing it is a real design decision rather than a capacity-planning afterthought. AWS names <a href="https://docs.aws.amazon.com/wellarchitected/latest/reducing-scope-of-impact-with-cell-based-architecture/cell-sizing.html">three opposing forces</a>:</p>
+<ul>
+<li>Big enough to fit the largest single workload you will ever accept.</li>
+<li>Small enough to <strong>test at full scale</strong>, and to stay below account and region quotas.</li>
+<li>Big enough to get economies of scale.</li>
+</ul>
+<p>The second one is the one people underweight and the one a senior engineer should defend. If a cell is too large to load-test to its own stated limit, then the cell's limit is a guess, and you will discover it during an incident. AWS's framing of what a cell's capacity <em>is</em>: "How many transactions per second can a cell handle? How many customers or tenants does it support? How many GB of transfer per second or stored capacity does it support?" If your team cannot answer those three questions with measured numbers for each cloud, that is a gap worth owning.</p>
+<p>The smaller-vs-larger trade table from the whitepaper is worth internalizing: smaller cells mean a smaller scope of impact, less chance of hitting a quota cliff, and cheaper full-scale testing, at the cost of more cells to operate and more idle headroom. Larger cells mean better utilization and fewer things to operate, at the cost of a bigger blast radius and a higher chance of hitting a limit that nobody knew existed. Note that "more cells to operate" is only expensive if your automation is weak — which is the argument that your team's automation quality is what actually sets the optimal cell size.</p>
+<h3 id="what-temporal-cloud-is-publicly-known-to-run">What Temporal Cloud is publicly known to run<a class="anchor" href="#what-temporal-cloud-is-publicly-known-to-run">#</a></h3>
+<p>Everything in this subsection is from Temporal's own published material. Where I extrapolate, I say so.</p>
+<p><strong>The unit.</strong> From the Temporal engineering blog: "Each cell operates as a self-contained unit with its own AWS account, VPC, EKS cluster, and supporting infrastructure. While this approach is framed within the context of AWS, we have applied the same principles to Google Cloud Platform (GCP), leveraging its equivalent primitives." Each cell includes:</p>
+<ul>
+<li><strong>Compute pods</strong> running "Temporal services and infrastructure tools for observability, ingress management, and certificate handling."</li>
+<li><strong>Databases</strong> — "both primary databases and Elasticsearch for enhanced visibility."</li>
+<li><strong>Additional components</strong> — "Load balancers, private connectivity endpoints, and other supporting infrastructure."</li>
+</ul>
+<p>That maps one-to-one onto this library: EKS/GKE/AKS is guide <a href="04-managed-kubernetes-eks-gke-aks.html">04</a>, the VPC is guide <a href="05-cni-and-host-networking.html">05</a>, the account boundary is guide <a href="03-multicloud-aws-gcp-azure.html">03</a>, "certificate handling" is guide <a href="11-cert-manager-and-pki.html">11</a>, and "ingress management" is the seam usually shared with a networking team.</p>
+<p><strong>The application inside the cell.</strong> The Temporal Server is <a href="https://docs.temporal.io/temporal-service/temporal-server">four independently scalable services</a>:</p>
+<ul>
+<li><strong>Frontend</strong> — stateless gateway; rate limiting, authorizing, validating, routing. gRPC on 7233, membership on 6933. Scales differently from the rest "because it has no sharding or partitioning; it is just stateless."</li>
+<li><strong>History</strong> — persists Workflow Execution state to Event History; owns mutable state, timers, and the internal Transfer / Timer / Replicator / Visibility task queues. 7234 / 6934.</li>
+<li><strong>Matching</strong> — hosts user-facing Task Queues and matches Workers to Tasks. 7235 / 6935.</li>
+<li><strong>Worker</strong> — internal background workflows and the replication queue. Membership on 6939.</li>
+</ul>
+<p>Services find each other through a membership protocol via <a href="https://github.com/temporalio/ringpop-go">Ringpop</a>. The docs' own example of a production shape: "5 Frontend, 15 History, 17 Matching, and 3 Worker Services per Temporal Service." Two consequences for you: the internal traffic is <strong>gRPC over a hash ring</strong>, not over a load balancer, which is why the guide <a href="02-grpc.html">02</a> material on client-side round-robin over headless Services matters; and <strong>History is the stateful one</strong>, which is why drain and PDB policy for History is a different conversation from drain policy for Frontend.</p>
+<p><strong>Persistence.</strong> <a href="https://docs.temporal.io/temporal-service/persistence">Persistence docs</a>: the required dependency is a persistence database (Cassandra, PostgreSQL, or MySQL), with a separate <strong>visibility</strong> store. Elasticsearch is recommended for production visibility; SQL-based advanced visibility is available from Server 1.20. Temporal's public multi-cloud writeup is specific about the AWS shape: "Temporal depends on a visibility layer, for which we use AWS OpenSearch with no clear equivalent in Google Cloud directly compatible with ElasticSearch 7. This required us to work with another vendor to deploy our visibility layer in Google Cloud" (<a href="https://temporal.io/blog/multi-cloud-thats-one-small-step-for-temporal-one-giant-leap-for-reliability">multi-cloud blog</a>). This is the canonical example of <em>the abstraction leaking on purpose</em>: same verb (<code>DeployVisibilityPersistenceStore</code>), completely different implementation, and the interface is what forces you to notice.</p>
+<p><strong>The control planes.</strong> Also public: there are two. "One that is the user-facing control plane (User CP), which handles resources logically, and another that is the infrastructure control plane (Infra CP), which handles resources 'physically'... Those two control planes are actually Temporal Namespaces with separate workers." The Infra CP talks to the cloud providers; the User CP does not. The published Go shape is a <code>TemporalClusterProvider</code> interface plus a <code>GetTemporalClusterProvider</code> factory, with cloud-agnostic parent workflows spawning cloud-specific child workflows.</p>
+<p><em>Inference, clearly marked:</em> cell infrastructure work naturally sits underneath or beside the Infra CP. The published interface has methods like <code>DeployPersistenceStore</code>; the cell-level equivalents (network, cluster, node capacity, PKI, policy) are the natural siblings. Treat that as a plausible shape to ask about early, not as a fact.</p>
+<p><strong>The ingress and identity story.</strong> Publicly: connections are gRPC on port 7233; each Namespace gets a <a href="https://docs.temporal.io/cloud/namespaces">Namespace endpoint</a> (<code>&lt;namespace&gt;.&lt;account&gt;.tmprl.cloud:7233</code>) and each region a regional endpoint (<code>&lt;region&gt;.&lt;cloud&gt;.api.temporal.io:7233</code>). Authentication is <a href="https://docs.temporal.io/cloud/certificates">mTLS</a> with a customer-supplied CA certificate, or API keys. All traffic is TLS 1.3. When using a regional endpoint with mTLS, the client must set <code>server_name</code> to the Namespace endpoint, "since the request to the regional endpoint is redirected to the specific Namespace" — which tells you SNI-based routing exists in the ingress path. Private connectivity is AWS PrivateLink endpoint services and GCP Private Service Connect service attachments, both enumerated per region in the <a href="https://docs.temporal.io/cloud/regions">regions doc</a>.</p>
+<p><strong>The rollout model.</strong> Publicly described, and this is the part most relevant to "upgrade N cells safely": cells are organized into <strong>deployment rings</strong>. "Ring 0: Synthetic traffic only, no customer impact. Changes are monitored here for at least a week. Ring 1: Low-priority traffic namespaces... Higher Rings: Gradually expanding to critical, high-priority traffic customers. Within each ring, updates are applied in batches, with pauses between batches to observe for potential issues like memory leaks or race conditions." Note the specific failure classes named: memory leaks and race conditions. Those are <em>soak-time</em> bugs. They do not show up in a canary that runs for an hour.</p>
+<h3 id="the-namespace-to-cell-mapping-problem">The namespace-to-cell mapping problem<a class="anchor" href="#the-namespace-to-cell-mapping-problem">#</a></h3>
+<p>This is the single most interesting design problem visible from outside, and it is worth having thought about before someone asks you.</p>
+<p>Publicly, the mapping exists ("selecting a suitable cell within the chosen region") and the endpoint abstraction hides it ("A Temporal Client that uses a Namespace endpoint doesn't have to be aware of which region the Namespace is in"). Publicly, it is mutable — the AWS whitepaper lists "migrating cell customers" as a control-plane responsibility, and Temporal's Same-region Replication feature replicates a Namespace "across multiple cells in that region" with failovers "always managed automatically by Temporal."</p>
+<p>The general problem, which every cell-based SaaS has (<em>industry pattern, not a Temporal-specific claim</em>):</p>
+<ul>
+<li><strong>Placement.</strong> When a new tenant arrives, which cell? Naive round-robin ignores capacity. Least-loaded creates hot spots as load changes after placement. Bin-packing maximizes utilization and minimizes headroom for spikes. Most mature systems end up with a placement service that reads live cell capacity, honours affinity and anti-affinity constraints, and refuses to place when no cell has headroom — which means <strong>"no capacity" must be a first-class, user-visible outcome</strong>, not a provisioning timeout.</li>
+<li><strong>Lookup.</strong> The router needs partition-key → cell in single-digit milliseconds, for every request, with a cache that fails safe. This is the "thinnest possible layer."</li>
+<li><strong>Rebalancing.</strong> Tenants grow. A cell that was 40% full becomes 95% full because one customer 10x'd. Moving a tenant between cells means moving its data, which for Temporal means moving workflow state — hence replication-based migration rather than copy-and-cutover.</li>
+<li><strong>Draining.</strong> When you need a cell gone (a bad node image, a failing AZ, an EOL cluster), you need every tenant off it, in an order you control, without dropping in-flight work.</li>
+</ul>
+<p>Shopify's published <a href="https://shopify.engineering/a-pods-architecture-to-allow-shopify-to-scale">pods architecture</a> is the clearest external illustration of all four: a "Sorting Hat" in the load balancers matches every request to a pod via a rule list and stamps a header; a "Pod Mover" relocates a whole pod to its recovery data center "in a minute without dropping requests or jobs"; and "evacuating a whole data center is nothing more than evacuating each pod active there one at a time." Read it — it is three minutes long and it is the pattern in miniature.</p>
+<h3 id="the-dependency-dag-of-bringing-up-a-cell">The dependency DAG of bringing up a cell<a class="anchor" href="#the-dependency-dag-of-bringing-up-a-cell">#</a></h3>
+<p>This is the heart of the guide. Everything below the horizontal rules in the other eleven guides is a node in this graph.</p>
+<p>The graph is drawn for a generic Kubernetes-based cell on any of the three clouds. It is <em>the industry-standard ordering</em>, assembled from the primary docs cited throughout this library — it is not a claim about Temporal's internal pipeline.</p>
+<div class="codehilite"><pre><span></span><code>L0   CLOUD TENANCY        account / project / subscription  -&gt;  quota grants
+  |                       org policy / SCP / Azure Policy attached
+  v
+L1   IDENTITY             cloud roles for the provisioner  -&gt;  OIDC provider registered
+  |                       workload identity federation (IRSA / GKE WIF / Entra WID)
+  v
+L2   NETWORK              [often shared with a networking team]
+  |                       IPAM allocation (pod CIDR, service CIDR, node subnets)
+  |                         -&gt;  VPC / VNet  -&gt;  subnets  -&gt;  route tables  -&gt;  egress NAT
+  |                         -&gt;  private endpoints: KMS, registry, object store, metadata
+  |                         -&gt;  DNS zones + delegation
+  v
+L3   K8S CONTROL PLANE    EKS / GKE / AKS API server + etcd, private endpoint
+  |                       cluster OIDC issuer published  -&gt;  authn binding for CI
+  v
+L4   IN-CLUSTER DATAPATH  [nodes stay NotReady until this lands]
+  |                       CNI DaemonSet (hostNetwork, tolerates the not-ready taint)
+  |                         -&gt;  conflist in /etc/cni/net.d  -&gt;  nodes Ready
+  |                         -&gt;  CoreDNS  -&gt;  cloud-controller-manager  -&gt;  CSI driver
+  v
+L5   CAPACITY             bootstrap node group / Fargate profile / system pool
+  |                         -&gt;  Karpenter CRDs  -&gt;  controller  -&gt;  NodeClass Ready
+  |                         -&gt;  NodePool Ready  -&gt;  workload nodes
+  v
+L6   PKI                  [nothing mTLS works before this]
+  |                       region intermediate CA already exists (created ahead of demand)
+  |                         -&gt;  cert-manager  -&gt;  cell issuer chained to the region CA
+  |                         -&gt;  trust-manager  -&gt;  CA bundle in every namespace
+  v
+L7   SECRETS              cloud KMS key + key policy  (needs L1 identity, L2 network)
+  |                         -&gt;  Vault  -&gt;  auto-unseal  -&gt;  init  -&gt;  audit devices
+  |                         -&gt;  Kubernetes auth  -&gt;  DB engine, PKI mount, transit
+  v
+L8   POLICY + TELEMETRY   Kyverno controller (webhook cert from L6)
+  |                         -&gt;  generating policies  -&gt;  baseline objects per namespace
+  |                         -&gt;  metrics / logs / traces agents  -&gt;  fleet backend
+  v
+L9   DATA STORES          persistence (Cassandra or SQL)  +  visibility (ES / SQL)
+  |                       credentials from L7, TLS from L6, disks from L4
+  |                         -&gt;  schema created at the target version
+  v
+L10  TEMPORAL SERVICES    history  -&gt;  matching  -&gt;  frontend  -&gt;  worker
+  |                       Ringpop membership converges; internal mTLS from L6
+  v
+L11  TRAFFIC REGISTRATION [networking team owns the far side]
+  |                       LB / ingress  -&gt;  mTLS termination  -&gt;  health targets green
+  |                         -&gt;  DNS record  -&gt;  private link publication  -&gt;  router registry
+  v
+L12  HEALTH GATE          synthetic namespace  -&gt;  workflow start  -&gt;  complete,
+                          through the REAL external endpoint with a REAL client cert
+                            -&gt;  cell marked ready for placement
+</code></pre></div>
+
+<p>Now the edges. For each, why it must come first and what breaks when it does not.</p>
+<table>
+<thead>
+<tr>
+<th>Edge</th>
+<th>Why this order</th>
+<th>What fails if you get it wrong</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>L0 → L1</td>
+<td>Roles and policies are scoped to a tenancy container that must exist first</td>
+<td>Role creation silently lands in the wrong account/project; you find out at teardown when the sweeper cannot see it</td>
+</tr>
+<tr>
+<td>L0 → all</td>
+<td>Quota is per account × region (AWS), project × region (GCP), subscription × region (Azure) — see <a href="03-multicloud-aws-gcp-azure.html">03</a></td>
+<td>Provision proceeds to 80% and then fails on an ENI, IP, or vCPU quota, leaving a half-cell that costs money and holds a CIDR</td>
+</tr>
+<tr>
+<td>L1 → L2</td>
+<td>Creating network objects requires a principal with permission; workload identity federation must be registered before anything in-cluster can assume a role</td>
+<td>Pods come up and get <code>AccessDenied</code> from the cloud SDK an hour later, in a component you were not watching</td>
+</tr>
+<tr>
+<td>L2 (IPAM first)</td>
+<td>Pod and service CIDRs are effectively immutable once workloads land; max-pods-per-node is immutable per node pool — see <a href="05-cni-and-host-networking.html">05</a></td>
+<td>Overlapping CIDRs across cells make Cluster Mesh, peering, and migration impossible forever. This is the one mistake with no fix short of rebuilding the cell</td>
+</tr>
+<tr>
+<td>L2 → L3</td>
+<td>The managed control plane is created <em>into</em> subnets and must be able to reach nodes</td>
+<td>Cluster created in the wrong subnets; private endpoint unreachable from CI; you rebuild</td>
+</tr>
+<tr>
+<td>L2 (egress before L4)</td>
+<td>Nodes pull container images and reach the cloud API before anything works</td>
+<td>Nodes join, then every pod is <code>ImagePullBackOff</code> and the failure looks like a registry problem</td>
+</tr>
+<tr>
+<td>L3 → L4</td>
+<td>The CNI DaemonSet is a Kubernetes object; the API server must exist to accept it</td>
+<td>—</td>
+</tr>
+<tr>
+<td>L4: CNI before node Ready</td>
+<td>The kubelet reports <code>NotReady</code> with <code>cni plugin not initialized</code> until a conflist appears in <code>/etc/cni/net.d</code>. The CNI must therefore be <code>hostNetwork: true</code> and tolerate the not-ready taint</td>
+<td>A CNI manifest missing the toleration produces a cell that provisions cleanly and never converges. Health checks that run before this settles report false failures</td>
+</tr>
+<tr>
+<td>L4: CoreDNS after CNI</td>
+<td>CoreDNS runs on the pod network</td>
+<td>CoreDNS pends forever; every subsequent component's DNS-based discovery fails in a way that looks like the component is broken</td>
+</tr>
+<tr>
+<td>L4: CCM before LoadBalancer Services</td>
+<td>The cloud controller manager is what turns a <code>Service type=LoadBalancer</code> into a cloud LB</td>
+<td>Services sit <code>&lt;pending&gt;</code> and the ingress step at L11 never completes</td>
+</tr>
+<tr>
+<td>L4: CSI before StatefulSets</td>
+<td>PVCs bind through the CSI driver; use <code>WaitForFirstConsumer</code> so the volume lands in the same zone as the pod</td>
+<td><code>Immediate</code> binding puts a zonal disk in a zone with no capacity; the pod is unschedulable forever</td>
+</tr>
+<tr>
+<td>L4 → L5</td>
+<td>Karpenter is a pod; it needs a node, DNS, and the API server</td>
+<td>See "the Karpenter chicken-and-egg" below</td>
+</tr>
+<tr>
+<td>L5 → L6</td>
+<td>cert-manager is a pod; it needs capacity</td>
+<td>—</td>
+</tr>
+<tr>
+<td>L6 before L7</td>
+<td>Vault's TLS, and any in-cluster CA-signed client cert, come from cert-manager. The region intermediate must pre-exist because signing it is a human ceremony — see <a href="11-cert-manager-and-pki.html">11</a></td>
+<td>A missing region intermediate blocks the cell on a human, at 2 a.m., with no automated path forward</td>
+</tr>
+<tr>
+<td>L6 trust before use</td>
+<td>"Distribute trust before you use it. Remove trust after you stop using it. Never in the other order."</td>
+<td>Rotate first and every client that has not yet received the new bundle rejects every connection. This is the classic internal-PKI outage</td>
+</tr>
+<tr>
+<td>L1+L2 → L7</td>
+<td>Vault auto-unseal calls cloud KMS, which needs an identity and a network path</td>
+<td>See "the unseal loop" below. Symptom: Vault sealed. Root cause: three layers down</td>
+</tr>
+<tr>
+<td>L7 → L9</td>
+<td>Database credentials are dynamic, issued by Vault</td>
+<td>Static credentials in a values file, which then never rotate and end up in git</td>
+</tr>
+<tr>
+<td>L6 → L8</td>
+<td>Kyverno's admission webhook needs a serving certificate the API server trusts</td>
+<td>See "the webhook deadlock" below</td>
+</tr>
+<tr>
+<td>L8 before tenant namespaces</td>
+<td>Kyverno <code>generate</code> rules fire on namespace creation; without <code>generateExisting</code>, namespaces created earlier get nothing</td>
+<td>Half your namespaces have a NetworkPolicy and half do not, and the difference is creation order</td>
+</tr>
+<tr>
+<td>L8 observability before L9</td>
+<td>You need to be able to <em>see</em> the database bootstrap fail — see <a href="14-observability-for-cells.html#the-prometheus-operator-and-how-a-cell-gets-monitoring-at-bring-up">14</a></td>
+<td>Otherwise you debug a silent cell with <code>kubectl logs</code> and guesswork</td>
+</tr>
+<tr>
+<td>L9 schema before L10</td>
+<td>Temporal will not run against an older schema: "Not supported: running newer binaries with an older schema" (<a href="https://github.com/temporalio/helm-charts">Helm chart README</a>)</td>
+<td>Server pods crash-loop with a schema version error, which reads like an application bug</td>
+</tr>
+<tr>
+<td>L10 internal order</td>
+<td>History owns state; Matching dispatches; Frontend fans in. Ringpop membership needs the peers to be discoverable</td>
+<td>Frontend accepts traffic before History has claimed its shards, and the first requests fail</td>
+</tr>
+<tr>
+<td>L10 → L11</td>
+<td>You register a cell with the router only once it can serve</td>
+<td>Register early and the router sends real traffic into a cell that is still converging</td>
+</tr>
+<tr>
+<td>L11 → L12</td>
+<td>"Cell is ready" means an external client completed a real RPC, not that pods are <code>Running</code> — see <a href="02-grpc.html">02</a>, and <a href="14-observability-for-cells.html#the-cell-health-gate">14</a> for the gate that evaluates it</td>
+<td>A cell that passes readiness on pod status and fails on the first customer connection, because of SNI, a missing SAN, an idle timeout, or an L4 LB pinning every request to one frontend</td>
+</tr>
+</tbody>
+</table>
+<p>Two structural notes on the DAG.</p>
+<p><strong>The Terraform/Kubernetes boundary sits between L3 and L4.</strong> Terraform's rule is explicit: "You can use expressions to configure provider arguments, but you can only reference values that Terraform knows before it applies your configuration" (<a href="https://developer.hashicorp.com/terraform/language/block/provider">provider block docs</a>). A cluster endpoint is unknown until the cluster exists, so you cannot create a cluster and manage Kubernetes resources against it in one apply. This is not a style choice — it is why L0–L3 is one or more Terraform applies and L4–L12 is something else. See <a href="08-terraform.html">08</a>.</p>
+<p><strong>Everything from L4 down is level-triggered; everything above is transactional.</strong> Cloud resources are created once and then drift; Kubernetes objects are continuously reconciled. That difference is why the drift-detection story is different on the two sides of the line, and why your teardown has to handle both a "delete these objects" path and a "sweep the cloud by tag" path. The reconciler that does the level-triggered half — and owns the inventory, the pruning, and the health assessment for L4–L12 — is guide <a href="13-gitops-argocd-flux.html">13</a>.</p>
+<h3 id="the-bootstrap-paradoxes">The bootstrap paradoxes<a class="anchor" href="#the-bootstrap-paradoxes">#</a></h3>
+<p>Six real cycles in that graph. Each has a name, a cause, and a standard resolution. Learn them as a set; they are the highest-signal thing you can know about a cell platform.</p>
+<p><strong>1. The Karpenter chicken-and-egg — the autoscaler needs a node to run on.</strong></p>
+<p>Karpenter is a Deployment. Deployments need nodes. Karpenter is what creates nodes. Standard resolutions, in rough order of preference:</p>
+<ul>
+<li>A small <strong>bootstrap node group</strong> (EKS managed node group, GKE default pool, AKS system pool) with 2–3 nodes, sized only for the platform add-ons, tainted so workloads never land there. Karpenter, CoreDNS, cert-manager, and the GitOps agent live there.</li>
+<li>On AWS specifically, a <strong>Fargate profile</strong> for the <code>karpenter</code> namespace, so Karpenter runs with no EC2 instance at all.</li>
+<li>On AKS/GKE, the provider's <strong>system node pool</strong> is exactly this by design.</li>
+</ul>
+<p>The trap: the bootstrap pool is now a thing you must also upgrade, and because it is small, a single unavailable node is 33% of your platform capacity. Give it its own PDB story and its own upgrade step. See <a href="06-karpenter.html">06</a>.</p>
+<p><strong>2. The self-signed root — cert-manager cannot issue a certificate to the CA it needs in order to issue certificates.</strong></p>
+<p>A <code>CA</code> issuer needs a Secret containing a CA key pair. Something has to make that key pair. cert-manager's answer is the <code>SelfSigned</code> issuer: a special issuer that signs a certificate with its own key. You use it exactly once, to mint a root, and then you never use it again:</p>
+<div class="codehilite"><pre><span></span><code>SelfSigned issuer  →  root Certificate (isCA: true)  →  CA ClusterIssuer (root)
+                            →  intermediate Certificate (isCA: true)
+                                     →  CA ClusterIssuer (cell issuer)
+                                              →  every leaf certificate
+</code></pre></div>
+
+<p>In production the root is not self-signed in-cluster at all — it is an offline root, or a cloud private CA, or a Vault PKI mount whose key was signed by a region CA in a human ceremony. The self-signed bootstrap is the <em>lab</em> resolution and the <em>day-zero</em> resolution; the production resolution is "the CA already exists, created ahead of demand." See <a href="11-cert-manager-and-pki.html">11</a>.</p>
+<p><strong>3. The webhook deadlock — Kyverno needs a certificate from cert-manager, and cert-manager's pods must pass Kyverno's admission webhook.</strong></p>
+<p>A validating webhook with <code>failurePolicy: Fail</code> that is unreachable blocks every matching API request cluster-wide. So: cert-manager issues Kyverno's webhook cert. Kyverno validates every pod, including cert-manager's. Kill both and neither can start.</p>
+<p>Four standard resolutions, usually combined:</p>
+<ul>
+<li><strong>Namespace exclusions.</strong> Exclude <code>kube-system</code>, <code>cert-manager</code>, and the policy engine's own namespace from the webhook's <code>namespaceSelector</code>. Kyverno excludes several by default; know which, and check <a href="https://kyverno.io/docs/installation/customization/">Kyverno's configuration docs</a> rather than assuming.</li>
+<li><strong>Self-signed webhook certs.</strong> Kyverno generates and rotates its own webhook certificate by default, precisely so it does not depend on cert-manager. Using cert-manager for it is an <em>option</em>, and taking that option creates this cycle. Consider not taking it.</li>
+<li><strong>Ordering.</strong> Install the policy engine <em>controller</em> early and the <em>policies</em> late. Kyverno registers no webhook rules until policies exist, which decouples the two cleanly.</li>
+<li><strong>A break-glass runbook.</strong> <code>kubectl delete validatingwebhookconfiguration &lt;name&gt;</code> is the recovery, and it must be a documented, rehearsed, permissioned procedure — not something someone invents during an outage. A fail-closed orphaned webhook pointing at a Service that no longer exists is the classic bricked cluster. See <a href="07-kyverno.html">07</a>.</li>
+</ul>
+<p><strong>4. The unseal loop — Vault's auto-unseal needs cloud KMS, which needs an identity, which needs a network path.</strong></p>
+<p>Vault starts sealed: it has the ciphertext but not the key (<a href="https://developer.hashicorp.com/vault/docs/concepts/seal">seal/unseal concepts</a>). Auto-unseal asks a cloud KMS to decrypt the root key. That call needs: a working pod network (L4), DNS (L4), an egress path or private endpoint to the KMS API (L2), a workload identity binding (L1), and a key policy granting Decrypt (L0/L1). Five dependencies, and the symptom for all five is identical: <strong>Vault is sealed</strong>.</p>
+<p>The resolution is not architectural — it is diagnostic. Build, and keep, a single diagnostic that distinguishes the five cases: can the pod resolve the KMS hostname, can it reach the endpoint, does it have a token, does the token map to the expected principal, does the principal have Decrypt. Guide <a href="10-vault.html">10</a> says it well: "If it does not, you have a networking or IAM problem, not a Vault problem — check in that order." Write that check once and every future cell bootstrap failure of this class costs five minutes instead of two hours.</p>
+<p>The second-order version of this paradox: <strong>anything that needs Vault to start cannot be something Vault needs to start.</strong> Vault's own TLS certificate is the trap. If Vault's serving cert comes from cert-manager, and cert-manager's issuer is Vault PKI, you have built a cycle. Break it by giving Vault a certificate from a different, simpler issuer (the cell's cert-manager CA issuer, chained to the region intermediate) — never from the Vault PKI mount that Vault itself hosts.</p>
+<p><strong>5. The GitOps bootstrap — the agent that deploys everything cannot deploy itself.</strong></p>
+<p>If Argo CD or Flux applies every manifest in the cell, something has to apply Argo CD or Flux. Standard resolutions:</p>
+<ul>
+<li><strong>Terraform installs exactly one thing</strong> — the agent — in a separate apply after the cluster exists, and then stops. Everything downstream is the agent's problem. This keeps Terraform's state small and keeps the "reachable cluster required for destroy" problem contained. See <a href="08-terraform.html">08</a>.</li>
+<li><strong>App-of-apps / self-management.</strong> The agent's first Application points at the agent's own manifests, so subsequent upgrades of the agent flow through the same pipeline as everything else. Elegant, and it has a sharp edge: a bad agent manifest can make the agent unable to fix itself, so keep the bootstrap apply path alive and tested as the recovery route.</li>
+<li><strong>Rendered manifests make this less scary.</strong> Because this library assumes Helm for templating only (<a href="09-helm.html">09</a>), the artifact is plain YAML in git. Worst case, <code>kubectl apply --server-side -f rendered/</code> from a laptop is a valid recovery path. Preserve that property deliberately; it is worth more than it looks.</li>
+</ul>
+<p><strong>6. The Terraform provider paradox — you cannot plan Kubernetes resources against a cluster that does not exist yet.</strong></p>
+<p>Covered above as a DAG note, but it belongs in this list because it is the same shape as the others. The resolution is <em>split the apply</em>, and the consequence is that "provision a cell" is inherently a multi-step orchestration rather than a single command — which is precisely the argument for a durable workflow driving it.</p>
+<p><strong>Two honourable mentions.</strong></p>
+<ul>
+<li><strong>The CNI/not-ready paradox.</strong> Nodes are <code>NotReady</code> until the CNI initializes, and the scheduler will not place pods on <code>NotReady</code> nodes — except the CNI DaemonSet itself, which runs <code>hostNetwork: true</code> and tolerates the not-ready taint. Every CNI ships this configuration; the failure mode is a homegrown or modified manifest that drops the toleration. See <a href="05-cni-and-host-networking.html">05</a>.</li>
+<li><strong>The observability paradox.</strong> The tooling you would use to debug a failing bootstrap is installed <em>during</em> the bootstrap. Resolution: the cell provisioning workflow itself must emit rich, structured progress from <em>outside</em> the cell — activity-level events with the layer name, the assertion that failed, and the last successful gate. If your only view into a stuck cell is <code>kubectl</code> from a laptop, that is a real gap and a very good first-90-days project.</li>
+</ul>
+<h3 id="the-steady-state-loop">The steady-state loop<a class="anchor" href="#the-steady-state-loop">#</a></h3>
+<p>Once a cell exists, nothing about it is "done." The loop:</p>
+<div class="codehilite"><pre><span></span><code>   change to desired state (git commit)
+              │
+              ▼
+   RENDER      helm template + kustomize  →  rendered/&lt;cell&gt;/*.yaml
+              │   pure function: chart + values → YAML, no cluster contact
+              ▼
+   REVIEW      PR diff IS the change plan (real images, limits, replicas)
+              │   policy gate: conftest / kyverno CLI / kubeconform
+              ▼
+   APPLY       GitOps agent  →  kubectl apply --server-side
+              │   field manager owns fields; prune removes what left the set
+              ▼
+   CONVERGE    controllers reconcile; Karpenter provisions; certs issue
+              │
+              ▼
+   VERIFY      health gate re-run  →  conformance suite  →  fleet metrics
+              │
+              └──────────► drift detector ──► back to the top
+</code></pre></div>
+
+<p><strong>Where drift comes from,</strong> in descending order of frequency: humans (<code>kubectl edit</code> during an incident, never reverted); other controllers writing a field your pipeline also writes, which surfaces as a server-side-apply field-ownership conflict and is <em>good</em> — see the <a href="https://kubernetes.io/docs/reference/using-api/server-side-apply/">SSA docs</a> and guide <a href="09-helm.html">09</a>; the cloud itself (an auto-upgraded control plane, a provider-rotated node image, a security group another team's automation touched); time (a renewed certificate, a rotated token, a consolidated node — not real drift, but a naive detector cannot tell); and someone clicking in a console, which only <code>terraform plan</code> will ever see.</p>
+<p><strong>How drift is detected,</strong> at three layers:</p>
+<ul>
+<li><strong>Kubernetes objects</strong> — the GitOps agent's own <code>OutOfSync</code> status, per-application, exported as a fleet metric with a cell label. See <a href="13-gitops-argocd-flux.html#drift-emergency-changes-and-break-glass">13</a> for how each tool detects and reports it, and what happens to a hand-edit during an incident.</li>
+<li><strong>Cloud resources</strong> — nightly <code>terraform plan -detailed-exitcode</code> per cell state, ticketing on exit code 2. Cheapest high-value job you can build.</li>
+<li><strong>Semantic conformance</strong> — the layer most teams skip and the one with the most value. It is the same shape as the cell health gate in <a href="14-observability-for-cells.html#the-cell-health-gate">14</a>, run continuously rather than once at bring-up. A per-cell suite that asserts the <em>properties</em> the cell is supposed to have, not the manifests: DNS resolves privately, workload identity mints a token, KMS decrypt works, the ingress does per-request gRPC balancing, egress leaves via the intended NAT, kube-proxy mode is explicitly set, no <code>Immediate</code> block StorageClass, no <code>maxUnavailable: 0</code> PDB, every APIService healthy, kubelet skew under 2, days-to-EOL above threshold. Run it continuously and publish "how many cells are non-conformant and why" as one number.</li>
+</ul>
+<p>The important framing, from the rendered-manifests literature: "Git contains the inputs to the desired state, not the desired state itself" (<a href="https://akuity.io/blog/the-rendered-manifests-pattern">Akuity</a>). Rendering into git converts that into "git contains the desired state," which is what makes the PR diff a real review surface and what makes <code>git revert</code> a real rollback.</p>
+<h3 id="cell-upgrade">Cell upgrade<a class="anchor" href="#cell-upgrade">#</a></h3>
+<p>Upgrading one cell is a pipeline with a fixed order. Upgrading three hundred is a scheduling problem layered on top of it. Do not conflate them.</p>
+<p><strong>The per-cell order, and why.</strong></p>
+<ol>
+<li><strong>Pre-flight.</strong> Deprecated API scan, PDB lint, add-on compatibility matrix, quota headroom check (surge capacity temporarily doubles vCPU), APIService health, and — for Temporal specifically — a schema compatibility check. Every one of these is cheaper than a rollback.</li>
+<li><strong>Cloud infrastructure.</strong> Anything below the cluster that the new version needs: a new subnet, a new security group rule, an IAM permission the new add-on version requires.</li>
+<li><strong>Kubernetes control plane.</strong> One minor version at a time. The <a href="https://kubernetes.io/releases/version-skew-policy/">version skew policy</a> permits kubelet to be up to three minors behind the API server but never ahead, which is exactly why the control plane goes first and nodes follow.</li>
+<li><strong>Cluster add-ons that gate the datapath.</strong> CNI, CoreDNS, kube-proxy, CSI. The CNI in particular has its own compatibility matrix against the Kubernetes version and against the node kernel.</li>
+<li><strong>Karpenter itself,</strong> before the control plane in some matrices — check <a href="https://karpenter.sh/docs/upgrading/compatibility/">Karpenter's compatibility page</a> rather than assuming, because the constraint runs the other direction from what people expect.</li>
+<li><strong>Node images.</strong> With Karpenter this is a declarative bump of the AMI/image selector, which marks every NodeClaim <code>Drifted</code> and rolls them, paced by a disruption budget. Elegant, and only safe with a pinned image (not <code>@latest</code>), an explicit budget, and <code>terminationGracePeriod</code> set.</li>
+<li><strong>Policy.</strong> Kyverno's Kubernetes support window is narrow; pin the CLI to the target version and run <code>kyverno test</code> against the whole policy set in CI before touching a cell.</li>
+<li><strong>Database schema, then application.</strong> For Temporal this order is <em>load-bearing</em> and publicly documented: "Not supported: running newer binaries with an older schema. Supported: downgrading binaries — running older binaries with a newer schema" (<a href="https://github.com/temporalio/helm-charts">Helm chart README</a>). Schema first is also what makes rollback possible.</li>
+<li><strong>Temporal Server, one minor at a time.</strong> From the <a href="https://docs.temporal.io/self-hosted-guide/upgrade-server">upgrade docs</a>: "Temporal Server should be upgraded sequentially, one minor version at a time. Before bumping to the next minor version, first upgrade to the highest available patch version of your current minor version." Skipping versions can make old data formats unreadable. And a number worth putting in your runbook: "each upgrade requires the History Service to load all Shards and update the Shard metadata, so allow approximately 10 minutes on each version."</li>
+</ol>
+<p><strong>The fleet problem: upgrade N cells safely.</strong></p>
+<p>Temporal's published model is deployment rings — Ring 0 synthetic-only, monitored for at least a week; Ring 1 low-priority namespaces; higher rings progressively more critical; batches within each ring with pauses between them. Generalizing that into the pieces you would build (<em>industry pattern</em>):</p>
+<ul>
+<li><strong>Canary cells that carry real but low-stakes traffic.</strong> A cell with only synthetic traffic will not find the bug that only appears under a real workload mix. Temporal's model has both, which is the right answer.</li>
+<li><strong>Soak time measured in days, not minutes.</strong> The failure classes Temporal names — memory leaks and race conditions — are time-dependent. A one-hour canary cannot see them. This is the single most common way a wave-based rollout is quietly useless.</li>
+<li><strong>A wave schedule with explicit gates.</strong> 1 cell → 5 cells → 10% → 50% → rest, with a defined pass criterion between waves. The criterion must be a <em>metric comparison against unupgraded siblings</em>, not "no pages fired." Cells give you a natural control group; use it.</li>
+<li><strong>Concurrency limits and a pause button.</strong> A human must be able to stop the fleet mid-rollout, and a stopped rollout must be resumable rather than restartable. Terraform gives you a diff and a lock but "has no notion of rollout" — that logic belongs in the orchestrator, and a durable workflow with a signal-based approval gate is the natural shape. See <a href="08-terraform.html">08</a>.</li>
+<li><strong>Rollback that is honest about what cannot roll back.</strong> Schema migrations, CRD version bumps, and anything that rewrote data are one-way. Know which steps in your pipeline are one-way <em>before</em> you start, and put the reversible steps first.</li>
+</ul>
+<p><strong>PDBs, drain, and long-running Temporal workloads.</strong></p>
+<p>This is where a generic upgrade pipeline meets a specific application, and it is worth being precise.</p>
+<ul>
+<li>A <a href="https://kubernetes.io/docs/tasks/run-application/configure-pdb/">PodDisruptionBudget</a> constrains <em>voluntary</em> disruption — the <a href="https://kubernetes.io/docs/concepts/scheduling-eviction/api-eviction/">Eviction API</a> that <code>kubectl drain</code> and Karpenter use. It does nothing about node failure, and <code>maxUnavailable: 0</code> makes a node undrainable forever, which is how a drift rollout wedges.</li>
+<li>Temporal Frontend is stateless and drains like any gRPC server: <code>GracefulStop</code>, a <code>terminationGracePeriodSeconds</code> longer than your longest RPC, a <code>preStop</code> sleep long enough for endpoint removal to propagate, and <code>MaxConnectionAge</code> already spreading reconnections so the herd is not synchronized. Done wrong you get a wall of <code>UNAVAILABLE</code> and a synchronized re-poll stampede. See <a href="02-grpc.html">02</a>.</li>
+<li><strong>Worker long polls are the specific hazard.</strong> Temporal SDK workers hold long-poll RPCs open (tens of seconds) against Matching. Any proxy or LB idle timeout shorter than the poll expiration turns a normal rollout into a burst of errors. Assert <code>route_timeout &gt; long_poll_expiration + margin</code> in CI, per cloud, and treat it as a cell invariant rather than a tuning detail.</li>
+<li><strong>History is stateful in the way that matters.</strong> Shard ownership moves when a History pod goes away; that movement is normal and fast, but a rollout that replaces History pods faster than shards can be reclaimed produces a latency spike that looks like a database problem. Roll History slowly, and watch shard-ownership metrics rather than pod readiness.</li>
+</ul>
+<h3 id="cell-teardown">Cell teardown<a class="anchor" href="#cell-teardown">#</a></h3>
+<p>Teardown is the least-tested path in every infrastructure system, and it is the one that silently costs money forever. Design it as a first-class, continuously-exercised code path, not as an afterthought.</p>
+<p><strong>The reverse DAG.</strong></p>
+<ol>
+<li><strong>Stop placement.</strong> Mark the cell ineligible in the router registry so no new tenant lands on it. Nothing else can proceed while new work is arriving.</li>
+<li><strong>Drain tenants.</strong> Migrate or expire every namespace. Verify zero in-flight work rather than "no traffic for N seconds" — for gRPC, channelz gives you actual in-flight stream counts, which is a much better gate (<a href="02-grpc.html">02</a>).</li>
+<li><strong>Deregister from traffic.</strong> Remove DNS records, remove LB targets, tear down private-link publications. Do this before deleting anything the LB points at, or you leave the router pointing at a black hole.</li>
+<li><strong>Stop the reconcilers.</strong> Delete the GitOps Application, or the agent will faithfully recreate everything you are about to delete. This is the step people forget, and the symptom is a teardown that appears to loop.</li>
+<li><strong>Delete workloads, then Kubernetes-owned cloud objects.</strong> <code>LoadBalancer</code> Services and bound PVCs create cloud resources through the CCM and CSI. Delete the Kubernetes objects and <em>verify</em> zero remaining LoadBalancer Services and zero bound PVCs before deleting the cluster. Deleting the cluster first orphans them permanently.</li>
+<li><strong>Revoke secrets before destroying the secret store.</strong> Vault leases must be revoked (<code>vault lease revoke -prefix</code> per mount) so external systems — databases, cloud IAM — actually clean up. Destroy Vault first and you leave orphaned IAM users and database roles that nobody will ever find. See <a href="10-vault.html">10</a>.</li>
+<li><strong>Delete node pools, then the cluster.</strong></li>
+<li><strong>Delete the network,</strong> then the identity objects, then the tenancy container.</li>
+<li><strong>Sweep by tag</strong> and assert zero remaining objects.</li>
+<li><strong>Tombstone the name and the CIDR</strong> so neither is reused before the cloud's own reservation windows expire.</li>
+</ol>
+<p><strong>Finalizer traps.</strong> <a href="https://kubernetes.io/docs/concepts/overview/working-with-objects/finalizers/">Finalizers</a> are the mechanism that makes ordered teardown possible and the mechanism that wedges it. The specific ones to know:</p>
+<ul>
+<li>A namespace stuck <code>Terminating</code> because an APIService backing a CRD in it is unavailable — the "ghost APIService" problem. The API server cannot enumerate resources it cannot reach, so it waits forever.</li>
+<li>A Karpenter <code>NodeClaim</code> held by a <code>do-not-disrupt</code> pod, a <code>maxUnavailable: 0</code> PDB, or a stuck <code>VolumeAttachment</code>. <code>terminationGracePeriod</code> on the NodePool is the bound that makes teardown actually terminate; argue for making it mandatory.</li>
+<li>A Kyverno generating policy with <code>synchronize: true</code> recreating objects inside a terminating namespace. Delete the policies before the namespaces.</li>
+<li><code>prevent_destroy</code> on a Terraform resource, which blocks <code>terraform destroy</code> entirely and needs a documented, reviewed lift procedure rather than an ad-hoc edit.</li>
+</ul>
+<p><strong>The orphan inventory.</strong> Enumerate it explicitly, per cloud, and make the sweeper's assertions match. The usual suspects: load balancers and target groups; public IPs; block volumes and their snapshots; <strong>ENIs left attached-or-detached-but-not-deleted on AWS</strong> (these consume subnet IPs that the next cell needs); security groups; DNS records; IAM roles, policies, and instance profiles; OIDC providers; KMS keys (with their pending-deletion windows); soft-deleted Azure Key Vaults; GCP key rings that cannot be deleted at all; permanently-burned GCP project IDs; workload-identity-pool name reservations; private-endpoint connections left pending on the consumer side; and container images or artifacts tagged with the cell ID.</p>
+<p><strong>How to verify a cell is actually gone.</strong> Three independent checks, because each can lie:</p>
+<ol>
+<li><strong>Kubernetes says so</strong> — the cluster does not exist. Weakest signal.</li>
+<li><strong>The cloud API says so</strong> — enumerate every resource type by <code>cell-id</code> tag in every region the cell touched, and assert zero. This must be a real, tested code path with a dry-run mode that runs on <em>every</em> teardown, not just the ones you are worried about.</li>
+<li><strong>The bill says so</strong> — a per-cell cost query that returns zero for the following month. This is the only check that catches resource types your sweeper does not know about, which is exactly the class of orphan that matters.</li>
+</ol>
+<h3 id="failure-modes-and-blast-radius">Failure modes and blast radius<a class="anchor" href="#failure-modes-and-blast-radius">#</a></h3>
+<p><strong>What a single-cell failure looks like.</strong> By construction: a subset of tenants, in one region, on one cloud, sees elevated errors or latency. Everyone else is fine. The dashboards that matter are therefore <strong>per-cell</strong>, and the alerting question is not "is the service down" but "how many cells are unhealthy and which tenants are on them." If your fleet dashboard cannot answer that in one glance, the cell architecture is not paying for itself.</p>
+<p><strong>Gray failure is the hard case.</strong> Microsoft's <a href="https://www.microsoft.com/en-us/research/wp-content/uploads/2017/06/paper-1.pdf">gray failure paper</a>, which Slack cites in its cellular writeup, defines it precisely: "different components have different views of the availability of the system." Slack's <a href="https://slack.engineering/slacks-migration-to-a-cellular-architecture/">account of the 2021-06-30 incident</a> is the best short description of why this defeats automatic remediation — systems inside the affected zone saw local backends as healthy and remote ones as down; systems outside saw the reverse; even two clients in the same zone disagreed depending on which network path they took. No health-checking algorithm resolves that cleanly.</p>
+<p>Slack's conclusion is the one to internalize: <strong>stop trying to automate the diagnosis, and build a button instead.</strong> Their design goals for that button are worth copying almost verbatim:</p>
+<ol>
+<li>Remove as much traffic as possible from a cell within 5 minutes.</li>
+<li>Drains must not cause user-visible errors — so a drain is a <em>generic mitigation</em> an operator can try during an incident and undo if it does not help.</li>
+<li>Drains must be incremental, down to 1% granularity, so you can test a recovery.</li>
+<li><strong>The draining mechanism must not depend on resources in the cell being drained.</strong> "It's not OK to activate a drain by just SSHing to every server."</li>
+</ol>
+<p>Point 4 is the one that gets designed wrong. If the drain control lives in the cell, the drain does not work in exactly the situation you built it for.</p>
+<p><strong>Cell evacuation and migration.</strong> Two different operations with two different costs:</p>
+<ul>
+<li><strong>Evacuation</strong> moves <em>traffic</em> away, leaving the data where it is. This is fast, reversible, and the right first response to a suspected cell problem. It requires the tenant's state to be reachable from another cell — which for Temporal is what replication provides. Temporal's publicly documented Same-region Replication does exactly this: replicate a Namespace "across multiple cells in that region," with cell-to-cell failovers "always managed automatically."</li>
+<li><strong>Migration</strong> moves <em>state</em> to another cell. Slow, one-way in practice, and the tool you use for capacity rebalancing rather than incident response. The AWS whitepaper lists "migrating cell customers" as a control-plane responsibility for exactly this reason.</li>
+</ul>
+<p><strong>The cell-level circuit breaker.</strong> <em>Industry pattern.</em> The router decides, per cell, whether to keep sending traffic to it. Three properties make it safe:</p>
+<ul>
+<li>The decision is made <strong>outside</strong> the cell, from signals the cell cannot suppress (external synthetic probes, error rates measured at the router, not health endpoints the cell serves about itself).</li>
+<li>It is <strong>partial and weighted</strong>, not binary — Slack drains by reweighting per-cell clusters at the edge, which lets you take a cell to 10% and watch, rather than 0% and pray.</li>
+<li>It has <strong>anti-flap and a floor</strong>: if enough cells trip that the survivors would be overloaded, tripping more makes the outage worse. A circuit breaker that can take down the whole fleet is not a safety device.</li>
+</ul>
+<p><strong>Why cells make some incidents boring.</strong> This is the actual payoff and it is worth saying explicitly. A bad deploy is caught in Ring 0 against synthetic traffic. A poison-pill request corrupts one cell's cache, not the fleet's. A hot tenant saturates one cell's database, and the blast radius is the tenants sharing it. A failing AZ or a bad node image is a drain, then a leisurely investigation. A quota cliff is hit by one cell that fails to scale — an alert, not a fleet-wide outage. Each of those is a page that turns into a ticket. The cost is that provisioning, upgrading, and deleting a cell must be <em>routine</em>, because you will do all three constantly. That cost is your team's job, and it is the reason the job exists.</p>
+<h3 id="where-senior-engineers-add-leverage">Where senior engineers add leverage<a class="anchor" href="#where-senior-engineers-add-leverage">#</a></h3>
+<p>An honest section, because the honest version is more useful than the flattering one. The Senior version of this job — understand the eleven tools deeply, ship reliable changes, debug hard problems fast — is a lot, and it is table stakes here rather than the differentiator. The senior version is about <strong>leverage</strong>, and for cell lifecycle across three clouds, the leverage is concentrated in four places.</p>
+<p><strong>1. The abstractions between clouds.</strong> Temporal has already published its answer — an interface of verbs (<code>DeployPersistenceStore</code>, <code>DeployVisibilityPersistenceStore</code>) with per-cloud implementations behind a factory, and cloud-agnostic parent workflows spawning cloud-specific child workflows. The senior work is not writing that pattern; it is <em>policing the boundary</em>. Specifically: which facts are genuinely per-cloud (IPAM model, max-pods math, LB provisioning, egress NAT and its port limits, MTU, teardown ordering, version support windows) versus which are accidental divergence that crept in because someone was in a hurry. The second list should shrink every quarter, and someone has to be the person who keeps a written record of both. Adding a method to the provider interface "will remind us to add it for other cloud providers" — that forcing function only works if someone defends it.</p>
+<p><strong>2. The bootstrap ordering contract.</strong> The DAG above is currently, in most organizations, distributed across a workflow definition, a few Terraform modules, a GitOps sync-wave annotation, and three people's heads. Making it an <em>explicit, tested, single-source artifact</em> — with named gates, per-layer assertions, and a diagnostic that tells you which layer failed and why — is a genuinely senior-scoped deliverable, and it pays off every single time a cell gets stuck. The measurable outcome is mean-time-to-diagnose for a stuck provision.</p>
+<p><strong>3. The upgrade safety story.</strong> This is where a fleet either compounds or accumulates debt. Concretely: the wave schedule, the soak criteria, the automated comparison against unupgraded siblings, the pause and resume semantics, the pre-flight checks that make a wave abort before it starts rather than halfway through, and the honest catalogue of which steps are irreversible. If your team can upgrade every cell on three clouds through a Kubernetes minor bump without anyone staying up late, that is a senior-level artifact — and if it takes a quarter and three incidents, that is the gap.</p>
+<p><strong>4. The tests and gates that let people ship without fear.</strong> The highest-leverage code on a platform team is usually a test. Rendered-manifest snapshot diffs. <code>terraform test</code> on the cell modules. <code>kyverno test</code> on the policy set, pinned to the target Kubernetes version. CI assertions that coupled values agree across templates (gRPC keepalive versus LB idle timeout versus long-poll expiration versus termination grace). A conformance suite that runs against every live cell. A teardown sweeper with a dry-run mode that runs on every teardown. None of these is glamorous; all of them convert tribal knowledge into a compile-time error, which is the definition of scaling a team.</p>
+<p><strong>What to look at, question, and measure in the first 90 days.</strong></p>
+<ul>
+<li><strong>Look at:</strong> the cell entity workflow (or whatever drives provisioning) end to end, in all three clouds; one real teardown with cloud audit logs open; the fleet inventory, whatever it is called; the last three cell-related incidents' write-ups.</li>
+<li><strong>Question:</strong> every per-cloud branch (is it a real difference or accidental?); every shared dependency (what happens to a cell when it is down?); the cell size limit (is it measured or assumed?); the placement algorithm (what happens when no cell has room?); the soak criteria (what metric, compared against what?).</li>
+<li><strong>Measure:</strong> time to provision a cell, p50 and p99, per cloud; time to tear one down; number of manual interventions per 10 cell operations; number of non-conformant cells and why; orphaned-resource cost per month; mean time to diagnose a stuck provision.</li>
+</ul>
+<p>That last list is the one to bring to your manager in week two. Numbers you can move are how a senior engineer picks what to work on.</p>
+<hr />
+<h2 id="hands-on">Hands-on<a class="anchor" href="#hands-on">#</a></h2>
+<p><strong>Build a miniature cell on your laptop.</strong> This is the single most valuable exercise in the library, because it is the only one that exercises the <em>composition</em>. Everything here mirrors a layer of the real DAG, in the real order, and every failure you hit is a scale model of a failure you will hit at work.</p>
+<p>What you build: a <code>kind</code> cluster with the default CNI and kube-proxy deliberately removed, Cilium as the datapath, a two-level PKI with trust distribution, Vault as the secret store, Kyverno as the policy gate, a rendered-manifest pipeline with server-side apply, a Postgres persistence layer, and a real Temporal Server on top — brought up in dependency order, with a health gate at the end that proves an external client can complete a workflow.</p>
+<p>Budget: 3–4 hours the first time. Do it in one sitting.</p>
+<p><strong>Prerequisites.</strong> A running Docker (or Podman/Colima with a Docker-compatible socket) with <strong>at least 8 GB of memory and 4 CPUs</strong> allocated — the three-node kind cluster plus Cilium, cert-manager, Vault, Kyverno, Postgres, and four Temporal services will not fit in less. Plus the CLIs in Step 0, outbound internet for Helm repos and image pulls, and roughly 5 GB of image downloads. Everything runs locally; there is no cloud account and no cost.</p>
+<h3 id="step-0--tools-and-a-sanity-check">Step 0 — Tools and a sanity check<a class="anchor" href="#step-0--tools-and-a-sanity-check">#</a></h3>
+<div class="codehilite"><pre><span></span><code><span class="c1"># Required. Docker must already be running — kind builds its nodes as containers.</span>
+brew install kind kubectl helm cilium-cli jq yq step temporal
+docker info &gt;/dev/null <span class="o">&amp;&amp;</span> <span class="nb">echo</span> <span class="s2">&quot;docker ok&quot;</span>
+<span class="c1"># or the equivalent for your platform — see kind.sigs.k8s.io, docs.cilium.io,</span>
+<span class="c1"># smallstep.com/docs/step-cli, and docs.temporal.io/cli for install instructions.</span>
+
+kind version <span class="o">&amp;&amp;</span> kubectl version --client <span class="o">&amp;&amp;</span> helm version --short <span class="o">&amp;&amp;</span> temporal --version
+</code></pre></div>
+
+<p>Before building anything, see what "working" looks like. The Temporal CLI ships a full in-process dev server:</p>
+<div class="codehilite"><pre><span></span><code>temporal server start-dev --db-filename /tmp/temporal-lab.db --ui-port <span class="m">8080</span>
+</code></pre></div>
+
+<p>In a second shell:</p>
+<div class="codehilite"><pre><span></span><code>temporal operator cluster health
+temporal operator namespace create --namespace lab
+temporal workflow start --type NoopWorkflow --task-queue lab-tq <span class="se">\</span>
+  --workflow-id smoke-1 --namespace lab
+temporal workflow list --namespace lab
+</code></pre></div>
+
+<p>The workflow will sit <code>Running</code> because there is no worker — that is fine and it is the point. It proves Frontend accepted the request, History persisted it, and Visibility indexed it. Open <code>http://localhost:8080</code>, look at the Event History, then <code>Ctrl-C</code>. You now know what the far end of the DAG looks like.</p>
+<p>Make a working directory:</p>
+<div class="codehilite"><pre><span></span><code>mkdir -p ~/cell-lab/<span class="o">{</span>charts,values,rendered,manifests<span class="o">}</span> <span class="o">&amp;&amp;</span> <span class="nb">cd</span> ~/cell-lab
+</code></pre></div>
+
+<h3 id="step-1--l0l3-the-cloud-account-and-the-kubernetes-control-plane">Step 1 — L0–L3: the "cloud account" and the Kubernetes control plane<a class="anchor" href="#step-1--l0l3-the-cloud-account-and-the-kubernetes-control-plane">#</a></h3>
+<p><code>kind</code> collapses layers 0 through 3 into one command, but you can still make the CNI edge visible by refusing the defaults.</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># ~/cell-lab/kind-cell.yaml</span><span class="w"></span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Cluster</span><span class="w"></span>
+<span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">kind.x-k8s.io/v1alpha4</span><span class="w"></span>
+<span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cell-lab</span><span class="w"></span>
+<span class="nt">networking</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">disableDefaultCNI</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span><span class="w">      </span><span class="c1"># no kindnet — we install our own datapath</span><span class="w"></span>
+<span class="w">  </span><span class="nt">kubeProxyMode</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;none&quot;</span><span class="w">        </span><span class="c1"># Cilium will replace kube-proxy</span><span class="w"></span>
+<span class="w">  </span><span class="nt">podSubnet</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;10.244.0.0/16&quot;</span><span class="w">   </span><span class="c1"># the IPAM decision, made once, immutable</span><span class="w"></span>
+<span class="w">  </span><span class="nt">serviceSubnet</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;10.96.0.0/16&quot;</span><span class="w"></span>
+<span class="nt">nodes</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">role</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">control-plane</span><span class="w"></span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">role</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">worker</span><span class="w"></span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">role</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">worker</span><span class="w"></span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code>kind create cluster --config kind-cell.yaml
+</code></pre></div>
+
+<p>Now look at what you have. This is L3 with no L4:</p>
+<div class="codehilite"><pre><span></span><code>kubectl get nodes -o wide
+<span class="c1"># STATUS: NotReady   — every node</span>
+
+kubectl get pods -n kube-system
+<span class="c1"># coredns-*  Pending   — it needs pod networking that does not exist yet</span>
+
+kubectl describe node cell-lab-worker <span class="p">|</span> grep -A3 <span class="s1">&#39;Ready &#39;</span>
+<span class="c1"># KubeletNotReady ... container runtime network not ready:</span>
+<span class="c1">#   NetworkReady=false ... cni plugin not initialized</span>
+</code></pre></div>
+
+<p><strong>Stop and read that.</strong> This is the exact message every real cell emits between L3 and L4. If your provisioning health check runs here, it reports a false failure. Encode gates, not sleeps.</p>
+<h3 id="step-2--l4-the-cni-and-nodes-becoming-ready">Step 2 — L4: the CNI, and nodes becoming Ready<a class="anchor" href="#step-2--l4-the-cni-and-nodes-becoming-ready">#</a></h3>
+<div class="codehilite"><pre><span></span><code><span class="c1"># The API server address the CNI needs, because there is no kube-proxy</span>
+<span class="c1"># to give it a working ClusterIP for the kubernetes Service.</span>
+<span class="nv">API_SERVER_IP</span><span class="o">=</span><span class="k">$(</span>docker inspect cell-lab-control-plane <span class="se">\</span>
+  -f <span class="s1">&#39;{{ .NetworkSettings.Networks.kind.IPAddress }}&#39;</span><span class="k">)</span>
+<span class="nb">echo</span> <span class="s2">&quot;</span><span class="nv">$API_SERVER_IP</span><span class="s2">&quot;</span>
+
+helm repo add cilium https://helm.cilium.io/
+helm repo update
+
+<span class="c1"># Pin the version explicitly. Never render from a floating chart.</span>
+<span class="nv">CILIUM_VERSION</span><span class="o">=</span><span class="k">$(</span>helm search repo cilium/cilium -o json <span class="p">|</span> jq -r <span class="s1">&#39;.[0].version&#39;</span><span class="k">)</span>
+<span class="nb">echo</span> <span class="s2">&quot;pinning cilium chart </span><span class="si">${</span><span class="nv">CILIUM_VERSION</span><span class="si">}</span><span class="s2">&quot;</span>
+
+helm template cilium cilium/cilium <span class="se">\</span>
+  --version <span class="s2">&quot;</span><span class="si">${</span><span class="nv">CILIUM_VERSION</span><span class="si">}</span><span class="s2">&quot;</span> <span class="se">\</span>
+  --namespace kube-system <span class="se">\</span>
+  --set <span class="nv">kubeProxyReplacement</span><span class="o">=</span><span class="nb">true</span> <span class="se">\</span>
+  --set <span class="nv">k8sServiceHost</span><span class="o">=</span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">API_SERVER_IP</span><span class="si">}</span><span class="s2">&quot;</span> <span class="se">\</span>
+  --set <span class="nv">k8sServicePort</span><span class="o">=</span><span class="m">6443</span> <span class="se">\</span>
+  --set operator.replicas<span class="o">=</span><span class="m">1</span> <span class="se">\</span>
+  &gt; rendered/10-cilium.yaml
+
+kubectl apply --server-side --force-conflicts <span class="se">\</span>
+  --field-manager<span class="o">=</span>cell-pipeline -f rendered/10-cilium.yaml
+
+cilium status --wait
+kubectl get nodes          <span class="c1"># Ready</span>
+kubectl get pods -n kube-system   <span class="c1"># coredns now Running</span>
+</code></pre></div>
+
+<p>Note what just happened in DAG terms: <strong>the CNI made the nodes Ready, and node-Ready made CoreDNS schedulable.</strong> Two edges, one command. Everything from here on depends on both.</p>
+<p>Prove the datapath works before trusting it:</p>
+<div class="codehilite"><pre><span></span><code>kubectl create deployment web --image<span class="o">=</span>nginx --replicas<span class="o">=</span><span class="m">3</span>
+kubectl expose deployment web --port<span class="o">=</span><span class="m">80</span>
+kubectl run probe --rm -it --image<span class="o">=</span>nicolaka/netshoot --restart<span class="o">=</span>Never -- <span class="se">\</span>
+  sh -c <span class="s1">&#39;nslookup web.default.svc.cluster.local &amp;&amp; curl -s -o /dev/null -w &quot;%{http_code}\n&quot; http://web&#39;</span>
+<span class="c1"># 200</span>
+kubectl delete deployment web <span class="o">&amp;&amp;</span> kubectl delete svc web
+</code></pre></div>
+
+<p>If DNS resolves and the ClusterIP answers, L4 is green. See <a href="05-cni-and-host-networking.html">05</a> for what each of those two facts actually required.</p>
+<h3 id="step-3--the-render-pipeline-helm-as-templating-only">Step 3 — The render pipeline (Helm as templating only)<a class="anchor" href="#step-3--the-render-pipeline-helm-as-templating-only">#</a></h3>
+<p>Before installing anything else, set up the pattern your team actually uses. Everything downstream goes through this.</p>
+<div class="codehilite"><pre><span></span><code>cat &gt; apply.sh <span class="s">&lt;&lt;&#39;EOF&#39;</span>
+<span class="s">#!/usr/bin/env bash</span>
+<span class="s">set -euo pipefail</span>
+<span class="s"># Apply rendered YAML with a stable field manager.</span>
+<span class="s"># Field ownership is what replaces Helm&#39;s release state.</span>
+<span class="s">for f in &quot;$@&quot;; do</span>
+<span class="s">  echo &quot;== $f  ($(grep -c &#39;^kind:&#39; &quot;$f&quot;) objects)&quot;</span>
+<span class="s">  kubectl diff --server-side --field-manager=cell-pipeline -f &quot;$f&quot; || true</span>
+<span class="s">  kubectl apply --server-side --force-conflicts \</span>
+<span class="s">    --field-manager=cell-pipeline -f &quot;$f&quot;</span>
+<span class="s">done</span>
+<span class="s">EOF</span>
+chmod +x apply.sh
+</code></pre></div>
+
+<p><code>kubectl diff</code> before every apply is the habit worth building: in a templating-only world, the diff <em>is</em> the change plan. See <a href="09-helm.html">09</a>.</p>
+<h3 id="step-4--l6-pki-the-two-level-hierarchy-and-trust-distribution">Step 4 — L6: PKI, the two-level hierarchy, and trust distribution<a class="anchor" href="#step-4--l6-pki-the-two-level-hierarchy-and-trust-distribution">#</a></h3>
+<p>Install cert-manager. Note <code>crds.enabled=true</code> — in a rendered-manifest world you own CRD lifecycle explicitly.</p>
+<div class="codehilite"><pre><span></span><code>helm repo add jetstack https://charts.jetstack.io <span class="o">&amp;&amp;</span> helm repo update
+<span class="nv">CM_VERSION</span><span class="o">=</span><span class="k">$(</span>helm search repo jetstack/cert-manager -o json <span class="p">|</span> jq -r <span class="s1">&#39;.[0].version&#39;</span><span class="k">)</span>
+<span class="nb">echo</span> <span class="s2">&quot;pinning cert-manager </span><span class="si">${</span><span class="nv">CM_VERSION</span><span class="si">}</span><span class="s2">&quot;</span>
+
+kubectl create namespace cert-manager --dry-run<span class="o">=</span>client -o yaml <span class="p">|</span> kubectl apply -f -
+
+helm template cert-manager jetstack/cert-manager <span class="se">\</span>
+  --version <span class="s2">&quot;</span><span class="si">${</span><span class="nv">CM_VERSION</span><span class="si">}</span><span class="s2">&quot;</span> <span class="se">\</span>
+  --namespace cert-manager <span class="se">\</span>
+  --set crds.enabled<span class="o">=</span><span class="nb">true</span> <span class="se">\</span>
+  &gt; rendered/20-cert-manager.yaml
+
+./apply.sh rendered/20-cert-manager.yaml
+kubectl -n cert-manager rollout status deploy/cert-manager --timeout<span class="o">=</span>180s
+kubectl -n cert-manager rollout status deploy/cert-manager-webhook --timeout<span class="o">=</span>180s
+</code></pre></div>
+
+<p>Now break the self-signed-root paradox, deliberately and visibly:</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># ~/cell-lab/manifests/30-pki.yaml</span><span class="w"></span>
+<span class="nn">---</span><span class="w"></span>
+<span class="c1"># The ONLY use of SelfSigned. Breaks the &quot;CA needs a certificate&quot; cycle.</span><span class="w"></span>
+<span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cert-manager.io/v1</span><span class="w"></span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">ClusterIssuer</span><span class="w"></span>
+<span class="nt">metadata</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">selfsigned-bootstrap</span><span class="w"></span>
+<span class="nt">spec</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">selfSigned</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">{}</span><span class="w"></span>
+<span class="nn">---</span><span class="w"></span>
+<span class="c1"># Level 1: the root. In production this is offline / a cloud private CA /</span><span class="w"></span>
+<span class="c1"># a Vault PKI mount signed in a human ceremony. Never this.</span><span class="w"></span>
+<span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cert-manager.io/v1</span><span class="w"></span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Certificate</span><span class="w"></span>
+<span class="nt">metadata</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cell-root</span><span class="w"></span>
+<span class="w">  </span><span class="nt">namespace</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cert-manager</span><span class="w"></span>
+<span class="nt">spec</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">isCA</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span><span class="w"></span>
+<span class="w">  </span><span class="nt">commonName</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cell-lab-root</span><span class="w"></span>
+<span class="w">  </span><span class="nt">secretName</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cell-root-ca</span><span class="w"></span>
+<span class="w">  </span><span class="nt">duration</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">87600h</span><span class="w">        </span><span class="c1"># 10y</span><span class="w"></span>
+<span class="w">  </span><span class="nt">privateKey</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">algorithm</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">ECDSA</span><span class="w"></span>
+<span class="w">    </span><span class="nt">size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">256</span><span class="w"></span>
+<span class="w">  </span><span class="nt">issuerRef</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">selfsigned-bootstrap</span><span class="w"></span>
+<span class="w">    </span><span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">ClusterIssuer</span><span class="w"></span>
+<span class="w">    </span><span class="nt">group</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cert-manager.io</span><span class="w"></span>
+<span class="nn">---</span><span class="w"></span>
+<span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cert-manager.io/v1</span><span class="w"></span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">ClusterIssuer</span><span class="w"></span>
+<span class="nt">metadata</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cell-root-issuer</span><span class="w"></span>
+<span class="nt">spec</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">ca</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">secretName</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cell-root-ca</span><span class="w"></span>
+<span class="nn">---</span><span class="w"></span>
+<span class="c1"># Level 2: the intermediate. This is the one that rotates routinely,</span><span class="w"></span>
+<span class="c1"># because rotating it needs no trust redistribution.</span><span class="w"></span>
+<span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cert-manager.io/v1</span><span class="w"></span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Certificate</span><span class="w"></span>
+<span class="nt">metadata</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cell-intermediate</span><span class="w"></span>
+<span class="w">  </span><span class="nt">namespace</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cert-manager</span><span class="w"></span>
+<span class="nt">spec</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">isCA</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span><span class="w"></span>
+<span class="w">  </span><span class="nt">commonName</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cell-lab-intermediate</span><span class="w"></span>
+<span class="w">  </span><span class="nt">secretName</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cell-intermediate-ca</span><span class="w"></span>
+<span class="w">  </span><span class="nt">duration</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">8760h</span><span class="w">         </span><span class="c1"># 1y</span><span class="w"></span>
+<span class="w">  </span><span class="nt">renewBefore</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">720h</span><span class="w">       </span><span class="c1"># 30d</span><span class="w"></span>
+<span class="w">  </span><span class="nt">privateKey</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">algorithm</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">ECDSA</span><span class="w"></span>
+<span class="w">    </span><span class="nt">size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">256</span><span class="w"></span>
+<span class="w">  </span><span class="nt">issuerRef</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cell-root-issuer</span><span class="w"></span>
+<span class="w">    </span><span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">ClusterIssuer</span><span class="w"></span>
+<span class="w">    </span><span class="nt">group</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cert-manager.io</span><span class="w"></span>
+<span class="nn">---</span><span class="w"></span>
+<span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cert-manager.io/v1</span><span class="w"></span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">ClusterIssuer</span><span class="w"></span>
+<span class="nt">metadata</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cell-issuer</span><span class="w"></span>
+<span class="nt">spec</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">ca</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">secretName</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cell-intermediate-ca</span><span class="w"></span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code>./apply.sh manifests/30-pki.yaml
+kubectl -n cert-manager get certificate
+kubectl get clusterissuer
+
+<span class="c1"># Read the chain you just built.</span>
+kubectl -n cert-manager get secret cell-intermediate-ca <span class="se">\</span>
+  -o <span class="nv">jsonpath</span><span class="o">=</span><span class="s1">&#39;{.data.tls\.crt}&#39;</span> <span class="p">|</span> base64 -d <span class="p">|</span> step certificate inspect --short
+</code></pre></div>
+
+<p>Trust distribution — the half with no automation by default:</p>
+<div class="codehilite"><pre><span></span><code>kubectl label namespace default cell.lab/trust<span class="o">=</span><span class="nb">true</span> --overwrite
+
+helm upgrade --install trust-manager <span class="se">\</span>
+  oci://quay.io/jetstack/charts/trust-manager <span class="se">\</span>
+  --namespace cert-manager <span class="se">\</span>
+  --set app.trust.namespace<span class="o">=</span>cert-manager <span class="se">\</span>
+  --wait
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="c1"># ~/cell-lab/manifests/35-trust.yaml</span><span class="w"></span>
+<span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">trust.cert-manager.io/v1alpha1</span><span class="w"></span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Bundle</span><span class="w"></span>
+<span class="nt">metadata</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cell-trust-bundle</span><span class="w"></span>
+<span class="nt">spec</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">sources</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">useDefaultCAs</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span><span class="w">          </span><span class="c1"># public roots, for egress to the internet</span><span class="w"></span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">secret</span><span class="p">:</span><span class="w"></span>
+<span class="w">        </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cell-root-ca</span><span class="w">         </span><span class="c1"># our root, for everything inside the cell</span><span class="w"></span>
+<span class="w">        </span><span class="nt">key</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;ca.crt&quot;</span><span class="w"></span>
+<span class="w">  </span><span class="nt">target</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">configMap</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="nt">key</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;trust-bundle.pem&quot;</span><span class="w"></span>
+<span class="w">    </span><span class="nt">namespaceSelector</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="nt">matchLabels</span><span class="p">:</span><span class="w"></span>
+<span class="w">        </span><span class="nt">cell.lab/trust</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;true&quot;</span><span class="w"></span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code>./apply.sh manifests/35-trust.yaml
+kubectl get bundle cell-trust-bundle
+kubectl -n default get configmap cell-trust-bundle -o <span class="nv">jsonpath</span><span class="o">=</span><span class="s1">&#39;{.data.trust-bundle\.pem}&#39;</span> <span class="se">\</span>
+  <span class="p">|</span> step certificate inspect --short --bundle <span class="p">|</span> head -20
+</code></pre></div>
+
+<p><strong>The lesson to take away:</strong> issuing the intermediate took two seconds. Getting the root into one namespace's trust store took a separate tool, a label, and a second reconcile loop. That asymmetry is the entire reason root rotation is a quarter-long project. See <a href="11-cert-manager-and-pki.html">11</a>.</p>
+<h3 id="step-5--l7-the-secret-store">Step 5 — L7: the secret store<a class="anchor" href="#step-5--l7-the-secret-store">#</a></h3>
+<p>Vault in dev mode is auto-unsealed, which is the lab's stand-in for cloud-KMS auto-unseal. The dependency shape is identical; only the unseal mechanism differs.</p>
+<div class="codehilite"><pre><span></span><code>helm repo add hashicorp https://helm.releases.hashicorp.com <span class="o">&amp;&amp;</span> helm repo update
+<span class="nv">VAULT_VERSION</span><span class="o">=</span><span class="k">$(</span>helm search repo hashicorp/vault -o json <span class="p">|</span> jq -r <span class="s1">&#39;.[0].version&#39;</span><span class="k">)</span>
+
+kubectl create namespace vault --dry-run<span class="o">=</span>client -o yaml <span class="p">|</span> kubectl apply -f -
+
+helm template vault hashicorp/vault <span class="se">\</span>
+  --version <span class="s2">&quot;</span><span class="si">${</span><span class="nv">VAULT_VERSION</span><span class="si">}</span><span class="s2">&quot;</span> <span class="se">\</span>
+  --namespace vault <span class="se">\</span>
+  --set <span class="s2">&quot;server.dev.enabled=true&quot;</span> <span class="se">\</span>
+  --set <span class="s2">&quot;server.dev.devRootToken=root&quot;</span> <span class="se">\</span>
+  --set <span class="s2">&quot;injector.enabled=false&quot;</span> <span class="se">\</span>
+  &gt; rendered/40-vault.yaml
+
+./apply.sh rendered/40-vault.yaml
+<span class="c1"># vault-helm sets updateStrategyType: OnDelete, and `kubectl rollout status`</span>
+<span class="c1"># errors out on any StatefulSet that is not RollingUpdate. Wait on the pod.</span>
+kubectl -n vault <span class="nb">wait</span> --for<span class="o">=</span><span class="nv">condition</span><span class="o">=</span>Ready pod/vault-0 --timeout<span class="o">=</span>180s
+
+<span class="c1"># Kubernetes auth: the cell&#39;s workloads authenticate by their ServiceAccount</span>
+<span class="c1"># token, not by a shared secret.</span>
+kubectl -n vault <span class="nb">exec</span> vault-0 -- sh -c <span class="s1">&#39;</span>
+<span class="s1">  export VAULT_TOKEN=root</span>
+<span class="s1">  vault auth enable kubernetes || true</span>
+<span class="s1">  vault write auth/kubernetes/config \</span>
+<span class="s1">    kubernetes_host=&quot;https://$KUBERNETES_PORT_443_TCP_ADDR:443&quot;</span>
+<span class="s1">  vault secrets enable -path=cell-lab kv-v2 || true</span>
+<span class="s1">  vault kv put cell-lab/postgres username=temporal password=temporal-lab-pw</span>
+<span class="s1">  vault kv get cell-lab/postgres</span>
+<span class="s1">&#39;</span>
+</code></pre></div>
+
+<p><strong>Exercise (10 minutes, high value).</strong> Prove that Vault fails closed. From guide <a href="10-vault.html">10</a>'s Lab 5: enable a file audit device pointing at a path Vault cannot write to, then watch every write fail. It is the most embarrassing Vault outage and it takes ten minutes to inoculate yourself against it.</p>
+<h3 id="step-6--l8-policy-and-the-webhook-deadlock">Step 6 — L8: policy, and the webhook deadlock<a class="anchor" href="#step-6--l8-policy-and-the-webhook-deadlock">#</a></h3>
+<div class="codehilite"><pre><span></span><code>helm repo add kyverno https://kyverno.github.io/kyverno/ <span class="o">&amp;&amp;</span> helm repo update
+<span class="nv">KYVERNO_VERSION</span><span class="o">=</span><span class="k">$(</span>helm search repo kyverno/kyverno -o json <span class="p">|</span> jq -r <span class="s1">&#39;.[0].version&#39;</span><span class="k">)</span>
+
+kubectl create namespace kyverno --dry-run<span class="o">=</span>client -o yaml <span class="p">|</span> kubectl apply -f -
+
+helm template kyverno kyverno/kyverno <span class="se">\</span>
+  --version <span class="s2">&quot;</span><span class="si">${</span><span class="nv">KYVERNO_VERSION</span><span class="si">}</span><span class="s2">&quot;</span> <span class="se">\</span>
+  --namespace kyverno <span class="se">\</span>
+  --include-crds <span class="se">\</span>
+  &gt; rendered/50-kyverno.yaml
+
+./apply.sh rendered/50-kyverno.yaml
+kubectl -n kyverno rollout status deploy/kyverno-admission-controller --timeout<span class="o">=</span>300s
+
+<span class="c1"># Which namespaces are excluded by default? Read it, do not assume.</span>
+kubectl -n kyverno get configmap kyverno -o yaml <span class="p">|</span> grep -A5 resourceFilters
+</code></pre></div>
+
+<p>A cell invariant as a policy. Check your Kyverno version's API first — the CEL types under <code>policies.kyverno.io/v1</code> are current, and the legacy <code>kyverno.io/v1 ClusterPolicy</code> is deprecated:</p>
+<div class="codehilite"><pre><span></span><code>kubectl api-resources <span class="p">|</span> grep -i kyverno
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="c1"># ~/cell-lab/manifests/55-policy.yaml</span><span class="w"></span>
+<span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">policies.kyverno.io/v1</span><span class="w"></span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">ValidatingPolicy</span><span class="w"></span>
+<span class="nt">metadata</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">require-cell-component-label</span><span class="w"></span>
+<span class="nt">spec</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">validationActions</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">Deny</span><span class="p p-Indicator">]</span><span class="w"></span>
+<span class="w">  </span><span class="nt">matchConstraints</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="c1"># Scope this to namespaces you own. A cluster-wide match here would deny</span><span class="w"></span>
+<span class="w">    </span><span class="c1"># every Deployment in the Temporal chart in Step 8, because a third-party</span><span class="w"></span>
+<span class="w">    </span><span class="c1"># chart does not carry your labels — which is the real-world lesson.</span><span class="w"></span>
+<span class="w">    </span><span class="nt">namespaceSelector</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="nt">matchLabels</span><span class="p">:</span><span class="w"></span>
+<span class="w">        </span><span class="nt">cell.lab/policy</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;enforce&quot;</span><span class="w"></span>
+<span class="w">    </span><span class="nt">resourceRules</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">apiGroups</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;apps&quot;</span><span class="p p-Indicator">]</span><span class="w"></span>
+<span class="w">        </span><span class="nt">apiVersions</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;v1&quot;</span><span class="p p-Indicator">]</span><span class="w"></span>
+<span class="w">        </span><span class="nt">operations</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;CREATE&quot;</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">&quot;UPDATE&quot;</span><span class="p p-Indicator">]</span><span class="w"></span>
+<span class="w">        </span><span class="nt">resources</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;deployments&quot;</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">&quot;statefulsets&quot;</span><span class="p p-Indicator">]</span><span class="w"></span>
+<span class="w">  </span><span class="nt">validations</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">expression</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;-</span><span class="w"></span>
+<span class="w">        </span><span class="no">has(object.spec.template.metadata) &amp;&amp;</span><span class="w"></span>
+<span class="w">        </span><span class="no">has(object.spec.template.metadata.labels) &amp;&amp;</span><span class="w"></span>
+<span class="w">        </span><span class="no">&#39;cell.lab/component&#39; in object.spec.template.metadata.labels</span><span class="w"></span>
+<span class="w">      </span><span class="nt">message</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;every</span><span class="nv"> </span><span class="s">workload</span><span class="nv"> </span><span class="s">must</span><span class="nv"> </span><span class="s">carry</span><span class="nv"> </span><span class="s">cell.lab/component&quot;</span><span class="w"></span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code>./apply.sh manifests/55-policy.yaml
+kubectl label namespace default cell.lab/policy<span class="o">=</span>enforce --overwrite
+
+<span class="c1"># Should be denied:</span>
+kubectl create deployment naughty --image<span class="o">=</span>nginx
+<span class="c1"># Should be accepted:</span>
+kubectl create deployment nice --image<span class="o">=</span>nginx --dry-run<span class="o">=</span>client -o yaml <span class="se">\</span>
+  <span class="p">|</span> yq <span class="s1">&#39;.spec.template.metadata.labels.&quot;cell.lab/component&quot; = &quot;demo&quot;&#39;</span> <span class="se">\</span>
+  <span class="p">|</span> kubectl apply -f -
+kubectl delete deployment nice --ignore-not-found
+</code></pre></div>
+
+<p><strong>Now break the cell on purpose.</strong> This is the most instructive twenty minutes in the lab.</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># Make the webhook fail-closed and then remove the thing behind it.</span>
+kubectl get validatingwebhookconfiguration <span class="p">|</span> grep kyverno
+kubectl scale -n kyverno deploy/kyverno-admission-controller --replicas<span class="o">=</span><span class="m">0</span>
+
+<span class="c1"># Try to do anything. Watch it hang and then fail.</span>
+kubectl create deployment canary --image<span class="o">=</span>nginx
+<span class="c1">#   Error: failed calling webhook ... connection refused</span>
+
+<span class="c1"># Break glass. This is the runbook step. Practise it now, not at 3am.</span>
+kubectl delete validatingwebhookconfiguration <span class="se">\</span>
+  <span class="k">$(</span>kubectl get validatingwebhookconfiguration -o name <span class="p">|</span> grep kyverno <span class="p">|</span> head -1 <span class="p">|</span> cut -d/ -f2<span class="k">)</span>
+
+kubectl scale -n kyverno deploy/kyverno-admission-controller --replicas<span class="o">=</span><span class="m">1</span>
+<span class="c1"># Kyverno re-registers its webhooks on startup. Confirm:</span>
+kubectl get validatingwebhookconfiguration <span class="p">|</span> grep kyverno
+</code></pre></div>
+
+<p>Ask yourself the question that matters: <strong>if this cell were bootstrapping right now, could it?</strong> A fail-closed webhook that matches <code>Pods</code> cluster-wide, installed before cert-manager, is a cell that never comes up. That is why the ordering in the DAG puts the policy <em>controller</em> early and the <em>policies</em> late.</p>
+<h3 id="step-7--l9-the-data-store">Step 7 — L9: the data store<a class="anchor" href="#step-7--l9-the-data-store">#</a></h3>
+<div class="codehilite"><pre><span></span><code><span class="c1"># ~/cell-lab/manifests/60-postgres.yaml</span><span class="w"></span>
+<span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">v1</span><span class="w"></span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Namespace</span><span class="w"></span>
+<span class="nt">metadata</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">data</span><span class="w"></span>
+<span class="w">  </span><span class="nt">labels</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">cell.lab/trust</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;true&quot;</span><span class="w"></span>
+<span class="w">    </span><span class="nt">cell.lab/policy</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;enforce&quot;</span><span class="w">   </span><span class="c1"># opt this namespace into the Step 6 policy</span><span class="w"></span>
+<span class="nn">---</span><span class="w"></span>
+<span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">v1</span><span class="w"></span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Secret</span><span class="w"></span>
+<span class="nt">metadata</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">postgres-creds</span><span class="w"></span>
+<span class="w">  </span><span class="nt">namespace</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">data</span><span class="w"></span>
+<span class="nt">stringData</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">POSTGRES_USER</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">temporal</span><span class="w"></span>
+<span class="w">  </span><span class="nt">POSTGRES_PASSWORD</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">temporal-lab-pw</span><span class="w"></span>
+<span class="w">  </span><span class="nt">POSTGRES_DB</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">postgres</span><span class="w"></span>
+<span class="nn">---</span><span class="w"></span>
+<span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">apps/v1</span><span class="w"></span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">StatefulSet</span><span class="w"></span>
+<span class="nt">metadata</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">postgres</span><span class="w"></span>
+<span class="w">  </span><span class="nt">namespace</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">data</span><span class="w"></span>
+<span class="nt">spec</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">serviceName</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">postgres</span><span class="w"></span>
+<span class="w">  </span><span class="nt">replicas</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1</span><span class="w"></span>
+<span class="w">  </span><span class="nt">selector</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">matchLabels</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> app</span><span class="p">:</span><span class="w"> </span><span class="nv">postgres</span><span class="w"> </span><span class="p p-Indicator">}</span><span class="w"></span>
+<span class="w">  </span><span class="nt">template</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">metadata</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="nt">labels</span><span class="p">:</span><span class="w"></span>
+<span class="w">        </span><span class="nt">app</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">postgres</span><span class="w"></span>
+<span class="w">        </span><span class="nt">cell.lab/component</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">persistence</span><span class="w"></span>
+<span class="w">    </span><span class="nt">spec</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="nt">containers</span><span class="p">:</span><span class="w"></span>
+<span class="w">        </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">postgres</span><span class="w"></span>
+<span class="w">          </span><span class="nt">image</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">postgres:16</span><span class="w"></span>
+<span class="w">          </span><span class="nt">envFrom</span><span class="p">:</span><span class="w"></span>
+<span class="w">            </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">secretRef</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> name</span><span class="p">:</span><span class="w"> </span><span class="nv">postgres-creds</span><span class="w"> </span><span class="p p-Indicator">}</span><span class="w"></span>
+<span class="w">          </span><span class="nt">ports</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[{</span><span class="nt"> containerPort</span><span class="p">:</span><span class="w"> </span><span class="nv">5432</span><span class="w"> </span><span class="p p-Indicator">}]</span><span class="w"></span>
+<span class="w">          </span><span class="nt">readinessProbe</span><span class="p">:</span><span class="w"></span>
+<span class="w">            </span><span class="nt">exec</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> command</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;pg_isready&quot;</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">&quot;-U&quot;</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">&quot;temporal&quot;</span><span class="p p-Indicator">]</span><span class="w"> </span><span class="p p-Indicator">}</span><span class="w"></span>
+<span class="w">            </span><span class="nt">initialDelaySeconds</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">5</span><span class="w"></span>
+<span class="nn">---</span><span class="w"></span>
+<span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">v1</span><span class="w"></span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Service</span><span class="w"></span>
+<span class="nt">metadata</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">postgres</span><span class="w"></span>
+<span class="w">  </span><span class="nt">namespace</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">data</span><span class="w"></span>
+<span class="nt">spec</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">selector</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> app</span><span class="p">:</span><span class="w"> </span><span class="nv">postgres</span><span class="w"> </span><span class="p p-Indicator">}</span><span class="w"></span>
+<span class="w">  </span><span class="nt">ports</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[{</span><span class="nt"> port</span><span class="p">:</span><span class="w"> </span><span class="nv">5432</span><span class="p p-Indicator">,</span><span class="nt"> targetPort</span><span class="p">:</span><span class="w"> </span><span class="nv">5432</span><span class="w"> </span><span class="p p-Indicator">}]</span><span class="w"></span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code>./apply.sh manifests/60-postgres.yaml
+kubectl -n data rollout status statefulset/postgres --timeout<span class="o">=</span>180s
+</code></pre></div>
+
+<p>Note that the StatefulSet carries <code>cell.lab/component</code> — your own policy from step 6 is now enforcing a cell invariant on the cell's own data layer. That is the point of policy-as-bootstrap.</p>
+<h3 id="step-8--l10-the-temporal-services">Step 8 — L10: the Temporal services<a class="anchor" href="#step-8--l10-the-temporal-services">#</a></h3>
+<p>Read the chart's values before you use it. Do this for every third-party chart, always:</p>
+<div class="codehilite"><pre><span></span><code>helm show values temporal --repo https://go.temporal.io/helm-charts <span class="se">\</span>
+  &gt; values/temporal-reference.yaml
+wc -l values/temporal-reference.yaml
+grep -n <span class="s1">&#39;useHelmHooks\|numHistoryShards\|manageSchema&#39;</span> values/temporal-reference.yaml
+</code></pre></div>
+
+<p>The chart's schema Job uses Helm hooks by default. In a rendered-manifest pipeline with no release state, hooks do not run — this is exactly the "third-party charts assume release state" problem from guide <a href="09-helm.html">09</a>, and the chart gives you the escape hatch:</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># ~/cell-lab/values/temporal-cell.yaml</span><span class="w"></span>
+<span class="nt">useHelmHooks</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">false</span><span class="w">          </span><span class="c1"># we own ordering, not Helm</span><span class="w"></span>
+
+<span class="nt">server</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">replicaCount</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1</span><span class="w"></span>
+<span class="w">  </span><span class="nt">config</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">numHistoryShards</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">4</span><span class="w">      </span><span class="c1"># tiny. In production this is fixed forever.</span><span class="w"></span>
+<span class="w">    </span><span class="nt">persistence</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="nt">defaultStore</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">default</span><span class="w"></span>
+<span class="w">      </span><span class="nt">visibilityStore</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">visibility</span><span class="w"></span>
+<span class="w">      </span><span class="nt">datastores</span><span class="p">:</span><span class="w"></span>
+<span class="w">        </span><span class="nt">default</span><span class="p">:</span><span class="w"></span>
+<span class="w">          </span><span class="nt">sql</span><span class="p">:</span><span class="w"></span>
+<span class="w">            </span><span class="nt">createDatabase</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span><span class="w"></span>
+<span class="w">            </span><span class="nt">manageSchema</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span><span class="w"></span>
+<span class="w">            </span><span class="nt">pluginName</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">postgres12</span><span class="w"></span>
+<span class="w">            </span><span class="nt">driverName</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">postgres12</span><span class="w"></span>
+<span class="w">            </span><span class="nt">databaseName</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">temporal</span><span class="w"></span>
+<span class="w">            </span><span class="nt">connectAddr</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;postgres.data.svc.cluster.local:5432&quot;</span><span class="w"></span>
+<span class="w">            </span><span class="nt">connectProtocol</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">tcp</span><span class="w"></span>
+<span class="w">            </span><span class="nt">user</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">temporal</span><span class="w"></span>
+<span class="w">            </span><span class="nt">password</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">temporal-lab-pw</span><span class="w"></span>
+<span class="w">        </span><span class="nt">visibility</span><span class="p">:</span><span class="w"></span>
+<span class="w">          </span><span class="nt">sql</span><span class="p">:</span><span class="w"></span>
+<span class="w">            </span><span class="nt">createDatabase</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span><span class="w"></span>
+<span class="w">            </span><span class="nt">manageSchema</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span><span class="w"></span>
+<span class="w">            </span><span class="nt">pluginName</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">postgres12</span><span class="w"></span>
+<span class="w">            </span><span class="nt">driverName</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">postgres12</span><span class="w"></span>
+<span class="w">            </span><span class="nt">databaseName</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">temporal_visibility</span><span class="w"></span>
+<span class="w">            </span><span class="nt">connectAddr</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;postgres.data.svc.cluster.local:5432&quot;</span><span class="w"></span>
+<span class="w">            </span><span class="nt">connectProtocol</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">tcp</span><span class="w"></span>
+<span class="w">            </span><span class="nt">user</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">temporal</span><span class="w"></span>
+<span class="w">            </span><span class="nt">password</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">temporal-lab-pw</span><span class="w"></span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code>kubectl create namespace temporal --dry-run<span class="o">=</span>client -o yaml <span class="p">|</span> kubectl apply -f -
+kubectl label namespace temporal cell.lab/trust<span class="o">=</span><span class="nb">true</span> --overwrite
+<span class="c1"># Deliberately NOT labelled cell.lab/policy=enforce: the upstream chart does not</span>
+<span class="c1"># stamp cell.lab/component, so enforcing here would deny the whole install. In a</span>
+<span class="c1"># real cell you would either patch the labels in the render step or scope the</span>
+<span class="c1"># policy the way we just did. Decide which, on purpose.</span>
+
+helm template temporal temporal <span class="se">\</span>
+  --repo https://go.temporal.io/helm-charts <span class="se">\</span>
+  --namespace temporal <span class="se">\</span>
+  -f values/temporal-cell.yaml <span class="se">\</span>
+  &gt; rendered/70-temporal.yaml
+
+<span class="c1"># Look at what you are about to apply. This is the review surface.</span>
+grep -c <span class="s1">&#39;^kind:&#39;</span> rendered/70-temporal.yaml
+grep -n <span class="s1">&#39;helm.sh/hook&#39;</span> rendered/70-temporal.yaml <span class="o">||</span> <span class="nb">echo</span> <span class="s2">&quot;no hooks left — good&quot;</span>
+grep -n <span class="s1">&#39;kind: Job&#39;</span> rendered/70-temporal.yaml
+
+./apply.sh rendered/70-temporal.yaml
+</code></pre></div>
+
+<p>Watch the ordering happen, and notice that it happens in the right order <strong>because the objects retry</strong>, not because you sequenced them:</p>
+<div class="codehilite"><pre><span></span><code>kubectl -n temporal get pods -w
+<span class="c1"># schema jobs run, then history/matching/frontend/worker come up.</span>
+<span class="c1"># Any pod that starts before the schema is ready crash-loops and recovers.</span>
+<span class="c1"># That is level-triggered convergence doing its job.</span>
+
+kubectl -n temporal get <span class="nb">jobs</span>
+kubectl -n temporal logs job/temporal-schema-setup --tail<span class="o">=</span><span class="m">20</span> <span class="m">2</span>&gt;/dev/null <span class="o">||</span> <span class="nb">true</span>
+kubectl -n temporal rollout status deploy/temporal-frontend --timeout<span class="o">=</span>300s
+</code></pre></div>
+
+<p>If the schema job did not run, that is the hook problem — apply it explicitly first, wait, then apply the rest. Either way, <em>you have now personally hit the L9 → L10 edge from the DAG table.</em></p>
+<h3 id="step-9--l11l12-the-health-gate">Step 9 — L11–L12: the health gate<a class="anchor" href="#step-9--l11l12-the-health-gate">#</a></h3>
+<div class="codehilite"><pre><span></span><code>kubectl -n temporal get svc
+kubectl -n temporal port-forward svc/temporal-frontend-headless <span class="m">7233</span>:7233 <span class="p">&amp;</span>
+sleep <span class="m">3</span>
+
+<span class="nb">export</span> <span class="nv">TEMPORAL_ADDRESS</span><span class="o">=</span><span class="m">127</span>.0.0.1:7233
+
+<span class="c1"># L12 gate step 1: the service reports itself healthy</span>
+temporal operator cluster health
+temporal operator cluster system
+
+<span class="c1"># L12 gate step 2: control-plane operations work</span>
+temporal operator namespace create --namespace cell-smoke --retention 24h
+temporal operator namespace describe --namespace cell-smoke
+
+<span class="c1"># L12 gate step 3: the full write path — frontend -&gt; history -&gt; persistence</span>
+temporal workflow start --type SmokeWorkflow --task-queue smoke-tq <span class="se">\</span>
+  --workflow-id <span class="s2">&quot;smoke-</span><span class="k">$(</span>date +%s<span class="k">)</span><span class="s2">&quot;</span> --namespace cell-smoke
+
+<span class="c1"># L12 gate step 4: the visibility path</span>
+temporal workflow list --namespace cell-smoke
+</code></pre></div>
+
+<p>Four assertions, four different subsystems. <strong>This is the difference between "pods are Running" and "the cell is ready."</strong> A real gate adds two more that the lab cannot show: the request goes through the real external endpoint (not a port-forward), and it presents a real client certificate against the real mTLS terminator. Those two are where SNI mismatches, missing SANs, and L4 load-balancer pinning are caught.</p>
+<p>Write the gate down as a script, because that is the actual artifact:</p>
+<div class="codehilite"><pre><span></span><code>cat &gt; gate.sh <span class="s">&lt;&lt;&#39;EOF&#39;</span>
+<span class="s">#!/usr/bin/env bash</span>
+<span class="s">set -euo pipefail</span>
+<span class="s">fail() { echo &quot;GATE FAIL: $*&quot; &gt;&amp;2; exit 1; }</span>
+<span class="s">ready() { kubectl -n &quot;$1&quot; get &quot;$2&quot; &quot;$3&quot; -o json | jq -e &#39;.status.readyReplicas &gt;= 1&#39; &gt;/dev/null; }</span>
+
+<span class="s">kubectl get nodes -o json | jq -e &#39;[.items[].status.conditions[]</span>
+<span class="s">  | select(.type==&quot;Ready&quot; and .status==&quot;True&quot;)] | length &gt;= 3&#39; &gt;/dev/null \</span>
+<span class="s">  || fail &quot;L4: not all nodes Ready&quot;</span>
+<span class="s">ready kube-system deploy coredns             || fail &quot;L4: CoreDNS not ready&quot;</span>
+<span class="s">kubectl -n cert-manager get certificate cell-intermediate -o json \</span>
+<span class="s">  | jq -e &#39;[.status.conditions[] | select(.type==&quot;Ready&quot; and .status==&quot;True&quot;)] | length == 1&#39; \</span>
+<span class="s">  &gt;/dev/null                                  || fail &quot;L6: intermediate CA not Ready&quot;</span>
+<span class="s">kubectl -n temporal get configmap cell-trust-bundle &gt;/dev/null 2&gt;&amp;1 \</span>
+<span class="s">  || fail &quot;L6: trust bundle missing in the temporal namespace&quot;</span>
+<span class="s">kubectl get validatingwebhookconfiguration -o name | grep -q kyverno \</span>
+<span class="s">  || fail &quot;L8: kyverno webhooks not registered&quot;</span>
+<span class="s">ready temporal deploy temporal-frontend      || fail &quot;L10: frontend not ready&quot;</span>
+<span class="s">temporal operator cluster health &gt;/dev/null  || fail &quot;L12: cluster health check failed&quot;</span>
+<span class="s">echo &quot;GATE PASS&quot;</span>
+<span class="s">EOF</span>
+chmod +x gate.sh <span class="o">&amp;&amp;</span> ./gate.sh
+</code></pre></div>
+
+<h3 id="step-10--break-things-on-purpose">Step 10 — Break things on purpose<a class="anchor" href="#step-10--break-things-on-purpose">#</a></h3>
+<p>Each of these is a scale model of a real incident. Do all four.</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. Kill the datapath. Watch what still works and what does not.</span>
+kubectl -n kube-system delete pod -l k8s-app<span class="o">=</span>cilium
+kubectl run probe --rm -it --image<span class="o">=</span>nicolaka/netshoot --restart<span class="o">=</span>Never -- <span class="se">\</span>
+  sh -c <span class="s1">&#39;nslookup temporal-frontend-headless.temporal.svc.cluster.local&#39;</span>
+<span class="c1"># New pods cannot get an IP. Existing pods keep their existing connections.</span>
+<span class="c1"># That asymmetry is why &quot;the cell looks fine&quot; during a CNI outage.</span>
+
+<span class="c1"># 2. Rotate the root the WRONG way. Time the outage.</span>
+kubectl -n cert-manager delete secret cell-root-ca
+kubectl -n cert-manager delete certificate cell-root
+./apply.sh manifests/30-pki.yaml
+<span class="c1"># New leaves chain to a new root. The trust bundle has not caught up yet.</span>
+<span class="c1"># In production, that window is your outage. Measure it.</span>
+
+<span class="c1"># 3. Wedge a namespace with a finalizer.</span>
+kubectl create namespace stuck
+kubectl create -n stuck configmap victim --from-literal<span class="o">=</span><span class="nv">a</span><span class="o">=</span>b
+kubectl patch configmap victim -n stuck --type<span class="o">=</span>merge <span class="se">\</span>
+  -p <span class="s1">&#39;{&quot;metadata&quot;:{&quot;finalizers&quot;:[&quot;cell.lab/never-removed&quot;]}}&#39;</span>
+kubectl delete namespace stuck --timeout<span class="o">=</span>30s   <span class="c1"># hangs</span>
+kubectl get namespace stuck -o json <span class="p">|</span> jq <span class="s1">&#39;.status.conditions&#39;</span>
+<span class="c1"># Fix it the way you would in production: remove the finalizer from the</span>
+<span class="c1"># OBJECT, not from the namespace.</span>
+kubectl patch configmap victim -n stuck --type<span class="o">=</span>merge <span class="se">\</span>
+  -p <span class="s1">&#39;{&quot;metadata&quot;:{&quot;finalizers&quot;:null}}&#39;</span>
+kubectl get namespace stuck <span class="m">2</span>&gt;/dev/null <span class="o">||</span> <span class="nb">echo</span> <span class="s2">&quot;namespace gone&quot;</span>
+
+<span class="c1"># 4. Simulate a node upgrade with a bad PDB.</span>
+kubectl -n temporal create poddisruptionbudget frontend-pdb <span class="se">\</span>
+  --selector<span class="o">=</span>app.kubernetes.io/component<span class="o">=</span>frontend --max-unavailable<span class="o">=</span><span class="m">0</span>
+kubectl drain cell-lab-worker --ignore-daemonsets --delete-emptydir-data --timeout<span class="o">=</span>60s
+<span class="c1"># Cannot evict. This is exactly how a Karpenter drift rollout wedges a cell.</span>
+kubectl -n temporal delete pdb frontend-pdb
+kubectl uncordon cell-lab-worker
+</code></pre></div>
+
+<h3 id="step-11--teardown-in-reverse-with-verification">Step 11 — Teardown, in reverse, with verification<a class="anchor" href="#step-11--teardown-in-reverse-with-verification">#</a></h3>
+<div class="codehilite"><pre><span></span><code><span class="c1"># Reverse DAG order. Note step 1: stop the reconcilers first.</span>
+kubectl delete -f manifests/55-policy.yaml --ignore-not-found       <span class="c1"># policies before namespaces</span>
+kubectl delete -f rendered/70-temporal.yaml --ignore-not-found
+kubectl delete -f manifests/60-postgres.yaml --ignore-not-found
+kubectl delete -f rendered/50-kyverno.yaml --ignore-not-found
+kubectl delete -f rendered/40-vault.yaml --ignore-not-found
+kubectl delete -f manifests/35-trust.yaml --ignore-not-found
+helm uninstall trust-manager -n cert-manager --ignore-not-found   <span class="c1"># installed by helm, not rendered</span>
+kubectl delete -f manifests/30-pki.yaml --ignore-not-found
+kubectl delete -f rendered/20-cert-manager.yaml --ignore-not-found
+
+<span class="c1"># Verify: the residue enumerator. This is the sweeper in miniature.</span>
+<span class="nb">echo</span> <span class="s2">&quot;--- namespaces stuck terminating&quot;</span>
+kubectl get ns -o json <span class="p">|</span> jq -r <span class="s1">&#39;.items[] | select(.status.phase==&quot;Terminating&quot;) | .metadata.name&#39;</span>
+<span class="nb">echo</span> <span class="s2">&quot;--- orphaned cluster-scoped webhooks (the bricked-cluster class)&quot;</span>
+kubectl get validatingwebhookconfiguration,mutatingwebhookconfiguration -o name
+<span class="nb">echo</span> <span class="s2">&quot;--- orphaned CRDs&quot;</span>
+kubectl get crd -o name <span class="p">|</span> grep -E <span class="s1">&#39;cert-manager|kyverno|trust&#39;</span> <span class="o">||</span> <span class="nb">echo</span> <span class="s2">&quot;none&quot;</span>
+<span class="nb">echo</span> <span class="s2">&quot;--- unbound PVs&quot;</span>
+kubectl get pv -o json <span class="p">|</span> jq -r <span class="s1">&#39;.items[] | select(.status.phase!=&quot;Bound&quot;) | .metadata.name&#39;</span>
+
+kind delete cluster --name cell-lab
+</code></pre></div>
+
+<p><strong>The exercise that makes this stick:</strong> run the residue enumerator <em>before</em> <code>kind delete cluster</code> and write down everything it finds. In a real cell, every one of those lines is a cloud resource that costs money forever. Your teardown workflow's job is to make that list empty, and to prove it independently by querying the cloud API by tag rather than trusting Kubernetes to have cleaned up.</p>
+<hr />
+<h2 id="production-gotchas">Production gotchas<a class="anchor" href="#production-gotchas">#</a></h2>
+<p>These are the composition-level failures — the ones that do not belong to any single tool, and so appear in no single tool's documentation.</p>
+<p><strong>1. "Ready" is defined at the wrong layer.</strong> A cell whose readiness gate checks pod status will be marked ready before it can serve. The gate must be an end-to-end request through the real ingress with real credentials. Everything else is a proxy metric that will eventually lie to you.</p>
+<p><strong>2. Sleeps instead of gates.</strong> Every <code>sleep 60</code> in a provisioning pipeline is a bug with a timer on it. It is too short on a slow day and wastes minutes on every other day. Poll a condition. Guide <a href="06-karpenter.html">06</a> makes the specific case: poll <code>NodePool.status.conditions[Ready]</code>, not the clock.</p>
+<p><strong>3. Coupled numbers in uncoupled files.</strong> gRPC server <code>keepAliveEnforcementPolicy.minTime</code> versus client keepalive interval; keepalive interval versus LB idle timeout; proxy route timeout versus long-poll expiration; <code>MaxConnectionAge</code> versus <code>terminationGracePeriodSeconds</code>; pod CIDR size versus max-pods-per-node versus expected pod count. Each pair lives in different YAML that nothing forces to agree. Write CI assertions. This is a cheap, high-visibility first-month contribution.</p>
+<p><strong>4. The shared dependency nobody drew on the diagram.</strong> A shared container registry, a shared Vault, a shared observability backend, a shared DNS zone, a shared CI runner pool. Each is a correlated failure domain spanning every cell. The question to answer for each: <em>is it on the request path, or only on the control path?</em> Control-path-only is usually acceptable — the cell keeps serving, you just cannot change it. Request-path shared dependencies quietly convert your cellular architecture back into a monolith.</p>
+<p><strong>5. Teardown is tested less than creation, so it fails more.</strong> Every team creates cells constantly and deletes them rarely. Fix this structurally: create and destroy a scratch cell on a schedule, in CI, on each cloud, and fail the build if the residue enumerator finds anything. The specific residue that bites hardest is leaked ENIs and IPs on AWS — interfaces left behind when nodes go away abruptly consume subnet addresses, and the <em>next</em> cell into that VPC fails IPAM for reasons that have nothing to do with it. Sweep by tag; alarm on subnet free-IP percentage.</p>
+<p><strong>6. Provider auto-upgrade fighting your pipeline.</strong> GKE release channels and AKS auto-upgrade will move your cells without asking. You want to control timing, not the provider: on GKE, the Extended channel or aggressive maintenance exclusions; on AKS, channel <code>none</code> plus your own driver; on EKS, staying comfortably inside standard support. See <a href="04-managed-kubernetes-eks-gke-aks.html">04</a>.</p>
+<p><strong>7. A canary that cannot catch the bug class you fear.</strong> Memory leaks and race conditions are the failure modes Temporal names publicly for its ring rollouts. Neither is visible in a one-hour synthetic canary. Soak time is a feature, not a delay.</p>
+<p><strong>8. Rollout logic built out of Terraform.</strong> Terraform "is a <em>convergence</em> tool with no notion of rollout" — no canary, no wave, no health gate that reverts. Trying to build waves out of <code>count</code> and <code>-target</code> produces something unreadable and unresumable. The rollout belongs in an orchestrator.</p>
+<p><strong>9. Per-cell state you cannot destroy.</strong> If Kubernetes or Helm resources live in the cell's Terraform state, <code>terraform destroy</code> needs a <em>reachable</em> cluster. If the control plane is already gone the plan itself fails, and you are doing state surgery during a teardown. Stop Terraform at the cluster boundary.</p>
+<p><strong>10. Trust and certificate lifetimes running backwards.</strong> The one-way rule: distribute trust before you use it, remove it after you stop. Violating the second half is subtler than violating the first and produces the same outage a week later, when the last straggler reconnects. The mirror image: a torn-down cell whose leaves are still valid is a set of live credentials for infrastructure that no longer exists — short lifetimes make that self-correcting within a day.</p>
+<p><strong>11. A routing layer that cannot say "no."</strong> If placement cannot report "no cell in this region has room," it will instead pick one and fail during provisioning, or pick one and overload it. Capacity exhaustion must be an explicit, monitored, user-visible state. Related, and more dangerous: the drain control living inside the thing being drained — Slack's fourth design goal, and the one most likely to be violated by accident. Test it. Can you drain a cell whose Kubernetes API server is unreachable?</p>
+<p><strong>12. Quota checked at the wrong time.</strong> Surge capacity during an upgrade temporarily doubles the vCPU footprint. Check headroom before the wave starts, on three differently-shaped quota models — not halfway through, when you have already drained half the nodes.</p>
+<hr />
+<h2 id="cell-readiness-checklist">Cell readiness checklist<a class="anchor" href="#cell-readiness-checklist">#</a></h2>
+<p>A cell may serve production traffic when all of the following are true. Each line should be an automated assertion, not a human judgment.</p>
+<p><strong>L0–L2 — tenancy, identity, network</strong></p>
+<ul>
+<li>[ ] Account / project / subscription exists, tagged with the cell ID, enrolled in the org policy set.</li>
+<li>[ ] Quota headroom exceeds the cell's maximum size plus upgrade surge, in every relevant dimension.</li>
+<li>[ ] Workload identity federation configured, and a pod mints a cloud token end to end.</li>
+<li>[ ] Pod CIDR, service CIDR, and node subnets allocated from the fleet IPAM registry, non-overlapping with every other cell, recorded durably.</li>
+<li>[ ] Egress leaves via the intended NAT, verified from inside a pod; MTU correct end to end.</li>
+<li>[ ] Private endpoints to KMS, registry, and object storage resolve and are reachable; DNS delegation resolves privately.</li>
+</ul>
+<p><strong>L3–L5 — cluster, datapath, capacity</strong></p>
+<ul>
+<li>[ ] All nodes <code>Ready</code>; kubelet skew within policy; node OS image within N days of latest.</li>
+<li>[ ] kube-proxy mode explicitly set (not defaulted) and supported by the node kernel; CoreDNS healthy for in-cluster and external names.</li>
+<li>[ ] CCM provisions a <code>LoadBalancer</code> Service; CSI provisions and mounts a volume with <code>WaitForFirstConsumer</code>.</li>
+<li>[ ] NetworkPolicy actually <em>enforced</em>, not merely accepted by the API server; every APIService healthy.</li>
+<li>[ ] Karpenter NodeClass <code>status</code> resolved, NodePool <code>Ready</code>, budgets set per reason, <code>terminationGracePeriod</code> set, image pinned (not a floating alias).</li>
+<li>[ ] No <code>maxUnavailable: 0</code> PDB outside a reviewed allowlist.</li>
+</ul>
+<p><strong>L6–L8 — PKI, secrets, policy, observability</strong></p>
+<ul>
+<li>[ ] Cell issuer chains to the region intermediate, verified with <code>openssl verify</code>; a throwaway certificate issues.</li>
+<li>[ ] Trust bundle present in every namespace that needs it, <em>before</em> any workload started.</li>
+<li>[ ] A wire probe confirms the certificate served on each port matches the Secret; every certificate in the fleet inventory with issuer, notAfter, SANs.</li>
+<li>[ ] Vault unsealed with the seal mechanism verified (not just "the pod is Running"); two audit devices enabled before any workload authenticated; root token revoked; recovery keys escrowed.</li>
+<li>[ ] Database credentials dynamic; <code>rotate-root</code> has run.</li>
+<li>[ ] Policy engine healthy, webhooks registered and pointing at a live Service; baseline objects generated in every namespace.</li>
+<li>[ ] Metrics, logs, and traces arriving at the fleet backend with the correct cell label; cell visible on the fleet dashboard.</li>
+</ul>
+<p><strong>L9–L10 — data and application</strong></p>
+<ul>
+<li>[ ] Persistence and visibility stores reachable, at the correct schema version.</li>
+<li>[ ] History shard count set correctly and recorded (it is immutable).</li>
+<li>[ ] Backup and restore verified — a restore drill, not just a backup job.</li>
+<li>[ ] All four Temporal services ready; Ringpop membership converged to the expected counts.</li>
+</ul>
+<p><strong>L11–L12 — traffic and gate</strong></p>
+<ul>
+<li>[ ] Load balancer targets healthy through the real health check, not a TCP dial; mTLS terminates with matching SANs and expected SNI behavior; private connectivity published where applicable.</li>
+<li>[ ] <strong>End-to-end synthetic:</strong> an external client with a real certificate creates a namespace, starts a workflow, and lists it, through the public endpoint.</li>
+<li>[ ] Conformance suite passes; teardown dry-run executes cleanly against this cell.</li>
+<li>[ ] Cell registered in the router as eligible for placement — <strong>and this is the last step, not an earlier one.</strong></li>
+</ul>
+<hr />
+<h2 id="the-first-90-days">The first 90 days<a class="anchor" href="#the-first-90-days">#</a></h2>
+<p>A schedule that synthesizes the eleven guides' learning paths. Weekday hours are assumed scarce; the heavy labs are weekend work.</p>
+<h3 id="days-130--build-the-map-get-your-hands-dirty-ship-something-small">Days 1–30 — Build the map, get your hands dirty, ship something small<a class="anchor" href="#days-130--build-the-map-get-your-hands-dirty-ship-something-small">#</a></h3>
+<p><strong>Week 1 — orientation and the two labs that change how you see everything.</strong></p>
+<ul>
+<li>Read this guide end to end. Then read the <a href="https://temporal.io/blog/building-durable-cloud-control-systems-with-temporal">Temporal cell architecture blog</a> and the <a href="https://temporal.io/blog/multi-cloud-thats-one-small-step-for-temporal-one-giant-leap-for-reliability">multi-cloud blog</a>, and map every noun in them onto the DAG above.</li>
+<li>Do <strong>the Hands-on lab in this guide</strong>, all eleven steps, in one sitting. Nothing else this month teaches as much per hour.</li>
+<li><a href="05-cni-and-host-networking.html">05 CNI</a>: <strong>Lab 1</strong> (build a two-namespace network by hand) and <strong>Lab 5</strong> (break MTU and watch the black hole). These two are 80% of the datapath intuition.</li>
+<li><a href="04-managed-kubernetes-eks-gke-aks.html">04 Managed Kubernetes</a>: <strong>Lab 2</strong> (PDB, drain, eviction). One hour, highest value in that guide.</li>
+<li><a href="01-golang.html">01 Go</a>: Tour of Go where unfamiliar, Effective Go, and the <code>context</code> package docs. Do Hands-on steps 1–4.</li>
+<li>Read your team's actual cell provisioning workflow or pipeline end to end, and draw it as a DAG. Compare against the DAG in this guide and list every difference. This list is your week-two conversation.</li>
+</ul>
+<p><strong>Week 2 — the delivery mechanics and the first PR.</strong></p>
+<ul>
+<li><a href="08-terraform.html">08 Terraform</a>: <strong>Labs 1 and 3</strong> (the <code>count</code> index-shift disaster; <code>moved</code>/<code>import</code>/<code>removed</code>). Read the state docs end to end. Find out where your team splits state and where the Terraform-to-GitOps boundary sits.</li>
+<li><a href="09-helm.html">09 Helm</a>: <strong>Labs 1 and 2</strong> (the <code>nindent</code> bug; what dies without a cluster). Then <code>helm template</code> your team's real cell chart with the exact pipeline flags and read all of the output. Grep it for <code>lookup</code>, <code>IsUpgrade</code>, and <code>helm.sh/hook</code>.</li>
+<li><a href="02-grpc.html">02 gRPC</a>: <strong>Labs 1, 2, 4</strong>. Then read <a href="https://github.com/temporalio/api/blob/master/temporal/api/workflowservice/v1/service.proto"><code>temporalio/api</code>'s <code>service.proto</code></a> and find the poll RPCs.</li>
+<li>Ship one small, reviewed change to a production cell module. The point is to see the whole pipeline — plan in PR, policy gate, approval, apply — not the change.</li>
+</ul>
+<p><strong>Week 3 — trust and secrets.</strong></p>
+<ul>
+<li><a href="11-cert-manager-and-pki.html">11 cert-manager and PKI</a>: <strong>Labs 1–4</strong>. Lab 4 (a full root rotation) is the one that matters; do the wrong-way version too and time the outage.</li>
+<li><a href="10-vault.html">10 Vault</a>: <strong>Labs 0, 2, and 5</strong>. Lab 5 (wedge the audit device) is ten minutes and inoculates you against the most embarrassing Vault outage.</li>
+<li>Find out where your fleet's region intermediates live, how they were created, and what the rotation runbook says. If there is no runbook, you have found your 60-day project.</li>
+</ul>
+<p><strong>Week 4 — the cluster-level controllers, and your first fleet-wide finding.</strong></p>
+<ul>
+<li><a href="06-karpenter.html">06 Karpenter</a>: <strong>Lab 1</strong>, exercises 1–6. Exercise 5 (the <code>do-not-disrupt</code> deadlock) is the highest-value hour.</li>
+<li><a href="07-kyverno.html">07 Kyverno</a>: <strong>Labs 0, 1, and 4</strong>. Lab 4 (break the cluster with a fail-closed policy, then break-glass) is mandatory.</li>
+<li>Do one audit that produces a real finding: every cell's kube-proxy mode explicitly set; or every NodePool's <code>terminationGracePeriod</code> present; or every PDB checked for <code>maxUnavailable: 0</code>. Write it up with numbers.</li>
+</ul>
+<p><strong>By day 30 you should be able to:</strong> draw the cell DAG from memory; name all six bootstrap paradoxes and their resolutions; explain where your team's Terraform stops and GitOps starts; and have shipped one small change and one fleet-wide finding.</p>
+<h3 id="days-3160--go-deep-where-the-cells-actually-live-own-something">Days 31–60 — Go deep where the cells actually live, own something<a class="anchor" href="#days-3160--go-deep-where-the-cells-actually-live-own-something">#</a></h3>
+<ul>
+<li><a href="03-multicloud-aws-gcp-azure.html">03 Multi-cloud</a>: <strong>Labs 1–6</strong>. Lab 4 (cross-cloud federation with no stored key) is the one that changes how you think. Then write the twelve capability tables from memory and check them.</li>
+<li><a href="04-managed-kubernetes-eks-gke-aks.html">04</a>: <strong>Labs 1, 3, 4</strong> plus the costed cloud labs A, C, E. Watch a real upgrade on each cloud and time it.</li>
+<li><a href="05-cni-and-host-networking.html">05</a>: <strong>Labs 2, 3, 4</strong>. Then compute, for each real cell shape on each cloud, the max-pods number and IP consumption at full scale. Write it down; this exercise finds latent exhaustion reliably.</li>
+<li><a href="08-terraform.html">08</a>: <strong>Labs 4, 5, 6</strong>. Write one <code>terraform test</code> for a module that has none.</li>
+<li><a href="09-helm.html">09</a>: <strong>Labs 3–6</strong>. Add a <code>values.schema.json</code> with <code>additionalProperties: false</code> to one chart that lacks one.</li>
+<li><a href="10-vault.html">10</a>: <strong>Labs 1, 3, 4</strong>. Write the Terraform module that configures one cell's Vault, apply it twice with different cell IDs, confirm nothing secret is in state.</li>
+<li><a href="11-cert-manager-and-pki.html">11</a>: <strong>Labs 5 and 6</strong>. Set up Vault PKI behind cert-manager — that is the production shape.</li>
+<li><a href="07-kyverno.html">07</a>: <strong>Labs 2, 3, 5, 6</strong>. Ship the generating-policy starter set to a real cell with tests in CI.</li>
+<li><strong>Trace one real cell teardown end to end</strong>, with cloud audit logs open, and enumerate every resource that survived cluster deletion. Turn that list into the sweeper's test fixture. This is the single highest-value thing you can do in this window.</li>
+<li><strong>Own one cross-cutting improvement and land it.</strong> Candidates, all real: the CI assertions for coupled timeout values across templates; the nightly per-cell <code>terraform plan -detailed-exitcode</code> drift job; the skew/EOL fleet reporter; the certificate inventory; the teardown residue enumerator.</li>
+</ul>
+<p><strong>By day 60 you should be able to:</strong> debug a stuck cell provision at any layer without asking; state which per-cloud branches are real and which are accidental; and point at one shipped artifact that made the fleet safer.</p>
+<h3 id="days-6190--earn-and-write-down-opinions">Days 61–90 — Earn and write down opinions<a class="anchor" href="#days-6190--earn-and-write-down-opinions">#</a></h3>
+<ul>
+<li><strong>Write the upgrade plan for the nearest version cliff on each cloud</strong>, including the wave schedule, the soak criteria, the metric comparison against unupgraded siblings, and the rollback story for each step (naming which steps are one-way).</li>
+<li><strong>Write the root rotation runbook for the real fleet</strong> and execute it in a scratch cell. Measure trust propagation time empirically rather than guessing it.</li>
+<li><strong>Build or improve the conformance suite</strong> — one test per line of the readiness checklist above, running continuously against every cell, with "how many cells are non-conformant and why" as one number on a dashboard.</li>
+<li><strong>Form and write down the fleet dataplane opinion.</strong> One CNI everywhere versus the cloud-supported one per cloud, with the tradeoffs from guide <a href="05-cni-and-host-networking.html">05</a> spelled out. This is the highest-leverage architectural question your team will answer, and being the person who can argue it from first principles is the senior-level deliverable.</li>
+<li><strong>Read Temporal server code for real.</strong> Trace one request path end to end through the Frontend service; understand the <code>fx</code> wiring. See <a href="01-golang.html">01</a>'s Month 1 path.</li>
+<li><strong>Read the Karpenter cloud provider interface</strong> (<code>pkg/cloudprovider/types.go</code>) and the disruption controller source. The nine-method interface makes the multi-cloud story legible.</li>
+<li><strong>Do one seal migration in the lab</strong> (Shamir to auto-unseal, and auto-unseal to a different KMS key). You will need this eventually and you do not want the first attempt to be an incident.</li>
+<li><strong>Measure the six numbers</strong> from the leverage section — provision time p50/p99 per cloud, teardown time, manual interventions per 10 operations, non-conformant cell count, orphaned-resource cost, MTTD for a stuck provision — and bring them to your manager with a proposal for which one to move.</li>
+</ul>
+<hr />
+<h2 id="questions-to-ask-the-team">Questions to ask the team<a class="anchor" href="#questions-to-ask-the-team">#</a></h2>
+<p>These are architecture questions. None of them is answerable by reading a README, and each one's answer will teach you more than a week of code reading.</p>
+<p><strong>Cell definition and boundaries</strong></p>
+<ol>
+<li>What exactly is inside a cell versus shared across cells, and which of the shared things are on the <em>request</em> path rather than only the <em>control</em> path?</li>
+<li>What is the maximum size of a cell — in tenants, in actions per second, in storage — was that number measured or assumed, and have we ever load-tested a cell to it on all three clouds?</li>
+<li>What is the cell's identity — a name, a generation counter, a UUID? If we rebuild a cell in place, is the name reusable?</li>
+<li>Where does the fleet inventory live, and is it the source of truth or a cache of one?</li>
+</ol>
+<p><strong>Placement and routing</strong></p>
+<ol start="5">
+<li>How is a namespace assigned to a cell? What happens when no cell in the requested region has capacity — is that a user-visible outcome or a provisioning timeout?</li>
+<li>Can we move a namespace between cells today? What does that cost, and how often do we do it?</li>
+<li>What does the routing layer actually consist of, and what is its blast radius? Where is its state, and what happens if that state is stale?</li>
+<li>Can we drain a cell? How fast, at what granularity, and — the important one — does the drain control depend on anything inside the cell being drained?</li>
+</ol>
+<p><strong>Bootstrap and ordering</strong></p>
+<ol start="9">
+<li>Where is the canonical, authoritative description of the cell bootstrap order? Is it one artifact, or is it spread across a workflow, some Terraform, and sync-wave annotations?</li>
+<li>Which of the bootstrap paradoxes have we hit, and how did we resolve each one? Specifically: what runs Karpenter, where does the root CA live, does Kyverno's webhook cert come from cert-manager, and what unseals Vault?</li>
+<li>When a cell provision fails at 3 a.m., what tells us which layer failed? Is there a diagnostic, or does someone read logs from the top?</li>
+<li>Where exactly does Terraform stop and GitOps start, and why there?</li>
+<li>Can we bring up a cell if the shared observability backend is down? If the shared registry is down? If the central Vault is down?</li>
+</ol>
+<p><strong>Multi-cloud</strong></p>
+<ol start="14">
+<li>Which per-cloud differences in the cell definition are genuinely irreducible, and which are accidental divergence we have not gotten around to removing?</li>
+<li>What does the provider interface look like today, and what happened the last time someone added a method to it?</li>
+<li>Where is Azure relative to AWS and GCP right now, and what is the feature-parity model — capability flags in cell metadata, or do we discover gaps at provision time?</li>
+<li>Which cloud do we test least, and what do we do about that?</li>
+</ol>
+<p><strong>Upgrade</strong></p>
+<ol start="18">
+<li>What does a Kubernetes minor version upgrade across the whole fleet actually look like, start to finish? How long does it take and how many humans does it involve?</li>
+<li>What are the ring and wave definitions, what is the soak time per wave, and what metric do we compare against unupgraded cells to decide a wave passed?</li>
+<li>Which steps in a cell upgrade are irreversible, does everyone know which ones, and what happens when a wave is paused halfway — resume, or restart?</li>
+<li>How do we suppress the cloud providers' own auto-upgrade so our pipeline stays in control?</li>
+<li>What is the drain story for History specifically, given shard ownership, versus Frontend, given long polls?</li>
+</ol>
+<p><strong>Teardown</strong></p>
+<ol start="23">
+<li>When did we last delete a cell, and how did we verify it was actually gone — by Kubernetes, by cloud API, or by the bill?</li>
+<li>Do we create-and-destroy a scratch cell on a schedule in CI? If not, what keeps the delete path working?</li>
+<li>What is on the orphan list per cloud, who owns the sweeper, and what is our monthly spend on resources belonging to cells that no longer exist?</li>
+</ol>
+<p><strong>Failure, blast radius, and the team</strong></p>
+<ol start="26">
+<li>What was the last incident contained to one cell, and the last one that was not? What made the difference?</li>
+<li>Is there a per-cell circuit breaker? What signal trips it, is that signal produced outside the cell, and what stops it from tripping enough cells to overload the survivors?</li>
+<li>How do we detect gray failure — a cell that is up, healthy by its own report, and serving errors to half its clients?</li>
+<li>What is the largest correlated failure domain we have, and is it drawn on any diagram?</li>
+<li>What is the thing about cell lifecycle that everybody knows and nobody has written down? Which part of the pipeline do people dread touching? If I could fix one thing in 90 days, what would you pick?</li>
+</ol>
+<hr />
+<h2 id="references">References<a class="anchor" href="#references">#</a></h2>
+<p><strong>Temporal — primary sources</strong></p>
+<ol>
+<li><a href="https://temporal.io/blog/building-durable-cloud-control-systems-with-temporal">Building durable cloud control systems with Temporal</a> — Sergey Bykov, Jan 2025. The cell definition (own AWS account, VPC, EKS cluster), what a cell contains, namespace provisioning steps, deployment rings, entity workflows.</li>
+<li><a href="https://temporal.io/blog/multi-cloud-thats-one-small-step-for-temporal-one-giant-leap-for-reliability">Making Temporal Cloud a Multi-Cloud Platform</a> — Raphaël Beamonte, Oct 2024. User CP vs Infra CP, the <code>TemporalClusterProvider</code> interface and factory, the OpenSearch/GCP visibility gap, the Azure plan.</li>
+<li><a href="https://www.infoq.com/presentations/durable-execution-control-plane/">Durable Execution in the Control Plane</a> — QCon talk referenced from (1). <em>Secondary recording of a primary talk.</em></li>
+<li><a href="https://docs.temporal.io/temporal-service/temporal-server">Temporal Server</a> — the four services, ports, History Shards, Ringpop membership, retention.</li>
+<li><a href="https://docs.temporal.io/temporal-service/persistence">Persistence</a> — supported databases and versions, visibility store.</li>
+<li><a href="https://docs.temporal.io/temporal-service/visibility">Visibility</a> — standard vs advanced visibility.</li>
+<li><a href="https://docs.temporal.io/cloud/high-availability">Temporal Cloud — High Availability</a> — 3-AZ replication, multi-region and multi-cloud replication, request forwarding, and the explicit "Temporal operates a 'cell architecture'" statement under Same-region Replication.</li>
+<li><a href="https://docs.temporal.io/cloud/regions">Temporal Cloud — Service regions</a> — per-region endpoints, PrivateLink endpoint services, Private Service Connect attachments, replication pairs.</li>
+<li><a href="https://docs.temporal.io/cloud/service-availability">Temporal Cloud — Service availability</a> — throughput model, p99 latency SLO.</li>
+<li><a href="https://docs.temporal.io/cloud/namespaces">Temporal Cloud — Namespaces</a> — namespace as unit of isolation, Namespace vs regional endpoints, SNI behavior, deletion protection.</li>
+<li><a href="https://docs.temporal.io/cloud/certificates">Temporal Cloud — Certificates</a> — mTLS CA requirements and certificate filters.</li>
+<li><a href="https://docs.temporal.io/self-hosted-guide/upgrade-server">Upgrade the Temporal Server</a> — sequential minor upgrades, schema-first ordering, the ~10-minute shard reload per version.</li>
+<li><a href="https://github.com/temporalio/helm-charts">temporalio/helm-charts</a> — the V3 chart, <code>useHelmHooks</code>, <code>numHistoryShards</code>, and the schema/binary compatibility rule.</li>
+<li><a href="https://github.com/temporalio/docker-compose">temporalio/docker-compose</a> — the <code>auto-setup</code> image and its environment contract.</li>
+<li><a href="https://github.com/temporalio/temporal">temporalio/temporal</a> — the server source.</li>
+<li><a href="https://github.com/temporalio/api/blob/master/temporal/api/workflowservice/v1/service.proto">temporalio/api — <code>service.proto</code></a> — the gRPC contract.</li>
+<li><a href="https://github.com/temporalio/ringpop-go">temporalio/ringpop-go</a> — the membership protocol.</li>
+<li><a href="https://docs.temporal.io/cli">Temporal CLI</a> — <code>temporal server start-dev</code>, <code>operator cluster health</code>.</li>
+<li><a href="https://docs.temporal.io/cloud/sla">Temporal Cloud SLA</a> and <a href="https://docs.temporal.io/cloud/rpo-rto">RPO/RTO</a>.</li>
+<li><a href="https://status.temporal.io">status.temporal.io</a> — public per-region status.</li>
+</ol>
+<p><strong>Cell-based architecture — primary literature</strong></p>
+<ol start="21">
+<li><a href="https://docs.aws.amazon.com/wellarchitected/latest/reducing-scope-of-impact-with-cell-based-architecture/reducing-scope-of-impact-with-cell-based-architecture.html">Reducing the Scope of Impact with Cell-Based Architecture</a> — AWS Well-Architected, Sept 2023. The whitepaper.</li>
+<li><a href="https://docs.aws.amazon.com/wellarchitected/latest/reducing-scope-of-impact-with-cell-based-architecture/what-is-a-cell-based-architecture.html">What is a cell-based architecture?</a> — bulkheads, partition key, cell router, control plane.</li>
+<li><a href="https://docs.aws.amazon.com/wellarchitected/latest/reducing-scope-of-impact-with-cell-based-architecture/cell-design.html">Cell design</a> — cell independence, no cross-cell dependencies, separate accounts.</li>
+<li><a href="https://docs.aws.amazon.com/wellarchitected/latest/reducing-scope-of-impact-with-cell-based-architecture/cell-sizing.html">Cell sizing</a> — the three opposing forces and the smaller-vs-larger trade table.</li>
+<li><a href="https://docs.aws.amazon.com/whitepapers/latest/aws-fault-isolation-boundaries/abstract-and-introduction.html">AWS Fault Isolation Boundaries</a> — AZs, Regions, control planes, data planes as isolation boundaries.</li>
+<li><a href="https://docs.aws.amazon.com/wellarchitected/latest/reliability-pillar/rel_manage_service_limits_aware_quotas_and_constraints.html">REL01-BP01 Aware of service quotas and constraints</a> — the quota discipline cells depend on.</li>
+<li><a href="https://docs.aws.amazon.com/wellarchitected/latest/reliability-pillar/rel_fault_isolation_use_bulkhead.html">Use bulkhead architectures to limit scope of impact</a> — the Well-Architected best practice the whitepaper expands.</li>
+<li><a href="https://aws.amazon.com/builders-library/workload-isolation-using-shuffle-sharding/">Workload isolation using shuffle sharding</a> — the complementary technique when full cells are too coarse.</li>
+<li><a href="https://aws.amazon.com/solutions/guidance/cell-based-architecture-on-aws/">Guidance for Cell-Based Architecture on AWS</a> — reference implementation.</li>
+<li><a href="https://www.youtube.com/watch?v=6IknqRZMFic">AWS re:Invent — cell-based architecture</a> — the talk cited by the whitepaper. <em>Secondary recording.</em></li>
+</ol>
+<p><strong>Industry cell writeups</strong></p>
+<ol start="31">
+<li><a href="https://slack.engineering/slacks-migration-to-a-cellular-architecture/">Slack's Migration to a Cellular Architecture</a> — Cooper Bethea, Aug 2023. AZ-as-cell, siloing, the four drain design goals, Envoy/xDS weighted clusters and RTDS.</li>
+<li><a href="https://shopify.engineering/a-pods-architecture-to-allow-shopify-to-scale">A Pods Architecture To Allow Shopify To Scale</a> — Sorting Hat routing, Pod Mover, per-pod disaster recovery, evacuating a data center pod by pod.</li>
+<li><a href="https://www.microsoft.com/en-us/research/wp-content/uploads/2017/06/paper-1.pdf">Gray Failure: The Achilles' Heel of Cloud-Scale Systems</a> — Microsoft Research. The definition Slack works from.</li>
+<li><a href="https://www.oreilly.com/content/generic-mitigations/">Generic mitigations</a> — why a drain button beats a diagnosis. <em>Secondary.</em></li>
+<li><a href="https://slack.engineering/scaling-datastores-at-slack-with-vitess/">Scaling Datastores at Slack with Vitess</a> — the strongly-consistent-shard constraint that shaped Slack's cells. <em>Secondary context.</em></li>
+</ol>
+<p><strong>Kubernetes and tooling — primary sources</strong></p>
+<ol start="36">
+<li><a href="https://kubernetes.io/releases/version-skew-policy/">Kubernetes version skew policy</a> — why control plane upgrades precede nodes.</li>
+<li><a href="https://kubernetes.io/docs/tasks/run-application/configure-pdb/">Specifying a Disruption Budget</a> and <a href="https://kubernetes.io/docs/concepts/scheduling-eviction/api-eviction/">API-initiated eviction</a>.</li>
+<li><a href="https://kubernetes.io/docs/concepts/overview/working-with-objects/finalizers/">Finalizers</a> — the ordered-teardown mechanism and its traps.</li>
+<li><a href="https://kubernetes.io/docs/reference/using-api/server-side-apply/">Server-Side Apply</a> — field ownership, which replaces Helm release ownership.</li>
+<li><a href="https://kubernetes.io/docs/concepts/cluster-administration/networking/">Cluster Networking</a> — the four-point network model contract.</li>
+<li><a href="https://kind.sigs.k8s.io/docs/user/quick-start/">kind — Quick Start</a> — the lab substrate, including <code>disableDefaultCNI</code> and <code>kubeProxyMode</code>.</li>
+<li><a href="https://docs.cilium.io/en/stable/installation/kind/">Cilium — Installation on kind</a> — kube-proxy replacement and <code>k8sServiceHost</code>.</li>
+<li><a href="https://cert-manager.io/docs/concepts/">cert-manager Concepts</a> and <a href="https://cert-manager.io/docs/trust/trust-manager/">trust-manager</a> — issuance and trust distribution as separate disciplines.</li>
+<li><a href="https://kyverno.io/docs/policy-types/">Kyverno — Policy Types</a> and <a href="https://kyverno.io/docs/installation/customization/">Configuring Kyverno</a> — the CEL policy family and the default resource filters.</li>
+<li><a href="https://developer.hashicorp.com/vault/docs/concepts/seal">Vault — Seal/Unseal</a> — why a cell that cannot unseal is a cell that cannot boot.</li>
+<li><a href="https://karpenter.sh/docs/concepts/disruption/">Karpenter — Disruption</a> and <a href="https://karpenter.sh/docs/upgrading/compatibility/">Compatibility</a> — graceful vs forceful disruption; the version matrix.</li>
+<li><a href="https://developer.hashicorp.com/terraform/language/block/provider">Terraform — provider block</a> — "you can only reference values that Terraform knows before it applies your configuration."</li>
+<li><a href="https://helm.sh/docs/helm/helm_template/">Helm — <code>helm template</code></a> — the pure function at the centre of a rendered-manifest pipeline.</li>
+<li><a href="https://akuity.io/blog/the-rendered-manifests-pattern">The Rendered Manifests Pattern</a> — "Git contains the inputs to the desired state, not the desired state itself." <em>Vendor blog, but the canonical statement of the pattern.</em></li>
+<li><a href="https://argo-cd.readthedocs.io/en/stable/user-guide/sync-waves/">Argo CD — Sync waves and phases</a> — how ordering is expressed once Helm hooks are gone.</li>
+</ol><p class="disclaimer"><strong>Disclaimer.</strong> I wrote this library before I joined Temporal, to ramp up on the areas my new role would likely touch. It contains no internal information &mdash; nothing here was sourced from Temporal&rsquo;s internal knowledge. Temporal is open source, so the programming model and server internals come from public code and documentation, and every statement about Temporal Cloud comes from Temporal&rsquo;s public docs and engineering blog, linked inline. Most of the library is general infrastructure technology &mdash; Go, gRPC, Kubernetes, Karpenter, Terraform, Helm, Vault, cert-manager, GitOps, observability &mdash; that has nothing to do with any one company. Where a guide goes beyond public sources, it says so and labels the claim as inference.</p></article><aside class="rail"><div class="rail-label">On this page</div><a href="#how-to-use-this-library">How to use this library</a><a href="#the-mental-model">The mental model</a><a href="#core-concepts">Core concepts</a><a class="h3" href="#what-a-cell-is-and-why-a-multi-tenant-saas-converges-on-one">What a cell is, and why a multi-tenant SaaS converges on one</a><a class="h3" href="#cell-vs-shard-vs-availability-zone-vs-region">Cell vs shard vs availability zone vs region</a><a class="h3" href="#cell-sizing-the-three-way-tension">Cell sizing: the three-way tension</a><a class="h3" href="#what-temporal-cloud-is-publicly-known-to-run">What Temporal Cloud is publicly known to run</a><a class="h3" href="#the-namespace-to-cell-mapping-problem">The namespace-to-cell mapping problem</a><a class="h3" href="#the-dependency-dag-of-bringing-up-a-cell">The dependency DAG of bringing up a cell</a><a class="h3" href="#the-bootstrap-paradoxes">The bootstrap paradoxes</a><a class="h3" href="#the-steady-state-loop">The steady-state loop</a><a class="h3" href="#cell-upgrade">Cell upgrade</a><a class="h3" href="#cell-teardown">Cell teardown</a><a class="h3" href="#failure-modes-and-blast-radius">Failure modes and blast radius</a><a class="h3" href="#where-senior-engineers-add-leverage">Where senior engineers add leverage</a><a href="#hands-on">Hands-on</a><a class="h3" href="#step-0--tools-and-a-sanity-check">Step 0 — Tools and a sanity check</a><a class="h3" href="#step-1--l0l3-the-cloud-account-and-the-kubernetes-control-plane">Step 1 — L0–L3: the &quot;cloud account&quot; and the Kubernetes control plane</a><a class="h3" href="#step-2--l4-the-cni-and-nodes-becoming-ready">Step 2 — L4: the CNI, and nodes becoming Ready</a><a class="h3" href="#step-3--the-render-pipeline-helm-as-templating-only">Step 3 — The render pipeline (Helm as templating only)</a><a class="h3" href="#step-4--l6-pki-the-two-level-hierarchy-and-trust-distribution">Step 4 — L6: PKI, the two-level hierarchy, and trust distribution</a><a class="h3" href="#step-5--l7-the-secret-store">Step 5 — L7: the secret store</a><a class="h3" href="#step-6--l8-policy-and-the-webhook-deadlock">Step 6 — L8: policy, and the webhook deadlock</a><a class="h3" href="#step-7--l9-the-data-store">Step 7 — L9: the data store</a><a class="h3" href="#step-8--l10-the-temporal-services">Step 8 — L10: the Temporal services</a><a class="h3" href="#step-9--l11l12-the-health-gate">Step 9 — L11–L12: the health gate</a><a class="h3" href="#step-10--break-things-on-purpose">Step 10 — Break things on purpose</a><a class="h3" href="#step-11--teardown-in-reverse-with-verification">Step 11 — Teardown, in reverse, with verification</a><a href="#production-gotchas">Production gotchas</a><a href="#cell-readiness-checklist">Cell readiness checklist</a><a href="#the-first-90-days">The first 90 days</a><a class="h3" href="#days-130--build-the-map-get-your-hands-dirty-ship-something-small">Days 1–30 — Build the map, get your hands dirty, ship something small</a><a class="h3" href="#days-3160--go-deep-where-the-cells-actually-live-own-something">Days 31–60 — Go deep where the cells actually live, own something</a><a class="h3" href="#days-6190--earn-and-write-down-opinions">Days 61–90 — Earn and write down opinions</a><a href="#questions-to-ask-the-team">Questions to ask the team</a><a href="#references">References</a></aside></div></div><script>
+document.querySelectorAll('.codehilite').forEach(function(block){
+  var wrap=document.createElement('div'); wrap.className='codewrap';
+  block.parentNode.insertBefore(wrap,block); wrap.appendChild(block);
+  var b=document.createElement('button'); b.className='copybtn'; b.textContent='copy';
+  b.addEventListener('click',function(){
+    var txt=block.innerText;
+    if(navigator.clipboard&&navigator.clipboard.writeText){
+      navigator.clipboard.writeText(txt).then(function(){
+        b.textContent='copied'; setTimeout(function(){b.textContent='copy';},1200);
+      }).catch(function(){b.textContent='select manually';});
+    } else {
+      var ta=document.createElement('textarea'); ta.value=txt; document.body.appendChild(ta);
+      ta.select(); try{document.execCommand('copy'); b.textContent='copied';}catch(e){}
+      document.body.removeChild(ta); setTimeout(function(){b.textContent='copy';},1200);
+    }
+  });
+  wrap.appendChild(b);
+});
+
+document.querySelectorAll('.doc table').forEach(function(t){
+  if(t.parentNode.classList.contains('tablewrap'))return;
+  var w=document.createElement('div'); w.className='tablewrap';
+  t.parentNode.insertBefore(w,t); w.appendChild(t);
+});
+
+(function(){
+  var links=Array.prototype.slice.call(document.querySelectorAll('.rail a'));
+  if(!links.length)return;
+  var map={};
+  links.forEach(function(a){
+    var el=document.getElementById(a.getAttribute('href').slice(1));
+    if(el)map[a.getAttribute('href').slice(1)]=a;
+  });
+  var obs=new IntersectionObserver(function(entries){
+    entries.forEach(function(e){
+      var a=map[e.target.id]; if(!a)return;
+      if(e.isIntersecting){
+        links.forEach(function(x){x.classList.remove('here');});
+        a.classList.add('here');
+      }
+    });
+  },{rootMargin:'0px 0px -78% 0px',threshold:0});
+  Object.keys(map).forEach(function(id){
+    var el=document.getElementById(id); if(el)obs.observe(el);
+  });
+})();
+</script>
+<script>/* open external links in a new tab; links within the library stay in this tab */
+document.addEventListener('click',function(e){var a=e.target.closest&&e.target.closest('a[href]');if(!a)return;var h=a.getAttribute('href');if(!h||h.charAt(0)==='#'||h.indexOf('javascript:')===0||a.hasAttribute('download'))return;if(!/^https?:$/.test(a.protocol)||a.host===location.host)return;a.target='_blank';a.rel='noopener';},true);
+</script>
+</body>
+</html>

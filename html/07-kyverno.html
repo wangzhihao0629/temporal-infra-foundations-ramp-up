@@ -1,0 +1,1538 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Kyverno — Policy as Code for Kubernetes - Temporal Cloud Infrastructure Ramp-Up</title>
+<link rel="stylesheet" href="style.css">
+<script>
+(function(){
+  try{
+    var t=localStorage.getItem('rampup-theme');
+    if(t){document.documentElement.setAttribute('data-theme',t);}
+  }catch(e){}
+  window.__toggleTheme=function(){
+    var el=document.documentElement;
+    var cur=el.getAttribute('data-theme');
+    if(!cur){
+      cur=window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';
+    }
+    var next=cur==='dark'?'light':'dark';
+    el.setAttribute('data-theme',next);
+    try{localStorage.setItem('rampup-theme',next);}catch(e){}
+  };
+})();
+</script>
+
+</head>
+<body>
+<div class="shell"><aside class="sidebar">
+  <div class="brand"><a href="../index.html">
+    <div class="brand-title">Temporal Cloud Infrastructure Ramp-Up</div>
+    <div class="brand-sub">New-role ramp-up &middot; public sources only</div>
+  </a></div>
+  <div class="nav-label">Guides</div>
+  <nav class="nav"><a href="01-golang.html"><span class="num">01</span><span>Go</span></a><a href="02-grpc.html"><span class="num">02</span><span>gRPC &amp; Protobuf</span></a><a href="03-multicloud-aws-gcp-azure.html"><span class="num">03</span><span>Multi-Cloud</span></a><a href="04-managed-kubernetes-eks-gke-aks.html"><span class="num">04</span><span>Managed Kubernetes</span></a><a href="05-cni-and-host-networking.html"><span class="num">05</span><span>CNI &amp; Host Networking</span></a><a href="06-karpenter.html"><span class="num">06</span><span>Karpenter</span></a><a href="07-kyverno.html" class="active"><span class="num">07</span><span>Kyverno</span></a><a href="08-terraform.html"><span class="num">08</span><span>Terraform</span></a><a href="09-helm.html"><span class="num">09</span><span>Helm</span></a><a href="10-vault.html"><span class="num">10</span><span>Vault</span></a><a href="11-cert-manager-and-pki.html"><span class="num">11</span><span>cert-manager &amp; PKI</span></a><a href="12-cell-lifecycle-synthesis.html"><span class="num">12</span><span>Cell Lifecycle</span></a><a href="13-gitops-argocd-flux.html"><span class="num">13</span><span>GitOps</span></a><a href="14-observability-for-cells.html"><span class="num">14</span><span>Observability</span></a><a href="15-temporal-programming-model.html"><span class="num">15</span><span>Temporal: Programming Model</span></a><a href="16-temporal-server-internals.html"><span class="num">16</span><span>Temporal Server Internals</span></a><a href="17-cell-based-architecture.html"><span class="num">17</span><span>Cell-Based Architecture</span></a></nav>
+  <div class="nav-label" style="margin-top:1rem">Practice</div>
+  <nav class="nav"><a href="../drill.html"><span class="num">&#9670;</span><span>Drill deck</span></a></nav>
+</aside><div class="main"><article class="doc"><div class="topbar">
+  <div class="crumbs"><span class="pill">Guide 07</span><span class="pill">48 refs</span><span class="pill">11,412 words</span></div>
+  <div style="display:flex;gap:.5rem;align-items:center">
+    <span>~57 min read</span>
+    <button class="iconbtn" onclick="__toggleTheme()">theme</button>
+  </div>
+</div><h1>Kyverno — Policy as Code for Kubernetes</h1>
+<div class="lede"><p><strong>Why this matters.</strong> When you own cell lifecycle across AWS, GCP, and Azure, you are shipping the same Kubernetes cluster hundreds of times and you need two guarantees that plain manifests cannot give you: that every cell comes up with the same baseline objects regardless of who created a namespace, and that nothing gets into a cell that violates the platform's invariants. Kyverno does both — <code>generate</code> rules are cell bootstrap (every new namespace gets a NetworkPolicy, a LimitRange, a pull secret), and <code>validate</code> rules are the guardrail that stops a tenant from shipping a <code>maxUnavailable: 0</code> PDB that wedges your Karpenter drift rollout. It is also a piece of infrastructure that, misconfigured, can prevent a cell from coming up at all, because it sits in the admission path of every API request. Understanding its failure modes is not optional.</p></div>
+<p>Everything below was verified against primary sources on <strong>2026-08-29</strong>. Where I could not verify something, I say so.</p>
+<blockquote>
+<p><strong>Stale-content trap, read this first.</strong> Kyverno is in the middle of the largest API transition in its history and <strong>almost every tutorial, blog post, and LLM-generated snippet you will find describes the deprecated API.</strong> The classic <code>apiVersion: kyverno.io/v1</code>, <code>kind: ClusterPolicy</code> with a <code>spec.rules[]</code> list of <code>validate</code>/<code>mutate</code>/<code>generate</code> rules is <strong>deprecated as of v1.19 and scheduled for removal in v1.20</strong>. The docs say it verbatim: <em>"ClusterPolicy, Policy, CleanupPolicy, and the legacy <code>kyverno.io</code> PolicyException are deprecated as of Kyverno v1.19 and will be removed in v1.20. The CEL-based policy types provide full feature parity as of v1.19. Plan your migration now."</em> (<a href="https://kyverno.io/docs/guides/migration-to-cel/">Migrating to CEL Policies</a>). The replacement is a family of single-purpose CEL types at <code>policies.kyverno.io/v1</code>. Every example in this guide uses the new API, with the legacy form shown only where it still matters. Current release is <strong>v1.19.0 (August 2026)</strong>, supporting <strong>Kubernetes v1.33–v1.35</strong> (<a href="https://kyverno.io/docs/installation/releases/">Releases</a>).</p>
+</blockquote>
+<hr />
+<h2 id="the-mental-model">The mental model<a class="anchor" href="#the-mental-model">#</a></h2>
+<p>Hold five ideas.</p>
+<p><strong>1. Kyverno is a pair of webhooks with a controller behind them, plus a reconciler that acts outside admission.</strong> The admission controller answers <code>AdmissionReview</code> requests from the API server. But <code>generate</code>, <code>mutate-existing</code>, and background scanning all run <em>outside</em> the admission path, in separate controllers, against the live cluster. That split — synchronous gate vs. asynchronous reconciler — explains most of Kyverno's operational behavior, including why generate rules are eventually consistent and why the background controller needs extra RBAC.</p>
+<p><strong>2. The policy language is now CEL, and each policy does exactly one thing.</strong> The old model was one <code>ClusterPolicy</code> with an ordered list of heterogeneous rules. The new model is five separate kinds — <code>ValidatingPolicy</code>, <code>MutatingPolicy</code>, <code>GeneratingPolicy</code>, <code>DeletingPolicy</code>, <code>ImageValidatingPolicy</code> — each a superset of the corresponding <em>native</em> Kubernetes admission policy type, each written in CEL, each with cluster-scoped and <code>Namespaced*</code> variants (<a href="https://kyverno.io/docs/policy-types/">Policy Types</a>).</p>
+<p><strong>3. Kyverno's positioning is now "CEL, but with the parts Kubernetes left out."</strong> A <code>ValidatingPolicy</code> <em>is</em> a <code>ValidatingAdmissionPolicy</code> plus external data lookups, background scans, reports, exceptions, auto-generation for pod controllers, CLI testing, and non-Kubernetes JSON payloads (<a href="https://kyverno.io/docs/policy-types/validating-policy/">ValidatingPolicy</a>). It can even <em>compile itself down</em> to a native <code>ValidatingAdmissionPolicy</code> so the API server evaluates it with no webhook hop at all.</p>
+<p><strong>4. Webhooks are the sharpest object in the box.</strong> A validating webhook with <code>failurePolicy: Fail</code> that is unreachable blocks every matching API request cluster-wide. Kyverno defaults to <strong>fail-closed</strong> (<a href="https://kyverno.io/docs/guides/security/">Security</a>) and dynamically narrows its webhook rules to only the resources your installed policies actually match, which is the mitigation. But the failure mode is real, and for a cell platform the question "can a cell bootstrap if Kyverno is down?" needs a deliberate answer.</p>
+<p><strong>5. Policies are code, so test them like code.</strong> The Kyverno CLI (<code>kyverno apply</code>, <code>kyverno test</code>) runs the real engine offline against manifest files. This is the single biggest reason a platform team picks Kyverno over hand-rolled webhooks: your guardrails get unit tests that run in CI before they can break a cell.</p>
+<div class="codehilite"><pre><span></span><code>                        kubectl / controller
+                                │
+                                ▼
+                        ┌───────────────┐
+                        │  kube-apiserver│
+                        └───────┬───────┘
+      Mutating phase            │            Validating phase
+   ┌────────────────────────────┴──────────────────────────────┐
+   │ 1. MutatingAdmissionWebhooks (Kyverno MutatingPolicy)     │
+   │ 2. MutatingAdmissionPolicy (in-process CEL)               │
+   │ 3. Object schema validation                               │
+   │ 4. ValidatingAdmissionPolicy (in-process CEL)             │
+   │ 5. ValidatingAdmissionWebhooks (Kyverno ValidatingPolicy) │
+   └───────────────────────────────────────────────────────────┘
+                                │ persist to etcd
+                                ▼
+   ── outside admission ──────────────────────────────────────────
+   Background controller  → generate / mutate-existing (async)
+   Reports controller     → background scans → PolicyReport (1h default)
+   Cleanup controller     → DeletingPolicy via CronJobs
+</code></pre></div>
+
+<hr />
+<h2 id="core-concepts">Core concepts<a class="anchor" href="#core-concepts">#</a></h2>
+<h3 id="admission-control-fundamentals-briefly">Admission control fundamentals, briefly<a class="anchor" href="#admission-control-fundamentals-briefly">#</a></h3>
+<p>You know the shape; what matters operationally is the ordering and the failure semantics.</p>
+<p><strong>Ordering.</strong> Mutating webhooks run first, all of them, then the object is schema-validated, then validating webhooks run — all of them, and <strong>in parallel</strong>. Two consequences: a validating webhook can never modify an object, and <em>mutating</em> webhooks have no guaranteed order among themselves. Kubernetes' answer to mutation ordering is <code>reinvocationPolicy: IfNeeded</code>, which re-invokes mutating webhooks when an earlier one changed the object (<a href="https://kubernetes.io/docs/reference/access-authn-authz/extensible-admission-controllers/">Kubernetes: Dynamic Admission Control</a>). Kyverno's <code>MutatingPolicy</code> exposes exactly this field, defaulting to <code>Never</code> (<a href="https://kyverno.io/docs/policy-types/mutating-policy/">MutatingPolicy</a>).</p>
+<p><strong>failurePolicy.</strong> <code>Fail</code> means an unreachable or erroring webhook <strong>rejects the request</strong>. <code>Ignore</code> means it is skipped. This is the single most consequential knob in the whole system.</p>
+<p><strong>timeoutSeconds.</strong> Per-webhook, 1–30 seconds. Kyverno's <code>spec.webhookConfiguration.timeoutSeconds</code> defaults to <strong>10</strong> with an allowed range of <strong>1 to 30</strong>, and Kyverno reflects it into the generated webhook configuration (<a href="https://kyverno.io/docs/policy-types/validating-policy/">ValidatingPolicy — webhookConfiguration</a>).</p>
+<p><strong>Why a broken webhook bricks a cluster.</strong> If a <code>failurePolicy: Fail</code> webhook matches <code>*/*</code> and its backing pods are gone — evicted, on a drained node, or unschedulable — then <em>every</em> create and update in the cluster fails, including the ones that would fix the webhook. If it also matches <code>pods</code> in the namespace where it runs, it cannot even restart itself. This is a genuine circular dependency and it is why Kubernetes ships a <code>namespaceSelector</code> and why Kyverno excludes <code>kube-system</code> and its own namespace by default (below). The recovery is <code>kubectl delete validatingwebhookconfiguration &lt;name&gt;</code> from a credential that can still reach the API server — which means you must know the webhook names <em>before</em> the incident.</p>
+<p>Kyverno creates these, by name (<a href="https://kyverno.io/docs/guides/security/">Security</a>):</p>
+<table>
+<thead>
+<tr>
+<th>Kind</th>
+<th>Names</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>MutatingWebhookConfiguration</td>
+<td><code>kyverno-policy-mutating-webhook-cfg</code>, <code>kyverno-resource-mutating-webhook-cfg</code>, <code>kyverno-verify-mutating-webhook-cfg</code></td>
+</tr>
+<tr>
+<td>ValidatingWebhookConfiguration</td>
+<td><code>kyverno-policy-validating-webhook-cfg</code>, <code>kyverno-resource-validating-webhook-cfg</code>, <code>kyverno-cleanup-validating-webhook-cfg</code>, <code>kyverno-exception-validating-webhook-cfg</code></td>
+</tr>
+</tbody>
+</table>
+<p>Put that table in your cell runbook.</p>
+<h3 id="kyvernos-model-and-how-it-compares">Kyverno's model, and how it compares<a class="anchor" href="#kyvernos-model-and-how-it-compares">#</a></h3>
+<p>The pitch has always been "policy as Kubernetes YAML, no new language." That is now half true: the new types are CEL-based, so there <em>is</em> an expression language — but it is the same CEL the Kubernetes API server itself uses for <code>ValidatingAdmissionPolicy</code>, not a bespoke one.</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Kyverno (CEL types)</th>
+<th>OPA / Gatekeeper</th>
+<th>ValidatingAdmissionPolicy (built-in)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Language</td>
+<td>CEL, in Kubernetes-shaped YAML</td>
+<td>Rego, embedded in a <code>ConstraintTemplate</code></td>
+<td>CEL</td>
+</tr>
+<tr>
+<td>Install footprint</td>
+<td>4 Deployments + CRDs + webhooks</td>
+<td>2 Deployments + CRDs + webhooks</td>
+<td><strong>None</strong> — in the API server</td>
+</tr>
+<tr>
+<td>Authoring model</td>
+<td>One policy = one action</td>
+<td><code>ConstraintTemplate</code> (the code) + <code>Constraint</code> (the instance) — two objects per rule</td>
+<td>One <code>ValidatingAdmissionPolicy</code> + one <code>Binding</code></td>
+</tr>
+<tr>
+<td>Validate</td>
+<td>Yes</td>
+<td>Yes</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td>Mutate</td>
+<td>Yes (<code>MutatingPolicy</code>)</td>
+<td>Yes (separate <code>Assign</code>/<code>AssignMetadata</code> CRDs)</td>
+<td>Only via <code>MutatingAdmissionPolicy</code>, a newer and separately-gated feature</td>
+</tr>
+<tr>
+<td>Generate resources</td>
+<td><strong>Yes</strong> (<code>GeneratingPolicy</code>)</td>
+<td>No</td>
+<td>No</td>
+</tr>
+<tr>
+<td>Delete on a schedule</td>
+<td><strong>Yes</strong> (<code>DeletingPolicy</code>)</td>
+<td>No</td>
+<td>No</td>
+</tr>
+<tr>
+<td>Image signature verification</td>
+<td><strong>Yes</strong> (<code>ImageValidatingPolicy</code>)</td>
+<td>Via external tooling</td>
+<td>No</td>
+</tr>
+<tr>
+<td>External data at eval time</td>
+<td>Kubernetes API, HTTP, image registries, <code>GlobalContextEntry</code> cache</td>
+<td><code>data.inventory</code> replication, external data providers</td>
+<td><strong>No</strong></td>
+</tr>
+<tr>
+<td>Background scan of existing resources</td>
+<td>Yes, ~1h default</td>
+<td>Via audit controller</td>
+<td><strong>No</strong></td>
+</tr>
+<tr>
+<td>Reports</td>
+<td>Policy WG <code>PolicyReport</code> CRs</td>
+<td><code>status</code> on Constraints + audit</td>
+<td><strong>No</strong></td>
+</tr>
+<tr>
+<td>Exceptions</td>
+<td><code>PolicyException</code> CRs, fine-grained</td>
+<td>Constraint <code>excludedNamespaces</code>, or Rego logic</td>
+<td>Binding-level only</td>
+</tr>
+<tr>
+<td>Offline unit testing</td>
+<td><code>kyverno test</code> / <code>kyverno apply</code></td>
+<td><code>opa test</code>, <code>gator</code></td>
+<td>Limited</td>
+</tr>
+<tr>
+<td>Failure blast radius</td>
+<td>Webhook outage → fail-closed by default</td>
+<td>Webhook outage → per your config</td>
+<td><strong>Cannot fail</strong> — no network hop</td>
+</tr>
+<tr>
+<td>Latency</td>
+<td>Network hop per request</td>
+<td>Network hop per request</td>
+<td>In-process</td>
+</tr>
+<tr>
+<td>Learning curve</td>
+<td>Low → medium (CEL)</td>
+<td>High (Rego is a genuinely different paradigm)</td>
+<td>Medium (CEL, verbose bindings)</td>
+</tr>
+</tbody>
+</table>
+<p>The honest read in 2026: <code>ValidatingAdmissionPolicy</code> — <strong>GA since Kubernetes 1.30</strong> (<a href="https://kubernetes.io/docs/reference/access-authn-authz/validating-admission-policy/">Kubernetes: Validating Admission Policy</a>) — is strictly better for simple, self-contained, CEL-expressible checks, because it has no webhook to break and no pods to keep alive. It cannot do external data, reports, background scans, generation, or exceptions.</p>
+<p>Kyverno's answer is not to compete but to <strong>compile down</strong>. <code>ValidatingPolicy.spec.autogen.validatingAdmissionPolicy.enabled: true</code> makes Kyverno emit a native <code>ValidatingAdmissionPolicy</code> from your policy, so the API server evaluates it in-process while you keep Kyverno's authoring, testing, and reporting. The docs describe the benefit as <em>"faster and more resilient execution during admission controls while leveraging all features of Kyverno"</em> (<a href="https://kyverno.io/docs/policy-types/validating-policy/">ValidatingPolicy — autogen</a>). The catch is stated in a note: <strong>pod-controller autogen and VAP generation are mutually exclusive</strong> — configuring <code>spec.autogen.podControllers</code> makes Kyverno skip VAP generation and report why in the policy status, because a VAP is evaluated by the API server and cannot carry Kyverno-generated pod-controller rule variants.</p>
+<p><code>MutatingPolicy</code> has the mirror image via <code>spec.autogen.mutatingAdmissionPolicy.enabled</code>. Note that Kubernetes' <code>MutatingAdmissionPolicy</code> is substantially newer than VAP; check your control-plane version and feature gates before relying on it (<a href="https://kubernetes.io/docs/reference/access-authn-authz/mutating-admission-policy/">Kubernetes: Mutating Admission Policy</a>).</p>
+<h3 id="current-api-version-and-major-version-status">Current API version and major-version status<a class="anchor" href="#current-api-version-and-major-version-status">#</a></h3>
+<p>Verified 2026-08-29.</p>
+<table>
+<thead>
+<tr>
+<th>Fact</th>
+<th>Value</th>
+<th>Source</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Current release</td>
+<td><strong>v1.19.0</strong>, August 2026</td>
+<td><a href="https://kyverno.io/docs/installation/releases/">Releases</a></td>
+</tr>
+<tr>
+<td>Kubernetes support</td>
+<td><strong>v1.33 – v1.35</strong></td>
+<td><a href="https://kyverno.io/docs/installation/releases/">Releases</a></td>
+</tr>
+<tr>
+<td>Patch support model</td>
+<td><strong>"main + 1"</strong> since v1.18 — current release plus previous, ~3 months, critical/high CVEs only</td>
+<td><a href="https://kyverno.io/blog/2026/04/24/announcing-kyverno-release-1.18/">Announcing 1.18</a></td>
+</tr>
+<tr>
+<td>Estimated EOL for 1.19</td>
+<td>v1.20 release, ~November 2026</td>
+<td><a href="https://kyverno.io/docs/installation/releases/">Releases</a></td>
+</tr>
+<tr>
+<td>Minor release cadence</td>
+<td>~every 3 months</td>
+<td><a href="https://kyverno.io/docs/installation/releases/">Releases</a></td>
+</tr>
+<tr>
+<td>CNCF status</td>
+<td><strong>Graduated</strong>, March 2026</td>
+<td><a href="https://www.cncf.io/announcements/2026/03/24/cloud-native-computing-foundation-announces-kyvernos-graduation/">CNCF announcement</a></td>
+</tr>
+</tbody>
+</table>
+<p><strong>The policy-type split, with dates:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Kind</th>
+<th>Group/version</th>
+<th>Introduced</th>
+<th>Status in 1.19</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>ValidatingPolicy</code> / <code>NamespacedValidatingPolicy</code></td>
+<td><code>policies.kyverno.io/v1</code></td>
+<td>v1.14 (Apr 2025)</td>
+<td>Stable</td>
+</tr>
+<tr>
+<td><code>ImageValidatingPolicy</code> / <code>Namespaced…</code></td>
+<td><code>policies.kyverno.io/v1</code></td>
+<td>v1.14 (Apr 2025)</td>
+<td>Stable</td>
+</tr>
+<tr>
+<td><code>MutatingPolicy</code> / <code>Namespaced…</code></td>
+<td><code>policies.kyverno.io/v1</code></td>
+<td>v1.15 (Jul 2025)</td>
+<td>Stable</td>
+</tr>
+<tr>
+<td><code>GeneratingPolicy</code> / <code>Namespaced…</code></td>
+<td><code>policies.kyverno.io/v1</code></td>
+<td>v1.15 (Jul 2025)</td>
+<td>Stable</td>
+</tr>
+<tr>
+<td><code>DeletingPolicy</code> / <code>Namespaced…</code></td>
+<td><code>policies.kyverno.io/v1</code></td>
+<td>v1.15 (Jul 2025)</td>
+<td>Stable</td>
+</tr>
+<tr>
+<td><code>ClusterPolicy</code> / <code>Policy</code></td>
+<td><code>kyverno.io/v1</code></td>
+<td>legacy</td>
+<td><strong>Deprecated, removed in v1.20</strong></td>
+</tr>
+<tr>
+<td><code>CleanupPolicy</code> / <code>ClusterCleanupPolicy</code></td>
+<td><code>kyverno.io/v2</code></td>
+<td>legacy</td>
+<td><strong>Deprecated, removed in v1.20</strong></td>
+</tr>
+<tr>
+<td><code>PolicyReport</code> / <code>ClusterPolicyReport</code></td>
+<td><code>wgpolicyk8s.io/v1alpha2</code></td>
+<td>—</td>
+<td>Current</td>
+</tr>
+<tr>
+<td><code>PolicyException</code> (legacy <code>kyverno.io</code>)</td>
+<td><code>kyverno.io/v2</code></td>
+<td>legacy</td>
+<td><strong>Deprecated, removed in v1.20</strong></td>
+</tr>
+</tbody>
+</table>
+<p>Three things to internalize from this table. First, <strong>the <code>Namespaced*</code> variants are new and important for multi-tenancy</strong>: <code>NamespacedValidatingPolicy</code> "allows namespace owners to manage validation policies without requiring cluster-admin permissions" (<a href="https://kyverno.io/docs/policy-types/validating-policy/">ValidatingPolicy — policy scope</a>). For a cell platform where each cell may host tenants, this is the difference between "platform team writes every policy" and "platform team writes cluster invariants, tenants write their own." Second, <strong>the cleanup story moved</strong>: <code>CleanupPolicy</code> is deprecated in favor of <code>DeletingPolicy</code>, with the docs claiming full feature parity (<a href="https://kyverno.io/docs/policy-types/cleanup-policy/">Cleanup Policy — deprecated</a>). Third, <strong>background scanning still uses intermediary CRs</strong> at <code>kyverno.io/v1alpha2</code> (<code>AdmissionReport</code>, <code>BackgroundScanReport</code> and their cluster-scoped forms) that roll up into the <code>wgpolicyk8s.io</code> reports (<a href="https://kyverno.io/docs/guides/reports/">Policy Reports</a>).</p>
+<blockquote>
+<p><strong>Correction to a common mistake:</strong> <code>kyverno migrate</code> is <strong>not</strong> a ClusterPolicy-to-CEL converter. Its documented synopsis is <em>"Migrate one or more resources to the stored version"</em> with the example <code>kyverno migrate --resource policyexceptions.kyverno.io</code> (<a href="https://kyverno.io/docs/kyverno-cli/reference/kyverno_migrate/">kyverno migrate</a>). It is a CRD stored-version utility. The CEL migration is manual, guided by the field-mapping table in <a href="https://kyverno.io/docs/guides/migration-to-cel/">Migrating to CEL Policies</a>.</p>
+</blockquote>
+<h3 id="rule-types-with-real-examples">Rule types, with real examples<a class="anchor" href="#rule-types-with-real-examples">#</a></h3>
+<h4 id="validatingpolicy--the-guardrail"><code>ValidatingPolicy</code> — the guardrail</h4>
+<div class="codehilite"><pre><span></span><code><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">policies.kyverno.io/v1</span><span class="w"></span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">ValidatingPolicy</span><span class="w"></span>
+<span class="nt">metadata</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">require-pdb-not-fully-blocking</span><span class="w"></span>
+<span class="w">  </span><span class="nt">annotations</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">policies.kyverno.io/title</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">PDBs must not permanently block eviction</span><span class="w"></span>
+<span class="w">    </span><span class="nt">policies.kyverno.io/category</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Cell Safety</span><span class="w"></span>
+<span class="w">    </span><span class="nt">policies.kyverno.io/severity</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">high</span><span class="w"></span>
+<span class="nt">spec</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="c1"># Deny | Audit | Warn. Start with Audit, promote to Deny.</span><span class="w"></span>
+<span class="w">  </span><span class="nt">validationActions</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">Deny</span><span class="p p-Indicator">]</span><span class="w"></span>
+
+<span class="w">  </span><span class="c1"># failurePolicy applies to the generated webhook. Fail is Kyverno&#39;s default.</span><span class="w"></span>
+<span class="w">  </span><span class="nt">failurePolicy</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Fail</span><span class="w"></span>
+
+<span class="w">  </span><span class="nt">webhookConfiguration</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">timeoutSeconds</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">10</span><span class="w">        </span><span class="c1"># default 10, allowed 1..30</span><span class="w"></span>
+
+<span class="w">  </span><span class="nt">evaluation</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">admission</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="nt">enabled</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span><span class="w">           </span><span class="c1"># gate at admission time</span><span class="w"></span>
+<span class="w">    </span><span class="nt">background</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="nt">enabled</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span><span class="w">           </span><span class="c1"># also scan pre-existing PDBs for reports</span><span class="w"></span>
+<span class="w">    </span><span class="nt">mode</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Kubernetes</span><span class="w">          </span><span class="c1"># or JSON, for non-Kubernetes payloads</span><span class="w"></span>
+
+<span class="w">  </span><span class="c1"># This is the Kubernetes ValidatingAdmissionPolicy matchConstraints shape.</span><span class="w"></span>
+<span class="w">  </span><span class="nt">matchConstraints</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">resourceRules</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">apiGroups</span><span class="p">:</span><span class="w">   </span><span class="p p-Indicator">[</span><span class="s">&quot;policy&quot;</span><span class="p p-Indicator">]</span><span class="w"></span>
+<span class="w">        </span><span class="nt">apiVersions</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;v1&quot;</span><span class="p p-Indicator">]</span><span class="w"></span>
+<span class="w">        </span><span class="nt">operations</span><span class="p">:</span><span class="w">  </span><span class="p p-Indicator">[</span><span class="s">&quot;CREATE&quot;</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">&quot;UPDATE&quot;</span><span class="p p-Indicator">]</span><span class="w"></span>
+<span class="w">        </span><span class="nt">resources</span><span class="p">:</span><span class="w">   </span><span class="p p-Indicator">[</span><span class="s">&quot;poddisruptionbudgets&quot;</span><span class="p p-Indicator">]</span><span class="w"></span>
+
+<span class="w">  </span><span class="c1"># CEL-based early exit. Cheaper than a validation that always evaluates.</span><span class="w"></span>
+<span class="w">  </span><span class="nt">matchConditions</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">not-platform-owned</span><span class="w"></span>
+<span class="w">      </span><span class="nt">expression</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;-</span><span class="w"></span>
+<span class="w">        </span><span class="no">!object.metadata.?labels[&#39;app.kubernetes.io/part-of&#39;].orValue(&#39;&#39;)</span><span class="w"></span>
+<span class="w">          </span><span class="no">.startsWith(&#39;temporal-platform&#39;)</span><span class="w"></span>
+
+<span class="w">  </span><span class="c1"># Named, reusable, lazily-evaluated CEL expressions.</span><span class="w"></span>
+<span class="w">  </span><span class="nt">variables</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">maxUnavailable</span><span class="w"></span>
+<span class="w">      </span><span class="nt">expression</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">object.spec.?maxUnavailable.orValue(null)</span><span class="w"></span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">minAvailable</span><span class="w"></span>
+<span class="w">      </span><span class="nt">expression</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">object.spec.?minAvailable.orValue(null)</span><span class="w"></span>
+
+<span class="w">  </span><span class="nt">validations</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">expression</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;variables.maxUnavailable</span><span class="nv"> </span><span class="s">!=</span><span class="nv"> </span><span class="s">0&quot;</span><span class="w"></span>
+<span class="w">      </span><span class="nt">messageExpression</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;-</span><span class="w"></span>
+<span class="w">        </span><span class="no">&quot;PodDisruptionBudget &quot; + object.metadata.name +</span><span class="w"></span>
+<span class="w">        </span><span class="no">&quot; sets maxUnavailable: 0, which permanently blocks node drain.&quot;</span><span class="w"></span>
+<span class="w">      </span><span class="nt">message</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;maxUnavailable:</span><span class="nv"> </span><span class="s">0</span><span class="nv"> </span><span class="s">is</span><span class="nv"> </span><span class="s">not</span><span class="nv"> </span><span class="s">permitted&quot;</span><span class="w"></span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">expression</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;variables.minAvailable</span><span class="nv"> </span><span class="s">!=</span><span class="nv"> </span><span class="s">&#39;100%&#39;&quot;</span><span class="w"></span>
+<span class="w">      </span><span class="nt">message</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;minAvailable:</span><span class="nv"> </span><span class="s">100%</span><span class="nv"> </span><span class="s">is</span><span class="nv"> </span><span class="s">not</span><span class="nv"> </span><span class="s">permitted;</span><span class="nv"> </span><span class="s">it</span><span class="nv"> </span><span class="s">blocks</span><span class="nv"> </span><span class="s">node</span><span class="nv"> </span><span class="s">drain</span><span class="nv"> </span><span class="s">forever&quot;</span><span class="w"></span>
+
+<span class="w">  </span><span class="c1"># Attach structured metadata to the PolicyReport entry.</span><span class="w"></span>
+<span class="w">  </span><span class="nt">auditAnnotations</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">key</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">owning-team</span><span class="w"></span>
+<span class="w">      </span><span class="nt">valueExpression</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;-</span><span class="w"></span>
+<span class="w">        </span><span class="no">object.metadata.?labels[&#39;team&#39;].orValue(&#39;unknown&#39;)</span><span class="w"></span>
+
+<span class="w">  </span><span class="c1"># Emit a native ValidatingAdmissionPolicy so the API server evaluates this</span><span class="w"></span>
+<span class="w">  </span><span class="c1"># in-process. Mutually exclusive with autogen.podControllers.</span><span class="w"></span>
+<span class="w">  </span><span class="nt">autogen</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">validatingAdmissionPolicy</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="nt">enabled</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span><span class="w"></span>
+</code></pre></div>
+
+<p>Notes on the pieces:</p>
+<ul>
+<li><strong><code>matchConditions</code> vs <code>validations</code>.</strong> <code>matchConditions</code> decide <em>whether the policy applies</em>; <code>validations</code> decide <em>pass or fail</em>. Put cheap filters in <code>matchConditions</code> — they short-circuit.</li>
+<li><strong><code>messageExpression</code> beats <code>message</code>.</strong> If both are set, <code>messageExpression</code> wins; if it errors or produces an empty/whitespace/multi-line string, Kyverno falls back to <code>message</code> (<a href="https://kyverno.io/docs/policy-types/validating-policy/">ValidatingPolicy — reporting details</a>). Always set both.</li>
+<li><strong><code>variables</code> are lazily evaluated at most once, on first reference.</strong> Free to declare, cheap if unused.</li>
+<li><strong>JSON mode is genuinely useful.</strong> With <code>evaluation.mode: JSON</code>, the same engine validates a Terraform plan (the docs' own example checks that <code>aws_eks_cluster</code> resources don't expose a public endpoint) — which means your cell IaC and your cell runtime can share one policy engine and one CI harness (<a href="https://kyverno.io/docs/policy-types/validating-policy/">ValidatingPolicy — JSON payloads</a>).</li>
+</ul>
+<p><strong><code>anyPattern</code>, <code>pattern</code>, and <code>foreach</code> — where they went.</strong> The legacy <code>ClusterPolicy</code> had <code>validate.pattern</code> (an overlay-matching DSL), <code>validate.anyPattern</code> (a list of alternatives, any of which may match), <code>validate.deny</code> with <code>conditions</code>, and <code>validate.foreach</code> for iterating lists. In the CEL types these all collapse into <code>spec.validations</code> (<a href="https://kyverno.io/docs/guides/migration-to-cel/">Migrating to CEL Policies</a>):</p>
+<table>
+<thead>
+<tr>
+<th>Legacy</th>
+<th>CEL replacement</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>validate.pattern</code></td>
+<td>a <code>validations[].expression</code></td>
+</tr>
+<tr>
+<td><code>validate.anyPattern</code></td>
+<td>one expression with <code>\|\|</code></td>
+</tr>
+<tr>
+<td><code>validate.cel</code></td>
+<td><code>spec.validations</code> directly</td>
+</tr>
+<tr>
+<td><code>validate.deny</code> + <code>conditions</code></td>
+<td>a <code>validations[].expression</code> with <strong>inverted logic</strong></td>
+</tr>
+<tr>
+<td><code>validate.foreach</code></td>
+<td>CEL comprehensions: <code>all()</code>, <code>exists()</code>, <code>exists_one()</code></td>
+</tr>
+<tr>
+<td><code>preconditions</code> / <code>celPreconditions</code></td>
+<td><code>spec.matchConditions</code></td>
+</tr>
+<tr>
+<td><code>context</code> (ConfigMap/API/registry lookups)</td>
+<td><code>spec.variables</code> using the CEL libraries</td>
+</tr>
+<tr>
+<td><code>failureAction</code></td>
+<td><code>spec.validationActions</code></td>
+</tr>
+<tr>
+<td><code>match</code> / <code>exclude</code></td>
+<td><code>spec.matchConstraints</code> (<code>resourceRules</code>, <code>excludeResourceRules</code>, <code>namespaceSelector</code>) + <code>matchConditions</code></td>
+</tr>
+</tbody>
+</table>
+<p>The <code>deny</code> inversion is the one that trips people: legacy <code>deny</code> fired when conditions were <strong>true</strong>; a CEL <code>validations[].expression</code> passes when it is <strong>true</strong>. Negate when porting.</p>
+<p>The <code>foreach</code> → comprehension mapping in practice:</p>
+<div class="codehilite"><pre><span></span><code><span class="w">  </span><span class="nt">validations</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="c1"># every container must set a memory limit</span><span class="w"></span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">expression</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;-</span><span class="w"></span>
+<span class="w">        </span><span class="no">object.spec.containers.all(c, has(c.resources) &amp;&amp; has(c.resources.limits)</span><span class="w"></span>
+<span class="w">          </span><span class="no">&amp;&amp; &#39;memory&#39; in c.resources.limits)</span><span class="w"></span>
+<span class="w">      </span><span class="nt">message</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;all</span><span class="nv"> </span><span class="s">containers</span><span class="nv"> </span><span class="s">must</span><span class="nv"> </span><span class="s">set</span><span class="nv"> </span><span class="s">resources.limits.memory&quot;</span><span class="w"></span>
+<span class="w">    </span><span class="c1"># no container may run privileged</span><span class="w"></span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">expression</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;-</span><span class="w"></span>
+<span class="w">        </span><span class="no">!object.spec.containers.exists(c,</span><span class="w"></span>
+<span class="w">          </span><span class="no">c.?securityContext.?privileged.orValue(false) == true)</span><span class="w"></span>
+<span class="w">      </span><span class="nt">message</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;privileged</span><span class="nv"> </span><span class="s">containers</span><span class="nv"> </span><span class="s">are</span><span class="nv"> </span><span class="s">not</span><span class="nv"> </span><span class="s">permitted&quot;</span><span class="w"></span>
+</code></pre></div>
+
+<h4 id="mutatingpolicy--defaults-and-normalization"><code>MutatingPolicy</code> — defaults and normalization</h4>
+<p>Two patch styles. <code>ApplyConfiguration</code> is a merge-style CEL expression returning an <code>Object</code> — this is the one to reach for. <code>JSONPatch</code> is RFC 6902, for surgical edits.</p>
+<div class="codehilite"><pre><span></span><code><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">policies.kyverno.io/v1</span><span class="w"></span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">MutatingPolicy</span><span class="w"></span>
+<span class="nt">metadata</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">default-cell-labels-and-tgp</span><span class="w"></span>
+<span class="nt">spec</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">evaluation</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">admission</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="nt">enabled</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span><span class="w"></span>
+<span class="w">    </span><span class="nt">mutateExisting</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="nt">enabled</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">false</span><span class="w"></span>
+<span class="w">  </span><span class="nt">reinvocationPolicy</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">IfNeeded</span><span class="w">     </span><span class="c1"># Never (default) | IfNeeded</span><span class="w"></span>
+<span class="w">  </span><span class="nt">matchConstraints</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">resourceRules</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">apiGroups</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;karpenter.sh&quot;</span><span class="p p-Indicator">]</span><span class="w"></span>
+<span class="w">        </span><span class="nt">apiVersions</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;v1&quot;</span><span class="p p-Indicator">]</span><span class="w"></span>
+<span class="w">        </span><span class="nt">operations</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;CREATE&quot;</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">&quot;UPDATE&quot;</span><span class="p p-Indicator">]</span><span class="w"></span>
+<span class="w">        </span><span class="nt">resources</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;nodepools&quot;</span><span class="p p-Indicator">]</span><span class="w"></span>
+<span class="w">  </span><span class="nt">mutations</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">patchType</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">ApplyConfiguration</span><span class="w"></span>
+<span class="w">      </span><span class="nt">applyConfiguration</span><span class="p">:</span><span class="w"></span>
+<span class="w">        </span><span class="c1"># Force a terminationGracePeriod on every NodePool so that</span><span class="w"></span>
+<span class="w">        </span><span class="c1"># do-not-disrupt pods can never wedge a cell teardown.</span><span class="w"></span>
+<span class="w">        </span><span class="nt">expression</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;</span><span class="w"></span>
+<span class="w">          </span><span class="no">!has(object.spec.template.spec.terminationGracePeriod) ?</span><span class="w"></span>
+<span class="w">          </span><span class="no">Object{</span><span class="w"></span>
+<span class="w">            </span><span class="no">spec: Object.spec{</span><span class="w"></span>
+<span class="w">              </span><span class="no">template: Object.spec.template{</span><span class="w"></span>
+<span class="w">                </span><span class="no">spec: Object.spec.template.spec{</span><span class="w"></span>
+<span class="w">                  </span><span class="no">terminationGracePeriod: &quot;4h&quot;</span><span class="w"></span>
+<span class="w">                </span><span class="no">}</span><span class="w"></span>
+<span class="w">              </span><span class="no">}</span><span class="w"></span>
+<span class="w">            </span><span class="no">}</span><span class="w"></span>
+<span class="w">          </span><span class="no">} : Object{}</span><span class="w"></span>
+</code></pre></div>
+
+<p>JSON Patch form, including the escaping helper for keys containing <code>/</code>:</p>
+<div class="codehilite"><pre><span></span><code><span class="w">  </span><span class="nt">mutations</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">patchType</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">JSONPatch</span><span class="w"></span>
+<span class="w">      </span><span class="nt">jsonPatch</span><span class="p">:</span><span class="w"></span>
+<span class="w">        </span><span class="nt">expression</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">|</span><span class="w"></span>
+<span class="w">          </span><span class="no">[</span><span class="w"></span>
+<span class="w">            </span><span class="no">JSONPatch{</span><span class="w"></span>
+<span class="w">              </span><span class="no">op: &quot;add&quot;,</span><span class="w"></span>
+<span class="w">              </span><span class="no">path: &quot;/metadata/labels/&quot; + jsonpatch.escapeKey(&quot;cell.example.com/managed-by&quot;),</span><span class="w"></span>
+<span class="w">              </span><span class="no">value: &quot;infra-foundation&quot;</span><span class="w"></span>
+<span class="w">            </span><span class="no">},</span><span class="w"></span>
+<span class="w">            </span><span class="no">JSONPatch{</span><span class="w"></span>
+<span class="w">              </span><span class="no">op: &quot;add&quot;,</span><span class="w"></span>
+<span class="w">              </span><span class="no">path: &quot;/metadata/annotations/kyverno.io~1managed&quot;,</span><span class="w"></span>
+<span class="w">              </span><span class="no">value: &quot;true&quot;</span><span class="w"></span>
+<span class="w">            </span><span class="no">}</span><span class="w"></span>
+<span class="w">          </span><span class="no">]</span><span class="w"></span>
+</code></pre></div>
+
+<p><strong>Looping</strong> uses CEL <code>map()</code> / <code>filter()</code> rather than a <code>foreach</code> block — the docs show adding <code>allowPrivilegeEscalation: false</code> to every container via <code>object.spec.containers.map(container, ...)</code>.</p>
+<p><strong>Mutate-on-existing</strong> is the powerful and dangerous one. With <code>evaluation.mutateExisting.enabled: true</code>, a trigger event causes Kyverno to fetch and mutate <em>all</em> matching existing resources, not just the triggering object. The docs are blunt about the two caveats (<a href="https://kyverno.io/docs/policy-types/mutating-policy/">MutatingPolicy — mutating existing resources</a>):</p>
+<ol>
+<li><strong>Asynchronous</strong> — variable delay between trigger and mutation.</li>
+<li><strong>Custom permissions almost always required</strong>, because these mutations happen outside an <code>AdmissionReview</code> and Kyverno's background controller has no default RBAC for arbitrary kinds. Kyverno performs the permission check when the policy is installed.</li>
+</ol>
+<p>The trigger/target split is expressed with <code>targetMatchConstraints</code> (which may also be a CEL <code>expression</code> resolving to an object, since 1.17) and filtered with <code>targetMatchConditions</code>. Evaluation is two-phase: trigger phase (match → lazily bind <code>variables</code> from <code>request.object</code>/<code>request.oldObject</code> → <code>matchConditions</code> → resolve targets), then target phase (per target: match target rules → <code>targetMatchConditions</code> where <code>object</code> is now the <em>target</em> → mutate with <code>Object</code> bound to the target). <code>variables</code> are the bridge carrying trigger data into the target phase.</p>
+<p><strong>Ordering caveat, stated plainly in the docs:</strong> mutations <em>within</em> one policy run in order, but <strong>the order across multiple MutatingPolicies is not deterministic.</strong> Do not build dependency chains across policies.</p>
+<h4 id="generatingpolicy--cell-bootstrap"><code>GeneratingPolicy</code> — cell bootstrap</h4>
+<p>This is the rule type most directly relevant to your job. Two source modes.</p>
+<p><strong>Data source</strong> — the resource is defined in the policy. The YAML-template form (Beta in v1.19) is far more readable than the CEL-object form and is what I would ship:</p>
+<div class="codehilite"><pre><span></span><code><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">policies.kyverno.io/v1</span><span class="w"></span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">GeneratingPolicy</span><span class="w"></span>
+<span class="nt">metadata</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cell-namespace-baseline</span><span class="w"></span>
+<span class="nt">spec</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">evaluation</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">synchronize</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="nt">enabled</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span><span class="w">              </span><span class="c1"># keep downstream in sync with the policy</span><span class="w"></span>
+<span class="w">    </span><span class="nt">generateExisting</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="nt">enabled</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span><span class="w">              </span><span class="c1"># also apply to namespaces that already exist</span><span class="w"></span>
+<span class="w">    </span><span class="nt">orphanDownstreamOnPolicyDelete</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="nt">enabled</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">false</span><span class="w">             </span><span class="c1"># default; delete downstream when policy is deleted</span><span class="w"></span>
+<span class="w">  </span><span class="nt">matchConstraints</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">resourceRules</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">apiGroups</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;&quot;</span><span class="p p-Indicator">]</span><span class="w"></span>
+<span class="w">        </span><span class="nt">apiVersions</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;v1&quot;</span><span class="p p-Indicator">]</span><span class="w"></span>
+<span class="w">        </span><span class="nt">operations</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;CREATE&quot;</span><span class="p p-Indicator">]</span><span class="w"></span>
+<span class="w">        </span><span class="nt">resources</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;namespaces&quot;</span><span class="p p-Indicator">]</span><span class="w"></span>
+<span class="w">  </span><span class="nt">matchConditions</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">not-system-namespace</span><span class="w"></span>
+<span class="w">      </span><span class="nt">expression</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;-</span><span class="w"></span>
+<span class="w">        </span><span class="no">!object.metadata.name.startsWith(&#39;kube-&#39;) &amp;&amp;</span><span class="w"></span>
+<span class="w">        </span><span class="no">object.metadata.name != &#39;kyverno&#39;</span><span class="w"></span>
+<span class="w">  </span><span class="nt">variables</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">nsName</span><span class="w"></span>
+<span class="w">      </span><span class="nt">expression</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">object.metadata.name</span><span class="w"></span>
+<span class="w">  </span><span class="nt">generate</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">template</span><span class="p">:</span><span class="w"></span>
+<span class="w">        </span><span class="nt">interpolate</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cel</span><span class="w">         </span><span class="c1"># evaluate (( ... )) placeholders</span><span class="w"></span>
+<span class="w">        </span><span class="nt">value</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">|</span><span class="w"></span>
+<span class="w">          </span><span class="no">apiVersion: networking.k8s.io/v1</span><span class="w"></span>
+<span class="w">          </span><span class="no">kind: NetworkPolicy</span><span class="w"></span>
+<span class="w">          </span><span class="no">metadata:</span><span class="w"></span>
+<span class="w">            </span><span class="no">name: default-deny-ingress</span><span class="w"></span>
+<span class="w">            </span><span class="no">namespace: (( variables.nsName ))</span><span class="w"></span>
+<span class="w">          </span><span class="no">spec:</span><span class="w"></span>
+<span class="w">            </span><span class="no">podSelector: {}</span><span class="w"></span>
+<span class="w">            </span><span class="no">policyTypes:</span><span class="w"></span>
+<span class="w">              </span><span class="no">- Ingress</span><span class="w"></span>
+<span class="w">          </span><span class="no">---</span><span class="w"></span>
+<span class="w">          </span><span class="no">apiVersion: v1</span><span class="w"></span>
+<span class="w">          </span><span class="no">kind: LimitRange</span><span class="w"></span>
+<span class="w">          </span><span class="no">metadata:</span><span class="w"></span>
+<span class="w">            </span><span class="no">name: default-limits</span><span class="w"></span>
+<span class="w">            </span><span class="no">namespace: (( variables.nsName ))</span><span class="w"></span>
+<span class="w">          </span><span class="no">spec:</span><span class="w"></span>
+<span class="w">            </span><span class="no">limits:</span><span class="w"></span>
+<span class="w">              </span><span class="no">- type: Container</span><span class="w"></span>
+<span class="w">                </span><span class="no">default:</span><span class="w"></span>
+<span class="w">                  </span><span class="no">cpu: 500m</span><span class="w"></span>
+<span class="w">                  </span><span class="no">memory: 512Mi</span><span class="w"></span>
+<span class="w">                </span><span class="no">defaultRequest:</span><span class="w"></span>
+<span class="w">                  </span><span class="no">cpu: 100m</span><span class="w"></span>
+<span class="w">                  </span><span class="no">memory: 128Mi</span><span class="w"></span>
+</code></pre></div>
+
+<p>Placeholder semantics are worth knowing precisely (<a href="https://kyverno.io/docs/policy-types/generating-policy/">GeneratingPolicy — YAML templates</a>): interpolation is <strong>structural, not textual</strong>. A placeholder occupying an <em>entire value</em> is spliced natively and may be any CEL type, including maps and lists, with no <code>dyn()</code> conversion. A placeholder <em>embedded in a larger string</em> must evaluate to a scalar. Placeholders are <strong>not supported in mapping keys</strong> — use a whole-value placeholder on the parent (<code>labels: (( variables.labels ))</code>). Escape a literal <code>((</code> as <code>\((</code>. With the default <code>interpolate: none</code>, nothing is evaluated.</p>
+<p><strong>Clone source</strong> — copy an existing resource, the classic image-pull-secret distribution:</p>
+<div class="codehilite"><pre><span></span><code><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">policies.kyverno.io/v1</span><span class="w"></span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">GeneratingPolicy</span><span class="w"></span>
+<span class="nt">metadata</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">distribute-registry-credentials</span><span class="w"></span>
+<span class="nt">spec</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">evaluation</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">synchronize</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="nt">enabled</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span><span class="w"></span>
+<span class="w">    </span><span class="nt">generateExisting</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="nt">enabled</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span><span class="w"></span>
+<span class="w">  </span><span class="nt">matchConstraints</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">resourceRules</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">apiGroups</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;&quot;</span><span class="p p-Indicator">]</span><span class="w"></span>
+<span class="w">        </span><span class="nt">apiVersions</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;v1&quot;</span><span class="p p-Indicator">]</span><span class="w"></span>
+<span class="w">        </span><span class="nt">operations</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;CREATE&quot;</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">&quot;UPDATE&quot;</span><span class="p p-Indicator">]</span><span class="w"></span>
+<span class="w">        </span><span class="nt">resources</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;namespaces&quot;</span><span class="p p-Indicator">]</span><span class="w"></span>
+<span class="w">  </span><span class="nt">variables</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">nsName</span><span class="w"></span>
+<span class="w">      </span><span class="nt">expression</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">object.metadata.name</span><span class="w"></span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">source</span><span class="w"></span>
+<span class="w">      </span><span class="nt">expression</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">resource.Get(&quot;v1&quot;, &quot;secrets&quot;, &quot;platform-system&quot;, &quot;regcred&quot;)</span><span class="w"></span>
+<span class="w">  </span><span class="nt">generate</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">expression</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">generator.Apply(variables.nsName, [variables.source])</span><span class="w"></span>
+</code></pre></div>
+
+<p><code>generator.Apply(namespace, [resources])</code> returns <code>true</code> on success, which is why it composes inside CEL comprehensions — the fan-out pattern is <code>variables.nsList.all(ns, generator.Apply(ns, variables.downstream))</code>. Use <code>resource.List(...)</code> instead of <code>resource.Get(...)</code> to clone every Secret in a namespace.</p>
+<p><strong>Synchronization semantics are the part to get right.</strong> With <code>synchronize.enabled: true</code> and a data source:</p>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Sync</th>
+<th>NoSync</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Delete downstream</td>
+<td>recreated</td>
+<td>deleted</td>
+</tr>
+<tr>
+<td>Delete policy, <code>orphanDownstreamOnPolicyDelete: true</code></td>
+<td>retained</td>
+<td>retained</td>
+</tr>
+<tr>
+<td>Delete policy, <code>orphanDownstreamOnPolicyDelete: false</code> (default)</td>
+<td><strong>deleted</strong></td>
+<td>retained</td>
+</tr>
+<tr>
+<td>Delete trigger (the namespace)</td>
+<td>deleted</td>
+<td>none</td>
+</tr>
+<tr>
+<td>Modify downstream</td>
+<td><strong>reverted</strong></td>
+<td>modified</td>
+</tr>
+<tr>
+<td>Modify policy</td>
+<td>synced</td>
+<td>unmodified</td>
+</tr>
+</tbody>
+</table>
+<p>With a <strong>clone</strong> source the table differs in an important way: deleting the policy never deletes downstream resources, because their lifecycle is tied to the <em>source</em>, and deleting or modifying the <strong>source</strong> propagates to every clone (<a href="https://kyverno.io/docs/policy-types/generating-policy/">GeneratingPolicy — synchronization</a>).</p>
+<p>The row that surprises people: <code>orphanDownstreamOnPolicyDelete</code> defaults to <strong>false</strong>, so deleting a GeneratingPolicy with sync on will <strong>delete every resource it generated</strong>. On a cell platform that could mean removing every NetworkPolicy in every namespace. Set it to <code>true</code> unless you have deliberately decided otherwise.</p>
+<p><strong>Namespace targeting</strong> for templates comes from each rendered document's <code>metadata.namespace</code>; documents without one are treated as cluster-scoped. For a <code>NamespacedGeneratingPolicy</code>, missing namespace defaults to the policy's own and any other namespace is rejected. And note the explicit limitation: <strong>fan-out to a runtime-computed set of namespaces is not expressible with templates</strong> — use expression mode with <code>generator.Apply()</code> in a CEL loop.</p>
+<h4 id="deletingpolicy--scheduled-cleanup"><code>DeletingPolicy</code> — scheduled cleanup</h4>
+<div class="codehilite"><pre><span></span><code><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">policies.kyverno.io/v1</span><span class="w"></span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">DeletingPolicy</span><span class="w"></span>
+<span class="nt">metadata</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">reap-stale-cell-test-namespaces</span><span class="w"></span>
+<span class="nt">spec</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">schedule</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;0</span><span class="nv"> </span><span class="s">3</span><span class="nv"> </span><span class="s">*</span><span class="nv"> </span><span class="s">*</span><span class="nv"> </span><span class="s">*&quot;</span><span class="w">          </span><span class="c1"># standard cron; minimum granularity 1 minute</span><span class="w"></span>
+<span class="w">  </span><span class="nt">matchPolicy</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Equivalent</span><span class="w">        </span><span class="c1"># Exact | Equivalent (Equivalent recommended)</span><span class="w"></span>
+<span class="w">  </span><span class="nt">deletionPropagationPolicy</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Foreground</span><span class="w">   </span><span class="c1"># Foreground | Background | Orphan</span><span class="w"></span>
+<span class="w">  </span><span class="nt">matchConstraints</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">resourceRules</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">apiGroups</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;&quot;</span><span class="p p-Indicator">]</span><span class="w"></span>
+<span class="w">        </span><span class="nt">apiVersions</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;v1&quot;</span><span class="p p-Indicator">]</span><span class="w"></span>
+<span class="w">        </span><span class="nt">operations</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;*&quot;</span><span class="p p-Indicator">]</span><span class="w"></span>
+<span class="w">        </span><span class="nt">resources</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;namespaces&quot;</span><span class="p p-Indicator">]</span><span class="w"></span>
+<span class="w">        </span><span class="nt">scope</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;Cluster&quot;</span><span class="w"></span>
+<span class="w">  </span><span class="nt">variables</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">ttlHours</span><span class="w"></span>
+<span class="w">      </span><span class="nt">expression</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;72&quot;</span><span class="w"></span>
+<span class="w">  </span><span class="nt">conditions</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">is-ephemeral</span><span class="w"></span>
+<span class="w">      </span><span class="nt">expression</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;-</span><span class="w"></span>
+<span class="w">        </span><span class="no">object.metadata.?labels[&#39;cell.example.com/ephemeral&#39;].orValue(&#39;&#39;) == &#39;true&#39;</span><span class="w"></span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">is-expired</span><span class="w"></span>
+<span class="w">      </span><span class="nt">expression</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;-</span><span class="w"></span>
+<span class="w">        </span><span class="no">timestamp(object.metadata.creationTimestamp) &lt;</span><span class="w"></span>
+<span class="w">          </span><span class="no">now() - duration(&#39;72h&#39;)</span><span class="w"></span>
+</code></pre></div>
+
+<p><code>deletionPropagationPolicy</code> matters: <code>Orphan</code> leaves dependents untouched, <code>Background</code> deletes the primary first and lets GC clean dependents asynchronously, <code>Foreground</code> is cascading and keeps the primary until dependents are gone (<a href="https://kyverno.io/docs/policy-types/deleting-policy/">DeletingPolicy</a>). RBAC is the usual stumbling block — the cleanup controller needs <code>get, list, watch, delete</code> on the targeted kinds, and the docs note permissions may be missing even for core kinds, surfacing as <code>pods is forbidden: cannot list resource "pods"</code>.</p>
+<p>The older TTL-label mechanism (<code>cleanup.kyverno.io/ttl</code> on individual resources) still exists on the deprecated Cleanup Policy page and is a nice lightweight alternative for one-off cases.</p>
+<h4 id="imagevalidatingpolicy--supply-chain"><code>ImageValidatingPolicy</code> — supply chain</h4>
+<div class="codehilite"><pre><span></span><code><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">policies.kyverno.io/v1</span><span class="w"></span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">ImageValidatingPolicy</span><span class="w"></span>
+<span class="nt">metadata</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">require-signed-platform-images</span><span class="w"></span>
+<span class="nt">spec</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">validationActions</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">Deny</span><span class="p p-Indicator">]</span><span class="w"></span>
+<span class="w">  </span><span class="nt">failurePolicy</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Fail</span><span class="w"></span>
+<span class="w">  </span><span class="nt">webhookConfiguration</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">timeoutSeconds</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">20</span><span class="w">            </span><span class="c1"># registry round-trips are slow; budget for them</span><span class="w"></span>
+<span class="w">  </span><span class="nt">evaluation</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">background</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="nt">enabled</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">false</span><span class="w">              </span><span class="c1"># do not re-hit the registry on every scan</span><span class="w"></span>
+<span class="w">  </span><span class="nt">matchConstraints</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">resourceRules</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">apiGroups</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;&quot;</span><span class="p p-Indicator">]</span><span class="w"></span>
+<span class="w">        </span><span class="nt">apiVersions</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;v1&quot;</span><span class="p p-Indicator">]</span><span class="w"></span>
+<span class="w">        </span><span class="nt">operations</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;CREATE&quot;</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">&quot;UPDATE&quot;</span><span class="p p-Indicator">]</span><span class="w"></span>
+<span class="w">        </span><span class="nt">resources</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;pods&quot;</span><span class="p p-Indicator">]</span><span class="w"></span>
+<span class="w">  </span><span class="nt">matchImageReferences</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">glob</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;ghcr.io/temporalio/*&quot;</span><span class="w"></span>
+<span class="w">    </span><span class="c1"># or: - expression: &quot;image.registry == &#39;ghcr.io&#39;&quot;</span><span class="w"></span>
+<span class="w">  </span><span class="nt">attestors</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">ci</span><span class="w"></span>
+<span class="w">      </span><span class="nt">cosign</span><span class="p">:</span><span class="w"></span>
+<span class="w">        </span><span class="nt">keyless</span><span class="p">:</span><span class="w">                  </span><span class="c1"># OIDC identity-based, no long-lived key</span><span class="w"></span>
+<span class="w">          </span><span class="nt">identities</span><span class="p">:</span><span class="w"></span>
+<span class="w">            </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">issuer</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;https://token.actions.githubusercontent.com&quot;</span><span class="w"></span>
+<span class="w">              </span><span class="nt">subjectRegExp</span><span class="p">:</span><span class="w"> </span><span class="s">&#39;^https://github\.com/temporalio/[^/]+/\.github/workflows/release\.yml@refs/tags/v.*$&#39;</span><span class="w"></span>
+<span class="w">        </span><span class="nt">ctlog</span><span class="p">:</span><span class="w"></span>
+<span class="w">          </span><span class="nt">url</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;https://rekor.sigstore.dev&quot;</span><span class="w"></span>
+<span class="w">  </span><span class="nt">attestations</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">sbom</span><span class="w"></span>
+<span class="w">      </span><span class="nt">referrer</span><span class="p">:</span><span class="w"></span>
+<span class="w">        </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">sbom/cyclone-dx</span><span class="w"></span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">provenance</span><span class="w"></span>
+<span class="w">      </span><span class="nt">intoto</span><span class="p">:</span><span class="w"></span>
+<span class="w">        </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;https://slsa.dev/provenance/v1&quot;</span><span class="w"></span>
+<span class="w">  </span><span class="nt">validationConfigurations</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">mutateDigest</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span><span class="w">            </span><span class="c1"># rewrite tag -&gt; digest, killing mutable tags</span><span class="w"></span>
+<span class="w">    </span><span class="nt">verifyDigest</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span><span class="w"></span>
+<span class="w">    </span><span class="nt">required</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span><span class="w"></span>
+<span class="w">  </span><span class="nt">credentials</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">allowInsecureRegistry</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">false</span><span class="w"></span>
+<span class="w">    </span><span class="nt">providers</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;default&quot;</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">&quot;amazon&quot;</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">&quot;azure&quot;</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">&quot;google&quot;</span><span class="p p-Indicator">]</span><span class="w"></span>
+<span class="w">    </span><span class="nt">secrets</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;platform-regcred&quot;</span><span class="p p-Indicator">]</span><span class="w">   </span><span class="c1"># must live in the Kyverno namespace</span><span class="w"></span>
+<span class="w">  </span><span class="nt">validations</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">expression</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;-</span><span class="w"></span>
+<span class="w">        </span><span class="no">images.containers.map(image,</span><span class="w"></span>
+<span class="w">          </span><span class="no">verifyImageSignatures(image, [attestors.ci])).all(e, e &gt; 0)</span><span class="w"></span>
+<span class="w">      </span><span class="nt">message</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;image</span><span class="nv"> </span><span class="s">is</span><span class="nv"> </span><span class="s">not</span><span class="nv"> </span><span class="s">signed</span><span class="nv"> </span><span class="s">by</span><span class="nv"> </span><span class="s">the</span><span class="nv"> </span><span class="s">platform</span><span class="nv"> </span><span class="s">CI</span><span class="nv"> </span><span class="s">identity&quot;</span><span class="w"></span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">expression</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;-</span><span class="w"></span>
+<span class="w">        </span><span class="no">images.containers.map(image,</span><span class="w"></span>
+<span class="w">          </span><span class="no">verifyAttestationSignatures(image, attestations.sbom, [attestors.ci]))</span><span class="w"></span>
+<span class="w">          </span><span class="no">.all(e, e &gt; 0)</span><span class="w"></span>
+<span class="w">      </span><span class="nt">message</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;image</span><span class="nv"> </span><span class="s">has</span><span class="nv"> </span><span class="s">no</span><span class="nv"> </span><span class="s">verified</span><span class="nv"> </span><span class="s">SBOM</span><span class="nv"> </span><span class="s">attestation&quot;</span><span class="w"></span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">expression</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;-</span><span class="w"></span>
+<span class="w">        </span><span class="no">images.containers.map(image,</span><span class="w"></span>
+<span class="w">          </span><span class="no">extractPayload(image, attestations.sbom).bomFormat == &#39;CycloneDX&#39;)</span><span class="w"></span>
+<span class="w">          </span><span class="no">.all(e, e)</span><span class="w"></span>
+<span class="w">      </span><span class="nt">message</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;SBOM</span><span class="nv"> </span><span class="s">is</span><span class="nv"> </span><span class="s">not</span><span class="nv"> </span><span class="s">CycloneDX&quot;</span><span class="w"></span>
+</code></pre></div>
+
+<p>Details that matter:</p>
+<ul>
+<li><code>mutateDigest: true</code> is the highest-value single setting here. It rewrites tags to digests at admission, which eliminates the entire class of "the tag moved under us" problems — and it pairs naturally with the immutability guarantees a cell platform wants.</li>
+<li><code>extractPayload()</code> <strong>requires</strong> prior verification via <code>verifyAttestationSignatures()</code>, or it errors.</li>
+<li>Attestation names with <code>-</code> must be accessed as <code>attestations["my-attes"]</code>; prefer camelCase.</li>
+<li>Notary is supported alongside cosign, with <code>certs</code> and <code>tsaCerts</code>.</li>
+<li>For a private Sigstore deployment, <code>keyless.trustedRoot.expression</code> accepts the full trusted-root JSON, typically read from a ConfigMap via <code>resource.get(...)</code>.</li>
+<li><strong>Registry lookups are network calls in the admission path.</strong> Raise <code>timeoutSeconds</code>, and think hard before enabling <code>background</code>.</li>
+</ul>
+<p>Source for all of the above: <a href="https://kyverno.io/docs/policy-types/image-validating-policy/">ImageValidatingPolicy</a>.</p>
+<h3 id="variables-context-and-the-cel-libraries">Variables, context, and the CEL libraries<a class="anchor" href="#variables-context-and-the-cel-libraries">#</a></h3>
+<p>The legacy <code>context</code> block (ConfigMap lookups, API calls, image registry lookups) is now <code>spec.variables</code> plus a set of CEL libraries Kyverno adds on top of the Kubernetes CEL environment (<a href="https://kyverno.io/docs/policy-types/cel-libraries/">CEL Libraries</a>):</p>
+<table>
+<thead>
+<tr>
+<th>Library</th>
+<th>Representative functions</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Resource</td>
+<td><code>resource.Get(apiVersion, resource, namespace, name)</code>, <code>resource.List(...)</code>, <code>resource.Post(...)</code> (e.g. a live <code>SubjectAccessReview</code>)</td>
+</tr>
+<tr>
+<td>HTTP</td>
+<td><code>http.Get(url)</code>, <code>http.Post(url, body, headers)</code>, <code>http.Client(caBundle)</code></td>
+</tr>
+<tr>
+<td>GlobalContext</td>
+<td><code>globalContext.Get(...)</code> — reads a cached <code>GlobalContextEntry</code></td>
+</tr>
+<tr>
+<td>Image</td>
+<td><code>image("nginx:latest")</code>, <code>isImage(...)</code>, then <code>.registry()</code>, <code>.repository()</code>, <code>.identifier()</code></td>
+</tr>
+<tr>
+<td>ImageData</td>
+<td><code>image.GetMetadata(...)</code> — OCI metadata: arch, OS, digests, tags, layers</td>
+</tr>
+<tr>
+<td>User</td>
+<td><code>parseServiceAccount(request.userInfo.username)</code> → <code>.Name</code>, <code>.Namespace</code></td>
+</tr>
+<tr>
+<td>Hash</td>
+<td><code>md5()</code>, <code>sha1()</code>, <code>sha256()</code></td>
+</tr>
+<tr>
+<td>JSON / YAML</td>
+<td><code>json.unmarshal(...)</code>, <code>yaml.parse(...)</code></td>
+</tr>
+<tr>
+<td>Time</td>
+<td><code>time.now()</code>, <code>time.truncate(...)</code>, <code>time.toCron(...)</code></td>
+</tr>
+<tr>
+<td>X509</td>
+<td><code>x509.decode(cert)</code> → issuer, subject, validity, key usage, <code>IsCA</code></td>
+</tr>
+<tr>
+<td>Math / Random / Transform / gzip</td>
+<td><code>math.round(v, precision)</code>, pattern-based random strings, <code>listObjToMap(...)</code>, gzip (added in 1.18)</td>
+</tr>
+</tbody>
+</table>
+<p>Note what is <strong>not</strong> there: there is no <code>quantity</code> CEL library documented on that page, so resource-quantity comparisons need care. Kubernetes' own CEL environment does provide <code>quantity()</code>, and Kyverno's own docs use <code>quantity(...)</code> in a <code>MutatingPolicy</code> <code>targetMatchConditions</code> example (<a href="https://kyverno.io/docs/policy-types/mutating-policy/">MutatingPolicy — mutating subresources</a>), so it is available via the base environment rather than a Kyverno library. Verify against your version before relying on it.</p>
+<p><strong>JMESPath is legacy.</strong> The JMESPath expression language and Kyverno's custom filters (<code>{{ request.object.metadata.name }}</code>, <code>to_upper()</code>, <code>time_since()</code>, etc.) belong to the <code>ClusterPolicy</code> API and are documented under the deprecated section (<a href="https://kyverno.io/docs/policy-types/cluster-policy/jmespath/">ClusterPolicy — JMESPath</a>). The <code>kyverno jp</code> CLI subcommands still exist for working with legacy policies. If you are writing new policy, you are writing CEL, and the mental translation is: <code>{{ }}</code> substitution → <code>variables</code>; JMESPath filters → CEL comprehensions.</p>
+<p><strong>HTTP calls are a security surface, and were hardened in 1.18.</strong> Loopback and metadata-service addresses are blocked by default, allow/block lists are configurable, and <strong>HTTP calls from namespaced policies are disabled by default</strong> and must be explicitly enabled. This closed <a href="https://github.com/advisories/GHSA-rggm-jjmc-3394">CVE-2026-4789</a> (SSRF-style abuse). Separately, <a href="https://github.com/kyverno/kyverno/security/advisories/GHSA-f9g8-6ppc-pqq4">CVE-2026-41323</a> fixed HTTP calls carrying a token that could impersonate Kyverno controllers; calls now carry a scoped token (<a href="https://kyverno.io/blog/2026/04/24/announcing-kyverno-release-1.18/">Announcing 1.18</a>). If your policies call internal services, read both advisories before enabling the feature.</p>
+<h3 id="policy-reports-background-scans-and-the-safe-rollout-path">Policy Reports, background scans, and the safe rollout path<a class="anchor" href="#policy-reports-background-scans-and-the-safe-rollout-path">#</a></h3>
+<p>Reports use the Kubernetes Policy WG API: <strong><code>wgpolicyk8s.io/v1alpha2</code></strong>, kinds <code>PolicyReport</code> (namespaced) and <code>ClusterPolicyReport</code> (<a href="https://kyverno.io/docs/guides/reports/">Policy Reports</a>). Result values are <code>pass</code>, <code>skip</code>, <code>warn</code>, <code>error</code>, <code>fail</code>. <code>warn</code> comes from the <code>policies.kyverno.io/scored: "false"</code> annotation converting a <code>fail</code>; <code>error</code> means variable substitution failed outside preconditions — treat <code>error</code> as a <strong>broken policy</strong>, not a failing resource.</p>
+<p>Reports reflect <strong>current state only</strong>; entries disappear when resources are deleted. They are not an audit log.</p>
+<p><strong>Background scans</strong> run on a period, <strong>1 hour by default</strong>, controlled by <code>--backgroundScanInterval</code> on the <strong>reports</strong> controller (<a href="https://kyverno.io/docs/installation/customization/">Configuring Kyverno</a>). Confusingly, background <em>scans</em> are the reports controller's job; the <em>background controller</em> handles generate and mutate-existing. They are different Deployments.</p>
+<p><strong>Audit vs Enforce.</strong> In the CEL types this is <code>spec.validationActions: [Audit|Deny|Warn]</code>; in legacy ClusterPolicy it is <code>spec.rules[*].validate[*].failureAction</code>. The interaction with reports:</p>
+<table>
+<thead>
+<tr>
+<th><code>background: true</code></th>
+<th>New resource</th>
+<th>Existing resource</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Enforce / <code>Deny</code></td>
+<td><strong>Pass results only</strong> (violations are blocked, never persisted)</td>
+<td>Reported</td>
+</tr>
+<tr>
+<td>Audit</td>
+<td>Reported</td>
+<td>Reported</td>
+</tr>
+</tbody>
+</table>
+<p>Background scan <strong>never blocks existing resources, even in Enforce mode</strong> (<a href="https://kyverno.io/docs/guides/reports/">Policy Reports</a>). This asymmetry is exactly what makes the safe rollout path work.</p>
+<p><strong>The safe rollout path — this is the operational discipline that makes policy-as-code survivable:</strong></p>
+<ol>
+<li><strong>Write and unit-test offline.</strong> <code>kyverno test tests/</code> in CI, against fixtures that assert both pass and fail. No cluster involved.</li>
+<li><strong>Ship as <code>Audit</code> with <code>background.enabled: true</code>.</strong> Deploy to one cell. Nothing is blocked.</li>
+<li><strong>Read the reports.</strong> <code>kubectl get polr -A</code> and <code>kubectl get cpolr</code>. Query for <code>result: fail</code> and count distinct owners.</li>
+<li><strong>Fix the fleet or write exceptions.</strong> A <code>PolicyException</code> grants a scoped bypass without weakening the policy (<a href="https://kyverno.io/docs/guides/exceptions/">Policy Exceptions</a>). Note that the legacy <code>kyverno.io</code> PolicyException is deprecated; CEL policies use the newer form.</li>
+<li><strong>Promote to <code>Deny</code> on one cell.</strong> Watch admission failures for a full deploy cycle.</li>
+<li><strong>Roll to the fleet</strong>, cell by cell, with a kill switch — flipping back to <code>Audit</code> is a one-field change, and it is the fastest rollback you have.</li>
+</ol>
+<div class="codehilite"><pre><span></span><code><span class="c1"># Step 3, concretely</span>
+kubectl get clusterpolicyreport -o json <span class="p">|</span> <span class="se">\</span>
+  jq -r <span class="s1">&#39;.items[].results[] | select(.result==&quot;fail&quot;) |</span>
+<span class="s1">         [.policy, .rule, (.resources[0].kind), (.resources[0].name)] | @tsv&#39;</span>
+</code></pre></div>
+
+<p>Two other reporting levers: the label <code>reports.kyverno.io/disabled</code> on any policy suppresses all report generation for it (since 1.16), and <code>--allowedResults</code> (since 1.17) controls which result types get persisted at all — useful when <code>pass</code> results are drowning etcd.</p>
+<p><strong>OpenReports</strong> (<code>openreports.io/v1alpha1</code>) is available since 1.15 as an <strong>alpha</strong> alternative behind <code>--openreportsEnabled</code>, described as <em>"an initial step to eventually deprecate wgpolicyk8s and fully depend on openreports.io."</em> Do not build tooling on it yet, but know it is coming.</p>
+<h3 id="operational-safety">Operational safety<a class="anchor" href="#operational-safety">#</a></h3>
+<p>This is the section to read twice, because Kyverno is in the critical path of cell bootstrap.</p>
+<h4 id="failurepolicy-ignore-vs-fail">failurePolicy: <code>Ignore</code> vs <code>Fail</code></h4>
+<p><strong>Kyverno is fail-closed by default.</strong> From the security guide: <em>"Kyverno policies are configured to fail-closed by default. This setting can be tuned on a per policy basis"</em> (<a href="https://kyverno.io/docs/guides/security/">Security</a>). There is a global override, <code>--forceFailurePolicyIgnore</code>, and per-policy control via <code>spec.failurePolicy</code> (<a href="https://kyverno.io/docs/installation/customization/">Configuring Kyverno</a>).</p>
+<p>The right choice is per-policy, not global:</p>
+<table>
+<thead>
+<tr>
+<th>Policy purpose</th>
+<th>failurePolicy</th>
+<th>Reasoning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Security invariant (no privileged pods, image signing)</td>
+<td><code>Fail</code></td>
+<td>Bypassing the check is worse than an outage</td>
+</tr>
+<tr>
+<td>Convenience mutation (default labels, sidecar injection)</td>
+<td><code>Ignore</code></td>
+<td>An unlabeled pod is a nuisance; a blocked deploy during an incident is not</td>
+</tr>
+<tr>
+<td>Anything matching cluster-bootstrap resources</td>
+<td><code>Ignore</code></td>
+<td>Never let a policy block the thing that would fix the policy</td>
+</tr>
+</tbody>
+</table>
+<p>For a cell platform I would go further: <strong>any policy whose failure could block cell bootstrap should be <code>Ignore</code>, with the invariant enforced by a background scan and an alert instead.</strong> You lose synchronous enforcement; you gain the ability to bring a cell up when Kyverno is unhealthy.</p>
+<h4 id="webhook-resource-scoping--the-mitigation-that-actually-works">Webhook resource scoping — the mitigation that actually works</h4>
+<p>Kyverno's most important safety property is that <strong>it dynamically generates its webhook rules from the installed policy set</strong>. Before any policy exists, <code>kyverno-resource-validating-webhook-cfg</code> is effectively empty; installing the first Pod-matching policy adds exactly one rule (<a href="https://kyverno.io/docs/installation/customization/">Configuring Kyverno</a>). The blast radius is therefore proportional to what you actually asked for.</p>
+<p>The corollary from the scaling docs is the thing to fear: <em>"any policies which match on a wildcard (<code>*</code>) will result in Kyverno being forced to process every operation (CREATE, UPDATE, DELETE, and CONNECT) on every resource in the cluster… only a single, simple policy written in such a manner and installed in a large cluster can and will have significant impact"</em> (<a href="https://kyverno.io/docs/installation/scaling/">Scaling Kyverno</a>). One wildcard policy converts Kyverno from a targeted gate into a whole-cluster proxy. Ban wildcard <code>resources: ["*"]</code> in code review.</p>
+<p><code>--autoUpdateWebhooks</code> defaults to <code>true</code>. Setting it to <code>false</code> makes Kyverno create <strong>default webhook configurations that match ALL resources</strong> with <code>failurePolicy: Ignore</code>, and the ConfigMap webhook settings are ignored entirely. That is almost never what you want.</p>
+<h4 id="namespaceselector-exclusions">namespaceSelector exclusions</h4>
+<p>Configured through the <code>webhooks</code> key of the <code>kyverno</code> ConfigMap, which accepts a JSON <code>namespaceSelector</code> object. <strong>The Kyverno and <code>kube-system</code> Namespaces are excluded by default</strong> (<a href="https://kyverno.io/docs/installation/customization/">Configuring Kyverno — namespace selectors</a>). The shipped default is:</p>
+<div class="codehilite"><pre><span></span><code><span class="p">[{</span><span class="nt">&quot;namespaceSelector&quot;</span><span class="p">:{</span><span class="nt">&quot;matchExpressions&quot;</span><span class="p">:[</span><span class="w"></span>
+<span class="w">  </span><span class="p">{</span><span class="nt">&quot;key&quot;</span><span class="p">:</span><span class="s2">&quot;kubernetes.io/metadata.name&quot;</span><span class="p">,</span><span class="nt">&quot;operator&quot;</span><span class="p">:</span><span class="s2">&quot;NotIn&quot;</span><span class="p">,</span><span class="nt">&quot;values&quot;</span><span class="p">:[</span><span class="s2">&quot;kube-system&quot;</span><span class="p">]},</span><span class="w"></span>
+<span class="w">  </span><span class="p">{</span><span class="nt">&quot;key&quot;</span><span class="p">:</span><span class="s2">&quot;kubernetes.io/metadata.name&quot;</span><span class="p">,</span><span class="nt">&quot;operator&quot;</span><span class="p">:</span><span class="s2">&quot;NotIn&quot;</span><span class="p">,</span><span class="nt">&quot;values&quot;</span><span class="p">:[</span><span class="s2">&quot;kyverno&quot;</span><span class="p">]}</span><span class="w"></span>
+<span class="p">],</span><span class="nt">&quot;matchLabels&quot;</span><span class="p">:</span><span class="kc">null</span><span class="p">}}]</span><span class="w"></span>
+</code></pre></div>
+
+<p>Separately, <code>resourceFilters</code> is a second, engine-level exclusion layer applied <em>after</em> the webhook. Format is <code>[&lt;Kind&gt;,&lt;Namespace&gt;,&lt;Name&gt;]</code> with wildcards; the documented default includes <code>[*/*,kyverno,*] [Event,*,*] [*/*,kube-system,*] [*/*,kube-public,*] [*/*,kube-node-lease,*] [Node,*,*] [Node/*,*,*]</code> and more. Critically: <strong>resource filters do not apply to background scanning</strong> by default, because <code>--skipResourceFilters</code> defaults to <code>true</code> — so <code>[*/*,kube-system,*]</code> still produces background-scan report entries for kube-system. That is a common source of "why is my report full of things I excluded."</p>
+<p>The full <code>kyverno</code> ConfigMap key set (13 keys) is: <code>defaultRegistry</code>, <code>enableDefaultRegistryMutation</code>, <code>excludeGroups</code> (default <code>system:serviceaccounts:kube-system,system:nodes</code>), <code>excludeUsernames</code> (default <code>'!system:kube-scheduler'</code>), <code>excludeRoles</code>, <code>excludeClusterRoles</code>, <code>generateSuccessEvents</code> (default <code>false</code>), <code>matchConditions</code>, <code>resourceFilters</code>, <code>updateRequestThreshold</code> (default <code>1000</code>), <code>webhooks</code>, <code>webhookAnnotations</code>, <code>webhookLabels</code>. The ConfigMap name is <code>kyverno</code>, overridable via the <code>INIT_CONFIG</code> env var, and changes are read dynamically at runtime (<a href="https://kyverno.io/docs/installation/customization/">Configuring Kyverno</a>).</p>
+<p>The <code>excludeGroups</code> default deserves attention: <strong><code>system:nodes</code> and kube-system service accounts bypass policy entirely.</strong> That is correct for keeping kubelet and control-plane controllers unblocked, and it is also a bypass path a tenant with node-level access could exploit. Know it exists.</p>
+<h4 id="the-ha-deployment">The HA deployment</h4>
+<p>Kyverno is <strong>four Deployments</strong>, each a different controller, with different HA characteristics (<a href="https://kyverno.io/docs/guides/high-availability/">High Availability</a>):</p>
+<table>
+<thead>
+<tr>
+<th>Controller</th>
+<th>Leader election</th>
+<th>Replicas buy you</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Admission</strong></td>
+<td>Only for cert + webhook management</td>
+<td><strong>Availability <em>and</em> scale</strong> — inbound <code>AdmissionReview</code>s are distributed across all replicas</td>
+<td>Required in every install. <strong>Minimum 3 replicas for HA.</strong></td>
+</tr>
+<tr>
+<td><strong>Reports</strong></td>
+<td>Yes</td>
+<td><strong>Availability only</strong> — one replica processes reports</td>
+<td>Stateful; vertical scaling helps only the leader</td>
+</tr>
+<tr>
+<td><strong>Background</strong></td>
+<td>Yes</td>
+<td><strong>Availability only</strong> — one replica does generate / mutate-existing</td>
+<td>Tune <code>--genWorkers</code> (default 10) instead</td>
+</tr>
+<tr>
+<td><strong>Cleanup</strong></td>
+<td>Mixed (cert/webhook yes, cleanup handler no)</td>
+<td>Both, but one replica per CronJob</td>
+<td>Handles <code>CleanupPolicy</code> and <code>DeletingPolicy</code></td>
+</tr>
+</tbody>
+</table>
+<p>The practical takeaway: <strong>only the admission controller scales horizontally for throughput.</strong> If generate rules are slow on a big cell, adding background-controller replicas does nothing — raise <code>--genWorkers</code> and CPU instead.</p>
+<p>Ports: admission and cleanup expose <strong>9443</strong> (webhook) and <strong>8000</strong> (metrics); background and reports expose <strong>8000</strong> only and run no webhook. The API server needs ingress to 9443; if you run a default-deny NetworkPolicy in the Kyverno namespace (you should), you must allow it explicitly. Kyverno ships no NetworkPolicy by default; the Helm chart has <code>networkPolicy.enabled</code> (<a href="https://kyverno.io/docs/guides/security/">Security</a>).</p>
+<h4 id="resource-consumption-at-scale">Resource consumption at scale</h4>
+<p>The scaling guide's core message is that <strong>node and pod counts are the wrong sizing input</strong>: <em>"a large production cluster hosting 60,000 Pods yet with no Kyverno policies installed which match on Pod has no bearing on the resources required by Kyverno"</em> (<a href="https://kyverno.io/docs/installation/scaling/">Scaling Kyverno</a>). What drives cost is the <em>shape of the policy set</em> — what it matches, and how often that fires.</p>
+<p>Two concrete recommendations from that page:</p>
+<ul>
+<li><strong>Do not set CPU limits</strong> on Kyverno. Admission latency is on the critical path of every matching API call, and CPU throttling turns a fast policy into a timeout.</li>
+<li><strong>Watch API server memory</strong> if you create thousands of policy resources: <em>"double check that the kube-apiserver pods have head room to increase its memory allocations, otherwise the cluster may crash entirely."</em></li>
+</ul>
+<p>Published v1.18.1 benchmarks for CEL policies (16 <code>ValidatingPolicy</code> resources mirroring the PSS restricted profile, k6 client-measured end-to-end latency including the API server hop): 1 replica at 50 VUs / 5,000 iterations → 57 ms avg, 103 ms p95; 3 replicas at 500 VUs / 10,000 iterations → 321 ms avg, 536 ms p95. The 500-VU single-replica case is flagged in the docs as degraded. Treat these as order-of-magnitude only and measure your own policy set; the runtime signal to watch is <code>kyverno_admission_review_duration_seconds</code>.</p>
+<h4 id="how-a-kyverno-outage-affects-a-cell-coming-up">How a Kyverno outage affects a cell coming up</h4>
+<p>This is the question worth answering explicitly in a design doc.</p>
+<p><strong>If Kyverno's webhooks are registered but its pods are down, with default fail-closed:</strong> every API request matching a registered webhook rule fails. Since Kyverno narrows rules to what your policies match, the impact is scoped — but if you have a policy matching Pods, <strong>no pod can be created anywhere except the excluded namespaces</strong>. Including, potentially, Kyverno's own pods if it were not for the <code>kyverno</code> namespace exclusion. That exclusion is load-bearing.</p>
+<p><strong>If Kyverno is not installed yet on a fresh cell:</strong> nothing blocks, because no webhook configurations exist. Kyverno is safe to install <em>late</em> in cell bootstrap.</p>
+<p><strong>If Kyverno's generate rules haven't run yet:</strong> namespaces come up without their baseline NetworkPolicy or LimitRange, briefly. Generation is asynchronous. <code>generateExisting.enabled: true</code> backfills, but there is a window. If a cell's security posture depends on the default-deny NetworkPolicy existing, the correct design is a validating policy that <em>rejects pods in namespaces lacking one</em> — belt and braces — not just a generating policy.</p>
+<p><strong>Design guidance for cells:</strong></p>
+<ol>
+<li>Install Kyverno with <strong>3 admission replicas</strong> and a PodDisruptionBudget, on nodes that are not Karpenter-consolidation candidates (or with a generous <code>karpenter.sh/do-not-disrupt</code> duration).</li>
+<li>Order cell bootstrap so Kyverno lands <strong>before</strong> tenant namespaces but <strong>after</strong> the CNI, CoreDNS, and anything Kyverno depends on.</li>
+<li>Use <code>failurePolicy: Ignore</code> for every policy that touches bootstrap-critical resources.</li>
+<li>Keep the webhook-configuration names in the break-glass runbook. <code>kubectl delete validatingwebhookconfiguration kyverno-resource-validating-webhook-cfg</code> is the emergency unblock.</li>
+<li>Alert on Kyverno admission-controller availability <em>as a cell health signal</em>, not just as an app.</li>
+</ol>
+<p><em>See also: <a href="11-cert-manager-and-pki.html#webhook-certificate-self-management">webhook certificate self-management</a> for the other half of the fail-closed story — an expired or untrusted webhook serving certificate produces exactly the same cluster-wide outage as dead pods, and the recovery is different.</em></p>
+<h3 id="the-kyverno-cli--the-reason-a-platform-team-picks-kyverno">The Kyverno CLI — the reason a platform team picks Kyverno<a class="anchor" href="#the-kyverno-cli--the-reason-a-platform-team-picks-kyverno">#</a></h3>
+<p>Two commands.</p>
+<p><strong><code>kyverno apply</code></strong> runs policies against manifests or a live cluster and prints results. It has the flags you'd want for CI: <code>--resource</code>/<code>--resources</code>, <code>--cluster</code> (evaluate against the current context), <code>--policy-report</code> (emit a report), <code>--table</code>, <code>--audit-warn</code> (treat audit-policy failures as warnings not failures), <code>--context-file</code> (supply context data for CEL policies), <code>--json</code>/<code>--http-payload</code> for JSON-payload policies, <code>--continue-on-error</code> (default true), <code>--batch-size</code> (100), <code>--concurrent</code> (1), <code>--show-performance</code>, and <code>--generate-exceptions</code> with <code>--generated-exception-ttl</code> (default <code>720h</code>) to auto-author exceptions for current violations (<a href="https://kyverno.io/docs/kyverno-cli/reference/kyverno_apply/">kyverno apply</a>).</p>
+<p>That <code>--generate-exceptions</code> flag is worth calling out for a fleet migration: point it at a cell's existing resources, get a set of time-boxed exceptions, ship the policy in Enforce, and let the exceptions expire as teams remediate.</p>
+<p><strong><code>kyverno test</code></strong> asserts declared expectations. Given a directory containing a <code>kyverno-test.yaml</code>, it compares expected results to actual engine output:</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># tests/require-pdb/kyverno-test.yaml</span><span class="w"></span>
+<span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">require-pdb-not-fully-blocking</span><span class="w"></span>
+<span class="nt">policies</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">../../policies/require-pdb-not-fully-blocking.yaml</span><span class="w"></span>
+<span class="nt">resources</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">resources.yaml</span><span class="w"></span>
+<span class="nt">results</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">policy</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">require-pdb-not-fully-blocking</span><span class="w"></span>
+<span class="w">    </span><span class="nt">rule</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">require-pdb-not-fully-blocking</span><span class="w"></span>
+<span class="w">    </span><span class="nt">resource</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">bad-pdb</span><span class="w"></span>
+<span class="w">    </span><span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">PodDisruptionBudget</span><span class="w"></span>
+<span class="w">    </span><span class="nt">result</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">fail</span><span class="w"></span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">policy</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">require-pdb-not-fully-blocking</span><span class="w"></span>
+<span class="w">    </span><span class="nt">rule</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">require-pdb-not-fully-blocking</span><span class="w"></span>
+<span class="w">    </span><span class="nt">resource</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">good-pdb</span><span class="w"></span>
+<span class="w">    </span><span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">PodDisruptionBudget</span><span class="w"></span>
+<span class="w">    </span><span class="nt">result</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">pass</span><span class="w"></span>
+</code></pre></div>
+
+<p>Useful flags: <code>--detailed-results</code>, <code>--fail-only</code>, <code>-o json|yaml|markdown|junit</code> (JUnit is what you want for CI reporting), <code>--require-tests</code>, and <code>-t/--test-case-selector</code> (default <code>"policy=*,rule=*,resource=*"</code>). <code>kyverno test</code> also accepts a git URL directly, e.g. <code>kyverno test https://github.com/kyverno/policies/pod-security --git-branch main</code> (<a href="https://kyverno.io/docs/kyverno-cli/reference/kyverno_test/">kyverno test</a>). Scaffold a test file with <code>kyverno create test</code> (<a href="https://kyverno.io/docs/kyverno-cli/reference/kyverno_create_test/">kyverno create test</a>).</p>
+<blockquote>
+<p><strong>Honest caveat:</strong> I could not find a page in the v1.19 docs that lays out the complete <code>kyverno-test.yaml</code> schema. The field names above are confirmed indirectly by <code>--test-case-selector</code> (<code>policy</code>, <code>rule</code>, <code>resource</code>) and by <code>kyverno create test</code>'s expected-result tuple (<code>policy-name,rule-name,resource-name,resource-namespace,resource-kind</code>). Verify against <a href="https://github.com/kyverno/policies">kyverno/policies</a>, which contains hundreds of working test files.</p>
+</blockquote>
+<p><strong>CI wiring</strong> (<a href="https://kyverno.io/docs/guides/testing-policies/">Testing Policies</a>):</p>
+<div class="codehilite"><pre><span></span><code><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">kyverno-policy-test</span><span class="w"></span>
+<span class="nt">on</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">pull_request</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">workflow_dispatch</span><span class="p p-Indicator">]</span><span class="w"></span>
+<span class="nt">jobs</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">test</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">runs-on</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">ubuntu-latest</span><span class="w"></span>
+<span class="w">    </span><span class="nt">permissions</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="nt">contents</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">read</span><span class="w"></span>
+<span class="w">    </span><span class="nt">steps</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">uses</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">actions/checkout@v4</span><span class="w"></span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Install Kyverno CLI</span><span class="w"></span>
+<span class="w">        </span><span class="nt">uses</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">kyverno/action-install-cli@v0.2.0</span><span class="w"></span>
+<span class="w">        </span><span class="nt">with</span><span class="p">:</span><span class="w"></span>
+<span class="w">          </span><span class="nt">release</span><span class="p">:</span><span class="w"> </span><span class="s">&#39;v1.19.0&#39;</span><span class="w"></span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">run</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">kyverno version</span><span class="w"></span>
+<span class="w">      </span><span class="c1"># 1. New/changed manifests vs the current policy set</span><span class="w"></span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">run</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">kyverno apply policies/ -r resources/</span><span class="w"></span>
+<span class="w">      </span><span class="c1"># 2. Declared test cases</span><span class="w"></span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">run</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">kyverno test tests/ -o junit &gt; kyverno-junit.xml</span><span class="w"></span>
+</code></pre></div>
+
+<p>The two use cases the docs name are exactly the two a platform team needs: gate <em>unknown resources</em> against <em>known policies</em> (a tenant's PR), and gate <em>known resources</em> against <em>changing policies</em> (your own PR, or a Kyverno version bump — pin <code>release:</code> to the next version to dry-run an upgrade). For end-to-end testing against a real cluster, <a href="https://kyverno.io/docs/subprojects/chainsaw/">Chainsaw</a> is the sibling project.</p>
+<h3 id="pod-security-standards-and-psa">Pod Security Standards, and PSA<a class="anchor" href="#pod-security-standards-and-psa">#</a></h3>
+<p>Kyverno ships a curated policy set covering all Pod Security Standards controls, installable as <code>kustomize build https://github.com/kyverno/policies/pod-security | kubectl apply -f -</code> or via Helm <code>kyverno/kyverno-policies</code> with <code>--set policyGroups=pod-security</code> (<a href="https://kyverno.io/docs/guides/pod-security/">Pod Security Standards</a>).</p>
+<p>The mechanism, in the <strong>legacy</strong> ClusterPolicy API, is the <code>validate.podSecurity</code> subrule, added in 1.8, which <em>"by integrating the same libraries as used in Kubernetes' Pod Security Admission"</em> applies whole profiles or individual controls (<a href="https://kyverno.io/docs/policy-types/cluster-policy/validate/">ClusterPolicy — validate</a>):</p>
+<div class="codehilite"><pre><span></span><code><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">kyverno.io/v1</span><span class="w">     </span><span class="c1"># LEGACY API — deprecated in 1.19</span><span class="w"></span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">ClusterPolicy</span><span class="w"></span>
+<span class="nt">metadata</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">psa-baseline</span><span class="w"></span>
+<span class="nt">spec</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">rules</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">baseline</span><span class="w"></span>
+<span class="w">      </span><span class="nt">match</span><span class="p">:</span><span class="w"></span>
+<span class="w">        </span><span class="nt">any</span><span class="p">:</span><span class="w"></span>
+<span class="w">          </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">resources</span><span class="p">:</span><span class="w"></span>
+<span class="w">              </span><span class="nt">kinds</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;Pod&quot;</span><span class="p p-Indicator">]</span><span class="w"></span>
+<span class="w">      </span><span class="nt">validate</span><span class="p">:</span><span class="w"></span>
+<span class="w">        </span><span class="nt">failureAction</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Enforce</span><span class="w"></span>
+<span class="w">        </span><span class="nt">podSecurity</span><span class="p">:</span><span class="w"></span>
+<span class="w">          </span><span class="nt">level</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">baseline</span><span class="w"></span>
+<span class="w">          </span><span class="nt">version</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">latest</span><span class="w"></span>
+</code></pre></div>
+
+<p><strong>Here is the important, easily-missed fact: there is no CEL equivalent.</strong> The migration guide states that <code>spec.rules.validate.podSecurity</code> is <em>"Not supported; use <code>spec.validations</code> for each pod security control"</em> (<a href="https://kyverno.io/docs/guides/migration-to-cel/">Migrating to CEL Policies</a>). The <code>ValidatingPolicy</code> docs never mention <code>podSecurity</code>. Kyverno's own scaling benchmark describes a <code>vpol-pss</code> scenario as <em>"16 ValidatingPolicy resources mirroring the Pod Security Standards restricted profile"</em> — hand-written CEL, one policy per control.</p>
+<p>So: if you plan to adopt PSS via Kyverno and you must be off <code>ClusterPolicy</code> before v1.20, budget for either 16-ish hand-written <code>ValidatingPolicy</code> resources or a shift to native PSA for the profile-level enforcement. <strong>Verify this against the docs when you actually do it</strong> — parity may land in v1.20.</p>
+<p><strong>Kyverno vs built-in Pod Security Admission.</strong> PSA is namespace-label-driven, baked into the API server since 1.25, and free. Kyverno's advantages, per its own docs: cluster-wide application without an <code>AdmissionConfiguration</code> file or control-plane changes; no namespace label required; <strong>individual controls can be exempted from a profile</strong>; container images can be exempted alongside a control; pod-controller enforcement is automatic; violations are visible via policy reports; and the whole thing is CI-testable.</p>
+<p>The interop rule is the one operational fact you must know: <strong>PSA and Kyverno are compatible, but pods blocked by PSA in <code>enforce</code> mode never generate an <code>AdmissionReview</code></strong>, so Kyverno cannot see or report on them (<a href="https://kyverno.io/docs/policy-types/cluster-policy/validate/">ClusterPolicy — PSA interoperability</a>). The recommended pattern is PSA enforcing <code>baseline</code> cluster-wide as a cheap floor, with Kyverno handling <code>restricted</code> and the granular exemptions. For a cell platform that shape is right: PSA is the thing that still works when Kyverno is down.</p>
+<h3 id="a-starter-policy-set-a-platform-team-would-actually-ship">A starter policy set a platform team would actually ship<a class="anchor" href="#a-starter-policy-set-a-platform-team-would-actually-ship">#</a></h3>
+<p>Ordered by value per line of YAML. Ship stages 1 and 2 to every cell; stage 3 where the tenancy model demands it.</p>
+<p><strong>Stage 1 — cell bootstrap (GeneratingPolicy, ship first, low risk).</strong></p>
+<ol>
+<li>Every non-system namespace gets a <strong>default-deny-ingress NetworkPolicy</strong>.</li>
+<li>Every non-system namespace gets a <strong>LimitRange</strong> with sane container defaults.</li>
+<li>Every non-system namespace gets the platform <strong>image pull secret</strong>, cloned from a source namespace with <code>synchronize.enabled: true</code> so credential rotation propagates automatically.</li>
+<li>Every non-system namespace gets a <strong>ResourceQuota</strong> sized from a cell-tier label.</li>
+</ol>
+<p>All four with <code>generateExisting.enabled: true</code> and <code>orphanDownstreamOnPolicyDelete.enabled: true</code>.</p>
+<p><strong>Stage 2 — platform invariants (ValidatingPolicy, <code>Audit</code> → <code>Deny</code>).</strong></p>
+<ol start="5">
+<li><strong>No <code>PodDisruptionBudget</code> with <code>maxUnavailable: 0</code> or <code>minAvailable: 100%</code>.</strong> Directly protects your Karpenter drift and consolidation paths from being permanently blocked.</li>
+<li><strong>Every <code>karpenter.sh/v1</code> NodePool must set <code>terminationGracePeriod</code></strong> — prevents the documented <code>expireAfter</code> + <code>do-not-disrupt</code> deadlock and guarantees cell teardown terminates.</li>
+<li><strong>Every <code>karpenter.sh/v1</code> NodePool must declare <code>disruption.budgets</code></strong> and must not use a floating AMI alias (<code>@latest</code>) in its referenced NodeClass.</li>
+<li><strong>Every workload sets resource requests</strong>, and containers do not run as root or privileged.</li>
+<li><strong>Images come from allowed registries</strong> and are <strong>referenced by digest, not tag</strong> — or let <code>ImageValidatingPolicy</code> <code>mutateDigest</code> fix it.</li>
+<li><strong>No <code>hostNetwork</code>, <code>hostPID</code>, <code>hostIPC</code>, or <code>hostPath</code></strong> outside an explicit allowlist.</li>
+<li><strong>Required ownership labels</strong> on every namespace and workload — this is what makes reports actionable.</li>
+</ol>
+<p><strong>Stage 3 — supply chain and hygiene.</strong></p>
+<ol start="12">
+<li><strong><code>ImageValidatingPolicy</code></strong>: platform images must carry a valid cosign keyless signature from your CI identity, with <code>mutateDigest: true</code>.</li>
+<li><strong><code>MutatingPolicy</code></strong>: stamp cell identity labels (<code>cell.example.com/cell</code>, region, cloud) onto every namespace and workload, <code>failurePolicy: Ignore</code>.</li>
+<li><strong><code>DeletingPolicy</code></strong>: reap ephemeral/test namespaces past a TTL, and completed Jobs older than N days.</li>
+</ol>
+<p>Every one of these gets a <code>kyverno test</code> fixture with a passing and a failing case, and the whole set runs in CI on every PR. Start from <a href="https://github.com/kyverno/policies">kyverno/policies</a> rather than from scratch — but expect to port from <code>ClusterPolicy</code> to CEL, and check the repo's current state before assuming the samples are already migrated.</p>
+<p><em>See also: <a href="06-karpenter.html#disruption-in-depth">disruption in depth</a> for the exact Karpenter behaviors rules 5–7 are defending, and <a href="04-managed-kubernetes-eks-gke-aks.html#lab-2--pdb-drain-and-eviction-semantics-kind-free">PDB, drain, and eviction semantics</a> for the lab that shows you what a deadlocked PDB looks like from the drain side.</em></p>
+<hr />
+<h2 id="hands-on">Hands-on<a class="anchor" href="#hands-on">#</a></h2>
+<p>Everything here runs on a <code>kind</code> cluster. Unlike Karpenter, Kyverno needs no cloud at all — it is pure Kubernetes.</p>
+<h3 id="lab-0--install">Lab 0 — install<a class="anchor" href="#lab-0--install">#</a></h3>
+<div class="codehilite"><pre><span></span><code>kind create cluster --name kyverno-lab --image kindest/node:v1.34.0
+
+helm repo add kyverno https://kyverno.github.io/kyverno/
+helm repo update
+
+<span class="c1"># HA-shaped install: 3 admission replicas, matching production.</span>
+helm install kyverno kyverno/kyverno <span class="se">\</span>
+  --namespace kyverno --create-namespace <span class="se">\</span>
+  --set admissionController.replicas<span class="o">=</span><span class="m">3</span> <span class="se">\</span>
+  --set backgroundController.replicas<span class="o">=</span><span class="m">1</span> <span class="se">\</span>
+  --set reportsController.replicas<span class="o">=</span><span class="m">1</span> <span class="se">\</span>
+  --set cleanupController.replicas<span class="o">=</span><span class="m">1</span>
+
+kubectl -n kyverno get deploy
+kubectl get crd <span class="p">|</span> grep -E <span class="s1">&#39;kyverno|wgpolicy&#39;</span>
+
+<span class="c1"># See the dynamically-generated webhooks -- note how empty they are with no policies.</span>
+kubectl get validatingwebhookconfiguration <span class="p">|</span> grep kyverno
+kubectl get validatingwebhookconfiguration kyverno-resource-validating-webhook-cfg <span class="se">\</span>
+  -o <span class="nv">jsonpath</span><span class="o">=</span><span class="s1">&#39;{.webhooks[*].rules}&#39;</span> <span class="p">|</span> jq .
+</code></pre></div>
+
+<p>Install the CLI too — you will use it more than the cluster:</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># https://kyverno.io/docs/subprojects/kyverno-cli/</span>
+brew install kyverno jq yq   <span class="c1"># jq and yq are used by later labs</span>
+kyverno version
+</code></pre></div>
+
+<h3 id="lab-1--a-validatingpolicy-offline-first">Lab 1 — a ValidatingPolicy, offline first<a class="anchor" href="#lab-1--a-validatingpolicy-offline-first">#</a></h3>
+<p>Set up a lab directory and write the policy from the PDB example above to <code>policies/require-pdb-not-fully-blocking.yaml</code>. Every later lab assumes you are sitting in <code>~/kyverno-lab</code>, so mind the <code>cd</code> at the end.</p>
+<div class="codehilite"><pre><span></span><code>mkdir -p ~/kyverno-lab/policies <span class="o">&amp;&amp;</span> <span class="nb">cd</span> ~/kyverno-lab
+<span class="c1"># ... paste the ValidatingPolicy into policies/require-pdb-not-fully-blocking.yaml ...</span>
+
+mkdir -p tests/require-pdb <span class="o">&amp;&amp;</span> <span class="nb">cd</span> tests/require-pdb
+cat &gt; resources.yaml <span class="s">&lt;&lt;&#39;EOF&#39;</span>
+<span class="s">apiVersion: policy/v1</span>
+<span class="s">kind: PodDisruptionBudget</span>
+<span class="s">metadata:</span>
+<span class="s">  name: bad-pdb</span>
+<span class="s">  namespace: default</span>
+<span class="s">spec:</span>
+<span class="s">  maxUnavailable: 0</span>
+<span class="s">  selector: {matchLabels: {app: x}}</span>
+<span class="s">---</span>
+<span class="s">apiVersion: policy/v1</span>
+<span class="s">kind: PodDisruptionBudget</span>
+<span class="s">metadata:</span>
+<span class="s">  name: good-pdb</span>
+<span class="s">  namespace: default</span>
+<span class="s">spec:</span>
+<span class="s">  maxUnavailable: 1</span>
+<span class="s">  selector: {matchLabels: {app: x}}</span>
+<span class="s">EOF</span>
+
+<span class="c1"># Run the real engine offline. No cluster involved.</span>
+kyverno apply ../../policies/ -r resources.yaml --table
+</code></pre></div>
+
+<p>Then add the <code>kyverno-test.yaml</code> from earlier and run <code>kyverno test .</code>. <strong>Deliberately break it</strong> — flip an expected <code>fail</code> to <code>pass</code> — and confirm the command exits non-zero. A test harness you have never seen fail is not a test harness.</p>
+<p>Then go back to the lab root: <code>cd ~/kyverno-lab</code>.</p>
+<h3 id="lab-2--audit--deny-and-read-the-reports">Lab 2 — Audit → Deny, and read the reports<a class="anchor" href="#lab-2--audit--deny-and-read-the-reports">#</a></h3>
+<p>First edit the policy to start in <code>Audit</code> — the example above ships <code>validationActions: [Deny]</code>, and the whole point of this lab is to promote it. Then:</p>
+<div class="codehilite"><pre><span></span><code>kubectl apply -f policies/require-pdb-not-fully-blocking.yaml   <span class="c1"># validationActions: [Audit]</span>
+
+kubectl apply -f tests/require-pdb/resources.yaml   <span class="c1"># both succeed; nothing is blocked</span>
+
+kubectl get clusterpolicyreport,policyreport -A
+kubectl get policyreport -n default -o yaml <span class="p">|</span> <span class="se">\</span>
+  yq <span class="s1">&#39;.items[].results[] | select(.result==&quot;fail&quot;)&#39;</span>
+</code></pre></div>
+
+<p>Now flip <code>validationActions: [Deny]</code>, delete and re-apply <code>bad-pdb</code>, and read the rejection message carefully — confirm <code>messageExpression</code> produced the dynamic form with the object name in it. Then flip to <code>[Warn]</code> and observe a <code>kubectl</code> warning instead of a rejection.</p>
+<p>Force a background scan cycle by lowering the interval:</p>
+<div class="codehilite"><pre><span></span><code>kubectl -n kyverno <span class="nb">set</span> env deploy/kyverno-reports-controller <span class="se">\</span>
+  --containers<span class="o">=</span>controller <span class="nv">KYVERNO_EXPERIMENTAL</span><span class="o">=</span> --overwrite   <span class="c1"># no-op env poke to restart</span>
+<span class="c1"># or set the flag directly:</span>
+kubectl -n kyverno patch deploy kyverno-reports-controller --type<span class="o">=</span>json -p<span class="o">=</span><span class="s1">&#39;[</span>
+<span class="s1">  {&quot;op&quot;:&quot;add&quot;,&quot;path&quot;:&quot;/spec/template/spec/containers/0/args/-&quot;,&quot;value&quot;:&quot;--backgroundScanInterval=1m&quot;}</span>
+<span class="s1">]&#39;</span>
+</code></pre></div>
+
+<h3 id="lab-3--a-generatingpolicy-and-the-deletion-trap">Lab 3 — a GeneratingPolicy, and the deletion trap<a class="anchor" href="#lab-3--a-generatingpolicy-and-the-deletion-trap">#</a></h3>
+<p>Apply the <code>cell-namespace-baseline</code> policy from above, then:</p>
+<div class="codehilite"><pre><span></span><code>kubectl create ns tenant-a
+kubectl -n tenant-a get networkpolicy,limitrange     <span class="c1"># generated asynchronously</span>
+
+<span class="c1"># Prove synchronization: tamper with the downstream, watch it revert.</span>
+kubectl -n tenant-a delete networkpolicy default-deny-ingress
+sleep <span class="m">5</span> <span class="o">&amp;&amp;</span> kubectl -n tenant-a get networkpolicy      <span class="c1"># recreated</span>
+
+kubectl -n tenant-a patch networkpolicy default-deny-ingress --type<span class="o">=</span>json <span class="se">\</span>
+  -p<span class="o">=</span><span class="s1">&#39;[{&quot;op&quot;:&quot;add&quot;,&quot;path&quot;:&quot;/spec/policyTypes/-&quot;,&quot;value&quot;:&quot;Egress&quot;}]&#39;</span>
+sleep <span class="m">5</span> <span class="o">&amp;&amp;</span> kubectl -n tenant-a get networkpolicy default-deny-ingress -o yaml   <span class="c1"># reverted</span>
+</code></pre></div>
+
+<p><strong>Now the trap.</strong> With <code>orphanDownstreamOnPolicyDelete.enabled: false</code> (the default):</p>
+<div class="codehilite"><pre><span></span><code>kubectl create ns tenant-b <span class="o">&amp;&amp;</span> sleep <span class="m">5</span>
+kubectl delete generatingpolicy cell-namespace-baseline
+sleep <span class="m">10</span>
+kubectl -n tenant-a get networkpolicy    <span class="c1"># GONE. Same for tenant-b.</span>
+</code></pre></div>
+
+<p>Every generated resource across every namespace is deleted. Re-apply with <code>orphanDownstreamOnPolicyDelete.enabled: true</code> and repeat to see the safe behavior. Do this once on kind so you never do it in production.</p>
+<p>Also try <code>generateExisting.enabled: true</code> on a cluster that already has ten namespaces and watch the one-time backfill.</p>
+<h3 id="lab-4--break-the-cluster-on-purpose">Lab 4 — break the cluster on purpose<a class="anchor" href="#lab-4--break-the-cluster-on-purpose">#</a></h3>
+<p>This is the most valuable twenty minutes in the guide.</p>
+<div class="codehilite"><pre><span></span><code>cat <span class="s">&lt;&lt;&#39;EOF&#39; | kubectl apply -f -</span>
+<span class="s">apiVersion: policies.kyverno.io/v1</span>
+<span class="s">kind: ValidatingPolicy</span>
+<span class="s">metadata:</span>
+<span class="s">  name: danger-wildcard</span>
+<span class="s">spec:</span>
+<span class="s">  validationActions: [Deny]</span>
+<span class="s">  failurePolicy: Fail</span>
+<span class="s">  matchConstraints:</span>
+<span class="s">    resourceRules:</span>
+<span class="s">      - apiGroups: [&quot;*&quot;]</span>
+<span class="s">        apiVersions: [&quot;*&quot;]</span>
+<span class="s">        operations: [&quot;CREATE&quot;, &quot;UPDATE&quot;]</span>
+<span class="s">        resources: [&quot;*&quot;]</span>
+<span class="s">  validations:</span>
+<span class="s">    - expression: &quot;true&quot;</span>
+<span class="s">      message: &quot;never fires&quot;</span>
+<span class="s">EOF</span>
+
+<span class="c1"># Look at what you just did to the webhook configuration.</span>
+kubectl get validatingwebhookconfiguration kyverno-resource-validating-webhook-cfg <span class="se">\</span>
+  -o <span class="nv">jsonpath</span><span class="o">=</span><span class="s1">&#39;{.webhooks[*].rules}&#39;</span> <span class="p">|</span> jq .
+
+<span class="c1"># Now take Kyverno down.</span>
+kubectl -n kyverno scale deploy kyverno-admission-controller --replicas<span class="o">=</span><span class="m">0</span>
+
+<span class="c1"># And try to do anything.</span>
+kubectl create ns should-fail
+kubectl -n default run <span class="nb">test</span> --image<span class="o">=</span>nginx
+</code></pre></div>
+
+<p>Observe: the cluster is effectively read-only for most namespaces, <strong>except</strong> <code>kube-system</code> and <code>kyverno</code>, which are excluded by default. Then recover the two ways:</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># Recovery A -- restore the service.</span>
+kubectl -n kyverno scale deploy kyverno-admission-controller --replicas<span class="o">=</span><span class="m">3</span>
+
+<span class="c1"># Recovery B -- break glass. Know this command before you need it.</span>
+kubectl delete validatingwebhookconfiguration kyverno-resource-validating-webhook-cfg
+</code></pre></div>
+
+<p>Repeat with <code>failurePolicy: Ignore</code> and confirm nothing breaks. This single experiment teaches the entire operational risk model.</p>
+<p>Clean up before moving on, or every later lab pays the wildcard webhook's latency on every single API write:</p>
+<div class="codehilite"><pre><span></span><code>kubectl delete validatingpolicy danger-wildcard
+</code></pre></div>
+
+<h3 id="lab-5--imagevalidatingpolicy-against-a-real-signature">Lab 5 — ImageValidatingPolicy against a real signature<a class="anchor" href="#lab-5--imagevalidatingpolicy-against-a-real-signature">#</a></h3>
+<div class="codehilite"><pre><span></span><code><span class="c1"># Kyverno&#39;s own images are cosign-signed with a published public key.</span>
+cat <span class="s">&lt;&lt;&#39;EOF&#39; | kubectl apply -f -</span>
+<span class="s">apiVersion: policies.kyverno.io/v1</span>
+<span class="s">kind: ImageValidatingPolicy</span>
+<span class="s">metadata:</span>
+<span class="s">  name: verify-kyverno-images</span>
+<span class="s">spec:</span>
+<span class="s">  validationActions: [Deny]</span>
+<span class="s">  webhookConfiguration:</span>
+<span class="s">    timeoutSeconds: 20</span>
+<span class="s">  evaluation:</span>
+<span class="s">    background:</span>
+<span class="s">      enabled: false</span>
+<span class="s">  matchConstraints:</span>
+<span class="s">    resourceRules:</span>
+<span class="s">      - apiGroups: [&quot;&quot;]</span>
+<span class="s">        apiVersions: [&quot;v1&quot;]</span>
+<span class="s">        operations: [&quot;CREATE&quot;, &quot;UPDATE&quot;]</span>
+<span class="s">        resources: [&quot;pods&quot;]</span>
+<span class="s">  matchImageReferences:</span>
+<span class="s">    - glob: &quot;ghcr.io/kyverno/*&quot;</span>
+<span class="s">    # Included so the lab has a guaranteed-unsigned counterexample below.</span>
+<span class="s">    - glob: &quot;docker.io/*&quot;</span>
+<span class="s">  attestors:</span>
+<span class="s">    - name: cosign</span>
+<span class="s">      cosign:</span>
+<span class="s">        keyless:</span>
+<span class="s">          identities:</span>
+<span class="s">            - issuer: &quot;https://token.actions.githubusercontent.com&quot;</span>
+<span class="s">              subjectRegExp: &quot;.*github\\.com/kyverno/.*&quot;</span>
+<span class="s">  validations:</span>
+<span class="s">    - expression: &gt;-</span>
+<span class="s">        images.containers.map(image,</span>
+<span class="s">          verifyImageSignatures(image, [attestors.cosign])).all(e, e &gt; 0)</span>
+<span class="s">      message: &quot;image signature verification failed&quot;</span>
+<span class="s">EOF</span>
+
+kubectl run signed   --image<span class="o">=</span>ghcr.io/kyverno/kyverno:v1.19.0   <span class="c1"># should pass</span>
+kubectl run unsigned --image<span class="o">=</span>nginx:1.27                        <span class="c1"># expect failure: no</span>
+                                                               <span class="c1"># cosign signature from</span>
+                                                               <span class="c1"># the kyverno GH identity</span>
+</code></pre></div>
+
+<p>Time the admission latency with <code>kubectl --v=6</code> and compare against a plain <code>ValidatingPolicy</code>. The registry round-trip is real and it is the reason <code>timeoutSeconds</code> matters here.</p>
+<h3 id="lab-6--vap-autogen">Lab 6 — VAP autogen<a class="anchor" href="#lab-6--vap-autogen">#</a></h3>
+<p>Add <code>autogen.validatingAdmissionPolicy.enabled: true</code> to the Lab 1 policy, then:</p>
+<div class="codehilite"><pre><span></span><code>kubectl get validatingadmissionpolicy
+kubectl get validatingadmissionpolicybinding
+kubectl get validatingadmissionpolicy &lt;generated-name&gt; -o yaml
+</code></pre></div>
+
+<p>Scale the Kyverno admission controller to zero and confirm the generated VAP <strong>still enforces</strong>, because the API server evaluates it in-process. That is the resilience argument in one command. Then add <code>autogen.podControllers</code> alongside it and confirm the VAP is <em>not</em> generated and the policy status explains why.</p>
+<p>Teardown: <code>kind delete cluster --name kyverno-lab</code>.</p>
+<hr />
+<h2 id="production-gotchas">Production gotchas<a class="anchor" href="#production-gotchas">#</a></h2>
+<ol>
+<li>
+<p><strong>The API you learned from the internet is being removed.</strong> <code>ClusterPolicy</code>, <code>Policy</code>, <code>CleanupPolicy</code>, and the legacy <code>kyverno.io</code> <code>PolicyException</code> are <strong>deprecated in v1.19 and removed in v1.20</strong> (<a href="https://kyverno.io/docs/guides/migration-to-cel/">Migrating to CEL Policies</a>). With a ~3-month minor cadence, v1.20 is close. Any policy you write today in <code>kyverno.io/v1</code> is technical debt with a known due date. Write CEL.</p>
+</li>
+<li>
+<p><strong><code>kyverno migrate</code> will not migrate your policies.</strong> It migrates CRD <em>stored versions</em> (<a href="https://kyverno.io/docs/kyverno-cli/reference/kyverno_migrate/">kyverno migrate</a>). The ClusterPolicy → CEL conversion is manual. Budget real engineering time, especially for <code>validate.podSecurity</code>, which has <strong>no CEL equivalent</strong> and must be rewritten as ~16 individual <code>ValidatingPolicy</code> expressions.</p>
+</li>
+<li>
+<p><strong>A single wildcard policy turns Kyverno into a whole-cluster proxy.</strong> <em>"Only a single, simple policy written in such a manner and installed in a large cluster can and will have significant impact"</em> (<a href="https://kyverno.io/docs/installation/scaling/">Scaling Kyverno</a>). Ban <code>resources: ["*"]</code> and <code>apiGroups: ["*"]</code> in review, and add a <code>kyverno test</code> fixture that asserts your own policy set does not produce a wildcard webhook rule.</p>
+</li>
+<li>
+<p><strong>Kyverno is fail-closed by default, and that is a deliberate footgun.</strong> (<a href="https://kyverno.io/docs/guides/security/">Security</a>) Choose <code>failurePolicy</code> per policy, not globally. Anything that could block cell bootstrap should be <code>Ignore</code> with the invariant backed by a background scan and an alert.</p>
+</li>
+<li>
+<p><strong><code>orphanDownstreamOnPolicyDelete</code> defaults to <code>false</code>.</strong> Deleting a <code>GeneratingPolicy</code> with sync enabled <strong>deletes every resource it ever generated</strong>, fleet-wide (<a href="https://kyverno.io/docs/policy-types/generating-policy/">GeneratingPolicy — synchronization</a>). Set it to <code>true</code> on every generating policy unless you have explicitly reasoned otherwise. Lab 3 reproduces this in under a minute; do it once.</p>
+</li>
+<li>
+<p><strong>Generation is asynchronous, so there is always a window.</strong> A namespace exists before its default-deny NetworkPolicy does. If the security posture depends on that object, pair the <code>GeneratingPolicy</code> with a <code>ValidatingPolicy</code> that rejects workloads in namespaces lacking it.</p>
+</li>
+<li>
+<p><strong>Mutate-existing needs RBAC you do not have by default.</strong> <em>"Custom permissions are almost always required. Because these mutations occur on existing resources and not during an AdmissionReview, Kyverno may need additional permissions which it does not have by default"</em> (<a href="https://kyverno.io/docs/policy-types/mutating-policy/">MutatingPolicy</a>). Kyverno checks at install time, so the failure is loud — but it means the policy silently does nothing until you grant the aggregated ClusterRole. Same applies to <code>DeletingPolicy</code> and the cleanup controller.</p>
+</li>
+<li>
+<p><strong>Mutation order across policies is not deterministic.</strong> Within one <code>MutatingPolicy</code>, mutations run top to bottom; across policies, <em>"their execution order is not deterministic"</em> (<a href="https://kyverno.io/docs/policy-types/mutating-policy/">MutatingPolicy — mutate ordering</a>). If mutation B depends on mutation A, they must be in the same policy. <code>reinvocationPolicy: IfNeeded</code> helps with interactions but does not give you ordering.</p>
+</li>
+<li>
+<p><strong>Only the admission controller scales horizontally.</strong> Reports and background are leader-elected: extra replicas buy availability, not throughput (<a href="https://kyverno.io/docs/guides/high-availability/">High Availability</a>). Slow generate rules are fixed with <code>--genWorkers</code> and CPU, not replicas. Minimum for admission HA is <strong>3</strong>.</p>
+</li>
+<li>
+<p><strong>Do not set CPU limits on Kyverno.</strong> The scaling guide recommends this explicitly. Throttling the admission controller turns a 50 ms policy into a webhook timeout, which — fail-closed — becomes a rejected API request.</p>
+</li>
+<li>
+<p><strong><code>resourceFilters</code> does not apply to background scans.</strong> <code>--skipResourceFilters</code> defaults to <code>true</code>, so <em>"anything defined in the resourceFilters will not be excluded in background reports"</em> (<a href="https://kyverno.io/docs/installation/customization/">Configuring Kyverno</a>). Excluded namespaces still show up in <code>PolicyReport</code>s. Filter at query time, or flip the flag.</p>
+</li>
+<li>
+<p><strong><code>excludeGroups</code> gives <code>system:nodes</code> a policy bypass by default.</strong> Default is <code>system:serviceaccounts:kube-system,system:nodes</code> (<a href="https://kyverno.io/docs/installation/customization/">Configuring Kyverno</a>). Necessary to keep the kubelet unblocked; also a real bypass path. Know it, and do not rely on Kyverno as your only defense against node-level compromise.</p>
+</li>
+<li>
+<p><strong><code>--autoUpdateWebhooks=false</code> is worse than it sounds.</strong> It makes Kyverno create default webhook configurations matching <strong>all resources</strong>, and the ConfigMap webhook settings are ignored (<a href="https://kyverno.io/docs/installation/customization/">Configuring Kyverno</a>). Leave it <code>true</code>.</p>
+</li>
+<li>
+<p><strong>PSA blocks before Kyverno sees anything.</strong> <em>"Pods which are blocked by PSA in enforce mode do not result in an AdmissionReview request being sent to admission controllers"</em> (<a href="https://kyverno.io/docs/policy-types/cluster-policy/validate/">ClusterPolicy — PSA interoperability</a>). If both are enforcing, your Kyverno reports will have a blind spot exactly where PSA is strictest.</p>
+</li>
+<li>
+<p><strong><code>result: error</code> in a report means a broken policy, not a failing resource.</strong> It signals variable substitution failure outside preconditions (<a href="https://kyverno.io/docs/guides/reports/">Policy Reports</a>). Alert on <code>error</code> separately from <code>fail</code>, and treat it as a page-worthy platform bug.</p>
+</li>
+<li>
+<p><strong><code>extractPayload()</code> errors without prior verification.</strong> It requires a preceding <code>verifyAttestationSignatures()</code> call (<a href="https://kyverno.io/docs/policy-types/image-validating-policy/">ImageValidatingPolicy</a>). And attestation names with hyphens need bracket access (<code>attestations["my-attes"]</code>) — prefer camelCase.</p>
+</li>
+<li>
+<p><strong>Image verification puts a registry round-trip in the admission path.</strong> Raise <code>webhookConfiguration.timeoutSeconds</code> (max 30) and think twice before enabling <code>background</code> for <code>ImageValidatingPolicy</code>, or every scan re-hits the registry. <code>credentials.secrets</code> must live in the <strong>Kyverno namespace</strong>, not the workload's.</p>
+</li>
+<li>
+<p><strong>HTTP calls from policies are a real attack surface and were CVE-worthy.</strong> Loopback and metadata addresses are blocked by default, and namespaced-policy HTTP calls are off by default since 1.18 (<a href="https://github.com/advisories/GHSA-rggm-jjmc-3394">CVE-2026-4789</a>, <a href="https://github.com/kyverno/kyverno/security/advisories/GHSA-f9g8-6ppc-pqq4">CVE-2026-41323</a>). If you enable them, treat the allowlist as a security control with a review process.</p>
+</li>
+<li>
+<p><strong>Support is only ~3 months.</strong> "main + 1" since v1.18 (<a href="https://kyverno.io/blog/2026/04/24/announcing-kyverno-release-1.18/">Announcing 1.18</a>). Across a fleet of cells that means Kyverno needs its own continuous upgrade pipeline, and <code>kyverno test</code> with the next version's CLI pinned is the cheapest dry-run you will ever get.</p>
+</li>
+<li>
+<p><strong>Kubernetes support is a narrow window: v1.33–v1.35 for v1.19</strong> (<a href="https://kyverno.io/docs/installation/releases/">Releases</a>). Cell Kubernetes upgrades and Kyverno upgrades are coupled and must be sequenced together, exactly like Karpenter.</p>
+</li>
+<li>
+<p><strong>Thousands of policy objects can take out the API server.</strong> <em>"If you create several thousand Kyverno policy resources, double check that the kube-apiserver pods have head room to increase its memory allocations, otherwise the cluster may crash entirely"</em> (<a href="https://kyverno.io/docs/installation/scaling/">Scaling Kyverno</a>). Namespaced policy types make it easy for tenants to create a lot of objects; quota them.</p>
+</li>
+<li>
+<p><strong>Autogen modes are mutually exclusive.</strong> Setting <code>spec.autogen.podControllers</code> silently disables <code>validatingAdmissionPolicy</code>/<code>mutatingAdmissionPolicy</code> generation, with the reason reported only in the policy status (<a href="https://kyverno.io/docs/policy-types/validating-policy/">ValidatingPolicy — autogen</a>). If you enabled VAP generation for resilience and later added pod-controller autogen, you lost the resilience without an error.</p>
+</li>
+</ol>
+<hr />
+<h2 id="how-this-shows-up-in-cell-lifecycle">How this shows up in cell lifecycle<a class="anchor" href="#how-this-shows-up-in-cell-lifecycle">#</a></h2>
+<p><strong>Cell bootstrap ordering.</strong> Kyverno's install position is a real design decision. It must land after the CNI and CoreDNS (it needs networking and DNS), after cert-manager if you use it for webhook certs, and before any tenant namespace exists — because generating policies only fire on namespace creation unless you enable <code>generateExisting</code>. A pragmatic order: cluster → CNI → CoreDNS → Karpenter → Kyverno (with generating policies) → platform namespaces → tenant namespaces. Because Kyverno registers no webhook rules until policies exist, installing the controller early and the <em>policies</em> late is a safe way to decouple these. That ordering is the L4–L8 slice of the full cell dependency DAG in <a href="12-cell-lifecycle-synthesis.html#the-dependency-dag-of-bringing-up-a-cell">12-cell-lifecycle-synthesis.md</a>.</p>
+<p><strong>Kyverno as the cell's namespace-provisioning API.</strong> This is the highest-leverage use. Rather than a bespoke controller that watches namespaces and creates baseline objects, a <code>GeneratingPolicy</code> with <code>synchronize</code> and <code>generateExisting</code> <em>is</em> that controller, declaratively, with drift correction built in. Changing the baseline is a one-file change that reconciles across every namespace in every cell. Two conditions make it safe: <code>orphanDownstreamOnPolicyDelete: true</code>, and the fan-out limitation (templates cannot target a runtime-computed namespace set) understood up front.</p>
+<p><strong>Kyverno as the guard on the other guides' invariants.</strong> Almost every gotcha in the <a href="06-karpenter.html#production-gotchas">Karpenter guide</a> is expressible as a Kyverno policy, which is the honest argument for running it at all:</p>
+<table>
+<thead>
+<tr>
+<th>Karpenter risk</th>
+<th>Kyverno policy</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>expireAfter</code> + <code>do-not-disrupt</code> deadlock</td>
+<td>Deny NodePools lacking <code>terminationGracePeriod</code></td>
+</tr>
+<tr>
+<td><code>alias: al2023@latest</code> rolls the fleet</td>
+<td>Deny EC2NodeClass with a floating alias</td>
+</tr>
+<tr>
+<td>Default 10% budget on a 200-node cell</td>
+<td>Deny NodePools without explicit <code>disruption.budgets</code></td>
+</tr>
+<tr>
+<td><code>maxUnavailable: 0</code> PDB immortalizes nodes</td>
+<td>Deny such PDBs outside an allowlist</td>
+</tr>
+<tr>
+<td>Labels consuming the 100-requirement ceiling</td>
+<td>Validate label count on NodePool templates</td>
+</tr>
+</tbody>
+</table>
+<p>Each is ten lines of CEL and a test fixture, and each converts a tribal-knowledge incident into a compile-time error.</p>
+<p><strong>Cell upgrade.</strong> Kyverno is a coupled upgrade with two constraints: the Kubernetes support window (v1.33–v1.35 for v1.19) and the 3-month patch window. The mitigation is unusually cheap here: pin the CLI to the <em>target</em> version in CI and run <code>kyverno test</code> against your whole policy set. If the tests pass, the policy set is compatible. Do that before touching a cell.</p>
+<p><strong>Cell teardown.</strong> Two failure modes. First, generating policies with sync will <em>fight</em> your teardown if you delete namespaces before deleting the policies — Kyverno may recreate objects in a terminating namespace. Delete generating policies (with orphan enabled, or accept the cascade) before namespaces. Second, the webhook configurations are cluster-scoped and outlive a <code>helm uninstall</code> of the workload if the uninstall path is not clean; a fail-closed orphaned webhook pointed at a service that no longer exists is the classic bricked cluster. <code>kubectl get validatingwebhookconfiguration,mutatingwebhookconfiguration | grep kyverno</code> belongs in your teardown verification.</p>
+<p><strong>Multi-cloud.</strong> Kyverno is one of the few pieces of this stack that is genuinely cloud-agnostic — it is pure Kubernetes and behaves identically on EKS, GKE, and AKS. Two caveats worth checking in <a href="https://kyverno.io/docs/installation/platform-notes/">Platform Notes</a>: private GKE clusters require a firewall rule for the control plane to reach the webhook port, and some managed offerings have their own admission controllers that interact with yours.</p>
+<p><strong>Helm-for-templating-only.</strong> Kyverno's chart renders cleanly with <code>helm template</code>. CRDs are the usual caveat — render them into the manifest set explicitly rather than relying on Helm's CRD hook. This is the same discipline as the Karpenter CRDs, and the same pipeline stage can handle both.</p>
+<hr />
+<h2 id="learning-path">Learning path<a class="anchor" href="#learning-path">#</a></h2>
+<p><strong>Day 1 — get the current API in your head, and only the current API.</strong></p>
+<ul>
+<li>Read <a href="https://kyverno.io/docs/policy-types/">Policy Types — Overview</a> and <a href="https://kyverno.io/docs/policy-types/validating-policy/">ValidatingPolicy</a> end to end. Ignore everything under "ClusterPolicy Deprecated" for now.</li>
+<li>Read <a href="https://kyverno.io/docs/guides/migration-to-cel/">Migrating to CEL Policies</a> — even with no policies to migrate, its field-mapping table is the fastest way to recognize stale examples.</li>
+<li>Run Lab 0 and Lab 1. Get a policy passing offline in <code>kyverno apply</code> before you ever apply it to a cluster.</li>
+</ul>
+<p><strong>Week 1 — build the operational instincts.</strong></p>
+<ul>
+<li>Run Labs 2, 3, and <strong>4</strong>. Lab 4 (breaking the cluster with a fail-closed wildcard policy, then break-glass recovery) is the highest-value exercise here; do not skip it.</li>
+<li>Read <a href="https://kyverno.io/docs/guides/high-availability/">High Availability</a> and <a href="https://kyverno.io/docs/guides/security/">Security</a>. Write the seven webhook-configuration names into the cell runbook.</li>
+<li>Read <a href="https://kyverno.io/docs/installation/customization/">Configuring Kyverno</a> with your finger on the <code>webhooks</code>, <code>resourceFilters</code>, and <code>excludeGroups</code> keys. Know what is excluded by default and why.</li>
+<li>Read <a href="https://kyverno.io/docs/installation/scaling/">Scaling Kyverno</a> and internalize the wildcard warning.</li>
+<li>Wire <code>kyverno test</code> into a real CI pipeline with JUnit output. Watch it fail on a bad PR.</li>
+<li>Write and ship Stage 1 of the starter set (the four generating policies) to a kind cluster, with tests.</li>
+</ul>
+<p><strong>Month 1 — own it.</strong></p>
+<ul>
+<li>Write and ship Stage 2, following the full audit → report → enforce path on one real cell, and document the promotion criteria.</li>
+<li>Read <a href="https://kyverno.io/docs/policy-types/generating-policy/">GeneratingPolicy</a> and <a href="https://kyverno.io/docs/policy-types/mutating-policy/">MutatingPolicy</a> completely, including the synchronization and evaluation-order tables. These are the two with the most surprising semantics.</li>
+<li>Run Lab 5 and Lab 6, and make a real call on VAP autogen: does your platform want in-process enforcement for the security-critical policies?</li>
+<li>Plan the <code>validate.podSecurity</code> migration explicitly, since there is no CEL equivalent today. Decide between hand-written CEL and native PSA, and re-verify the docs at decision time.</li>
+<li>Read <a href="https://kyverno.io/docs/guides/exceptions/">Policy Exceptions</a> and design the exception workflow <em>before</em> you turn anything to <code>Deny</code> — who can create one, does it expire, is it reviewed. <code>kyverno apply --generate-exceptions --generated-exception-ttl</code> is a good migration primitive.</li>
+<li>Evaluate <a href="https://kyverno.io/docs/subprojects/chainsaw/">Chainsaw</a> for end-to-end tests against a real cell, and <a href="https://kyverno.io/docs/subprojects/policy-reporter/">Policy Reporter</a> for a fleet-wide reports UI.</li>
+<li>Read the <a href="https://kyverno.io/docs/guides/gatekeeper/">Gatekeeper Migration Guide</a> and <a href="https://kyverno.io/docs/guides/evaluating-policy-engines/">Evaluating Policy Engines</a> so you can defend the tool choice in a design review.</li>
+</ul>
+<hr />
+<h2 id="references">References<a class="anchor" href="#references">#</a></h2>
+<ol>
+<li><a href="https://kyverno.io/docs/introduction/">Kyverno Documentation (v1.19)</a> — the canonical source; use the version selector in the header and never trust a version-less search result.</li>
+<li><a href="https://kyverno.io/docs/policy-types/">Kyverno — Policy Types overview</a> — the map of the new CEL policy family and when each type was introduced.</li>
+<li><a href="https://kyverno.io/docs/policy-types/validating-policy/">Kyverno — ValidatingPolicy</a> — full spec, VAP comparison table, <code>autogen</code>, <code>evaluation</code>, JSON payloads, <code>messageExpression</code>, <code>auditAnnotations</code>.</li>
+<li><a href="https://kyverno.io/docs/policy-types/mutating-policy/">Kyverno — MutatingPolicy</a> — <code>ApplyConfiguration</code> vs <code>JSONPatch</code>, mutate-existing, target resolution phases, <code>reinvocationPolicy</code>, ordering caveats.</li>
+<li><a href="https://kyverno.io/docs/policy-types/generating-policy/">Kyverno — GeneratingPolicy</a> — data vs clone source, YAML templates and placeholder semantics, synchronization tables, <code>generateExisting</code>, <code>orphanDownstreamOnPolicyDelete</code>.</li>
+<li><a href="https://kyverno.io/docs/policy-types/deleting-policy/">Kyverno — DeletingPolicy</a> — schedules, <code>deletionPropagationPolicy</code>, <code>matchPolicy</code>, RBAC requirements.</li>
+<li><a href="https://kyverno.io/docs/policy-types/image-validating-policy/">Kyverno — ImageValidatingPolicy</a> — cosign/Notary attestors, keyless identities, attestations, <code>validationConfigurations</code>, registry credentials.</li>
+<li><a href="https://kyverno.io/docs/policy-types/cleanup-policy/">Kyverno — Cleanup Policy (deprecated)</a> — the deprecation notice and the <code>cleanup.kyverno.io/ttl</code> label mechanism.</li>
+<li><a href="https://kyverno.io/docs/policy-types/cel-libraries/">Kyverno — CEL Libraries</a> — the 14 libraries Kyverno adds on top of Kubernetes CEL, with function names.</li>
+<li><a href="https://kyverno.io/docs/guides/migration-to-cel/">Kyverno — Migrating to CEL Policies</a> — the deprecation notice, the complete legacy→CEL field mapping, and the list of unsupported features (<code>validate.podSecurity</code>, <code>validate.manifests</code>).</li>
+<li><a href="https://kyverno.io/docs/installation/releases/">Kyverno — Releases</a> — current version, Kubernetes support window, the "main + 1" patch policy, release cadence.</li>
+<li><a href="https://kyverno.io/docs/installation/installation/">Kyverno — Installation</a> — Helm install including the HA section.</li>
+<li><a href="https://kyverno.io/docs/installation/customization/">Kyverno — Configuring Kyverno</a> — the 13 ConfigMap keys with defaults, every container flag, webhook management, namespace selectors, resource filters.</li>
+<li><a href="https://kyverno.io/docs/installation/scaling/">Kyverno — Scaling Kyverno</a> — sizing guidance, the wildcard-policy warning, published CEL benchmarks, the API-server memory warning.</li>
+<li><a href="https://kyverno.io/docs/guides/high-availability/">Kyverno — High Availability</a> — the four controllers, which use leader election, and what replicas actually buy you.</li>
+<li><a href="https://kyverno.io/docs/guides/security/">Kyverno — Security</a> — fail-closed default, the seven webhook configuration names, ports, threat model and mitigations.</li>
+<li><a href="https://kyverno.io/docs/guides/reports/">Kyverno — Policy Reports</a> — <code>wgpolicyk8s.io/v1alpha2</code>, intermediary report kinds, result values, the Audit/Enforce reporting matrix, OpenReports.</li>
+<li><a href="https://kyverno.io/docs/guides/exceptions/">Kyverno — Policy Exceptions</a> — scoped bypasses, including the CEL-policy form.</li>
+<li><a href="https://kyverno.io/docs/guides/testing-policies/">Kyverno — Testing Policies</a> — the two CI use cases and a working GitHub Actions workflow.</li>
+<li><a href="https://kyverno.io/docs/guides/applying-policies/">Kyverno — Applying Policies</a> — how policies are evaluated in-cluster and via CLI.</li>
+<li><a href="https://kyverno.io/docs/guides/pod-security/">Kyverno — Pod Security Standards</a> — the curated PSS policy set and how to install it (short page; the real content is in reference 22).</li>
+<li><a href="https://kyverno.io/docs/policy-types/cluster-policy/validate/">Kyverno — ClusterPolicy validate rules</a> — the <code>validate.podSecurity</code> subrule, its advantages over PSA, and the critical PSA interoperability note. Legacy API, still the only PSS documentation.</li>
+<li><a href="https://kyverno.io/docs/guides/admission-controllers/">Kyverno — Kubernetes Admission Controllers</a> — admission fundamentals in Kyverno's own words.</li>
+<li><a href="https://kyverno.io/docs/guides/monitoring/">Kyverno — Monitoring</a> and <a href="https://kyverno.io/docs/reference/metrics/">Metrics reference</a> — including <code>kyverno_admission_review_duration_seconds</code>.</li>
+<li><a href="https://kyverno.io/docs/guides/troubleshooting/">Kyverno — Troubleshooting</a> — symptom-indexed debugging.</li>
+<li><a href="https://kyverno.io/docs/installation/platform-notes/">Kyverno — Platform Notes</a> — per-provider caveats (private GKE firewall rules, managed admission interactions).</li>
+<li><a href="https://kyverno.io/docs/guides/evaluating-policy-engines/">Kyverno — Evaluating Policy Engines</a> — Kyverno's own comparison framing; read critically, it is not neutral.</li>
+<li><a href="https://kyverno.io/docs/guides/gatekeeper/">Kyverno — Gatekeeper Migration Guide</a> — concept-by-concept mapping from Rego/Constraints to Kyverno.</li>
+<li><a href="https://kyverno.io/docs/kyverno-cli/reference/kyverno_apply/">Kyverno CLI — <code>kyverno apply</code></a> — every flag, including <code>--generate-exceptions</code> and <code>--cluster</code>.</li>
+<li><a href="https://kyverno.io/docs/kyverno-cli/reference/kyverno_test/">Kyverno CLI — <code>kyverno test</code></a> — test invocation, output formats, and the test-case selector.</li>
+<li><a href="https://kyverno.io/docs/kyverno-cli/reference/kyverno_create_test/">Kyverno CLI — <code>kyverno create test</code></a> — scaffolds a <code>kyverno-test.yaml</code>; the closest thing to schema documentation.</li>
+<li><a href="https://kyverno.io/docs/kyverno-cli/reference/kyverno_migrate/">Kyverno CLI — <code>kyverno migrate</code></a> — proof that this is a stored-version tool, not a policy converter.</li>
+<li><a href="https://kyverno.io/docs/subprojects/kyverno-cli/">Kyverno CLI subproject</a> — install methods and overall CLI docs.</li>
+<li><a href="https://kyverno.io/blog/2026/04/24/announcing-kyverno-release-1.18/">Announcing Kyverno 1.18</a> — the "main + 1" support change, HTTP hardening, CLI expansion, and the ClusterPolicy deprecation reminder.</li>
+<li><a href="https://kyverno.io/blog/2026/02/02/announcing-kyverno-release-1.17/">Announcing Kyverno 1.17</a> — CEL policy engine stabilization.</li>
+<li><a href="https://github.com/kyverno/kyverno/releases">kyverno/kyverno releases</a> — authoritative version list and per-release notes.</li>
+<li><a href="https://github.com/kyverno/policies">kyverno/policies</a> — hundreds of production sample policies with working <code>kyverno test</code> fixtures. Best starting point for a policy library.</li>
+<li><a href="https://www.cncf.io/announcements/2026/03/24/cloud-native-computing-foundation-announces-kyvernos-graduation/">CNCF — Kyverno graduation announcement</a> — March 2026 graduation.</li>
+<li><a href="https://github.com/advisories/GHSA-rggm-jjmc-3394">CVE-2026-4789 advisory</a> — SSRF via HTTP CEL calls; the reason for the 1.18 allowlist/blocklist.</li>
+<li><a href="https://github.com/kyverno/kyverno/security/advisories/GHSA-f9g8-6ppc-pqq4">CVE-2026-41323 advisory</a> — token impersonation via HTTP calls; the reason for scoped tokens.</li>
+<li><a href="https://kubernetes.io/docs/reference/access-authn-authz/validating-admission-policy/">Kubernetes — Validating Admission Policy</a> — the built-in CEL alternative, GA since Kubernetes 1.30.</li>
+<li><a href="https://kubernetes.io/docs/reference/access-authn-authz/mutating-admission-policy/">Kubernetes — Mutating Admission Policy</a> — the newer mutating counterpart; check your control-plane version and feature gates.</li>
+<li><a href="https://kubernetes.io/docs/reference/access-authn-authz/extensible-admission-controllers/">Kubernetes — Dynamic Admission Control</a> — webhook ordering, <code>failurePolicy</code>, timeouts, <code>reinvocationPolicy</code>, and the "avoid deadlocking your cluster" section.</li>
+<li><a href="https://kubernetes.io/docs/concepts/security/pod-security-admission/">Kubernetes — Pod Security Admission</a> — the built-in PSS enforcement Kyverno interoperates with.</li>
+<li><a href="https://open-policy-agent.github.io/gatekeeper/website/docs/">Open Policy Agent Gatekeeper</a> — the Rego-based alternative, for the comparison table.</li>
+<li><a href="https://kyverno.io/docs/subprojects/chainsaw/">Kyverno Chainsaw</a> — end-to-end policy testing against a live cluster, complementing <code>kyverno test</code>.</li>
+<li><a href="https://kyverno.io/docs/subprojects/policy-reporter/">Policy Reporter</a> — UI and alerting over <code>PolicyReport</code> resources; the practical way to consume reports across a fleet.</li>
+<li><a href="https://playground.kyverno.io/">Kyverno Playground</a> — browser-based policy evaluation; fastest way to iterate on a CEL expression.</li>
+</ol><p class="disclaimer"><strong>Disclaimer.</strong> I wrote this library before I joined Temporal, to ramp up on the areas my new role would likely touch. It contains no internal information &mdash; nothing here was sourced from Temporal&rsquo;s internal knowledge. Temporal is open source, so the programming model and server internals come from public code and documentation, and every statement about Temporal Cloud comes from Temporal&rsquo;s public docs and engineering blog, linked inline. Most of the library is general infrastructure technology &mdash; Go, gRPC, Kubernetes, Karpenter, Terraform, Helm, Vault, cert-manager, GitOps, observability &mdash; that has nothing to do with any one company. Where a guide goes beyond public sources, it says so and labels the claim as inference.</p></article><aside class="rail"><div class="rail-label">On this page</div><a href="#the-mental-model">The mental model</a><a href="#core-concepts">Core concepts</a><a class="h3" href="#admission-control-fundamentals-briefly">Admission control fundamentals, briefly</a><a class="h3" href="#kyvernos-model-and-how-it-compares">Kyverno&#x27;s model, and how it compares</a><a class="h3" href="#current-api-version-and-major-version-status">Current API version and major-version status</a><a class="h3" href="#rule-types-with-real-examples">Rule types, with real examples</a><a class="h3" href="#variables-context-and-the-cel-libraries">Variables, context, and the CEL libraries</a><a class="h3" href="#policy-reports-background-scans-and-the-safe-rollout-path">Policy Reports, background scans, and the safe rollout path</a><a class="h3" href="#operational-safety">Operational safety</a><a class="h3" href="#the-kyverno-cli--the-reason-a-platform-team-picks-kyverno">The Kyverno CLI — the reason a platform team picks Kyverno</a><a class="h3" href="#pod-security-standards-and-psa">Pod Security Standards, and PSA</a><a class="h3" href="#a-starter-policy-set-a-platform-team-would-actually-ship">A starter policy set a platform team would actually ship</a><a href="#hands-on">Hands-on</a><a class="h3" href="#lab-0--install">Lab 0 — install</a><a class="h3" href="#lab-1--a-validatingpolicy-offline-first">Lab 1 — a ValidatingPolicy, offline first</a><a class="h3" href="#lab-2--audit--deny-and-read-the-reports">Lab 2 — Audit → Deny, and read the reports</a><a class="h3" href="#lab-3--a-generatingpolicy-and-the-deletion-trap">Lab 3 — a GeneratingPolicy, and the deletion trap</a><a class="h3" href="#lab-4--break-the-cluster-on-purpose">Lab 4 — break the cluster on purpose</a><a class="h3" href="#lab-5--imagevalidatingpolicy-against-a-real-signature">Lab 5 — ImageValidatingPolicy against a real signature</a><a class="h3" href="#lab-6--vap-autogen">Lab 6 — VAP autogen</a><a href="#production-gotchas">Production gotchas</a><a href="#how-this-shows-up-in-cell-lifecycle">How this shows up in cell lifecycle</a><a href="#learning-path">Learning path</a><a href="#references">References</a></aside></div></div><script>
+document.querySelectorAll('.codehilite').forEach(function(block){
+  var wrap=document.createElement('div'); wrap.className='codewrap';
+  block.parentNode.insertBefore(wrap,block); wrap.appendChild(block);
+  var b=document.createElement('button'); b.className='copybtn'; b.textContent='copy';
+  b.addEventListener('click',function(){
+    var txt=block.innerText;
+    if(navigator.clipboard&&navigator.clipboard.writeText){
+      navigator.clipboard.writeText(txt).then(function(){
+        b.textContent='copied'; setTimeout(function(){b.textContent='copy';},1200);
+      }).catch(function(){b.textContent='select manually';});
+    } else {
+      var ta=document.createElement('textarea'); ta.value=txt; document.body.appendChild(ta);
+      ta.select(); try{document.execCommand('copy'); b.textContent='copied';}catch(e){}
+      document.body.removeChild(ta); setTimeout(function(){b.textContent='copy';},1200);
+    }
+  });
+  wrap.appendChild(b);
+});
+
+document.querySelectorAll('.doc table').forEach(function(t){
+  if(t.parentNode.classList.contains('tablewrap'))return;
+  var w=document.createElement('div'); w.className='tablewrap';
+  t.parentNode.insertBefore(w,t); w.appendChild(t);
+});
+
+(function(){
+  var links=Array.prototype.slice.call(document.querySelectorAll('.rail a'));
+  if(!links.length)return;
+  var map={};
+  links.forEach(function(a){
+    var el=document.getElementById(a.getAttribute('href').slice(1));
+    if(el)map[a.getAttribute('href').slice(1)]=a;
+  });
+  var obs=new IntersectionObserver(function(entries){
+    entries.forEach(function(e){
+      var a=map[e.target.id]; if(!a)return;
+      if(e.isIntersecting){
+        links.forEach(function(x){x.classList.remove('here');});
+        a.classList.add('here');
+      }
+    });
+  },{rootMargin:'0px 0px -78% 0px',threshold:0});
+  Object.keys(map).forEach(function(id){
+    var el=document.getElementById(id); if(el)obs.observe(el);
+  });
+})();
+</script>
+<script>/* open external links in a new tab; links within the library stay in this tab */
+document.addEventListener('click',function(e){var a=e.target.closest&&e.target.closest('a[href]');if(!a)return;var h=a.getAttribute('href');if(!h||h.charAt(0)==='#'||h.indexOf('javascript:')===0||a.hasAttribute('download'))return;if(!/^https?:$/.test(a.protocol)||a.host===location.host)return;a.target='_blank';a.rel='noopener';},true);
+</script>
+</body>
+</html>

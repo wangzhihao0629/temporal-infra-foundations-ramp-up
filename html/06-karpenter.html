@@ -1,0 +1,1272 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Karpenter — Node Autoscaling and Node Lifecycle - Temporal Cloud Infrastructure Ramp-Up</title>
+<link rel="stylesheet" href="style.css">
+<script>
+(function(){
+  try{
+    var t=localStorage.getItem('rampup-theme');
+    if(t){document.documentElement.setAttribute('data-theme',t);}
+  }catch(e){}
+  window.__toggleTheme=function(){
+    var el=document.documentElement;
+    var cur=el.getAttribute('data-theme');
+    if(!cur){
+      cur=window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';
+    }
+    var next=cur==='dark'?'light':'dark';
+    el.setAttribute('data-theme',next);
+    try{localStorage.setItem('rampup-theme',next);}catch(e){}
+  };
+})();
+</script>
+
+</head>
+<body>
+<div class="shell"><aside class="sidebar">
+  <div class="brand"><a href="../index.html">
+    <div class="brand-title">Temporal Cloud Infrastructure Ramp-Up</div>
+    <div class="brand-sub">New-role ramp-up &middot; public sources only</div>
+  </a></div>
+  <div class="nav-label">Guides</div>
+  <nav class="nav"><a href="01-golang.html"><span class="num">01</span><span>Go</span></a><a href="02-grpc.html"><span class="num">02</span><span>gRPC &amp; Protobuf</span></a><a href="03-multicloud-aws-gcp-azure.html"><span class="num">03</span><span>Multi-Cloud</span></a><a href="04-managed-kubernetes-eks-gke-aks.html"><span class="num">04</span><span>Managed Kubernetes</span></a><a href="05-cni-and-host-networking.html"><span class="num">05</span><span>CNI &amp; Host Networking</span></a><a href="06-karpenter.html" class="active"><span class="num">06</span><span>Karpenter</span></a><a href="07-kyverno.html"><span class="num">07</span><span>Kyverno</span></a><a href="08-terraform.html"><span class="num">08</span><span>Terraform</span></a><a href="09-helm.html"><span class="num">09</span><span>Helm</span></a><a href="10-vault.html"><span class="num">10</span><span>Vault</span></a><a href="11-cert-manager-and-pki.html"><span class="num">11</span><span>cert-manager &amp; PKI</span></a><a href="12-cell-lifecycle-synthesis.html"><span class="num">12</span><span>Cell Lifecycle</span></a><a href="13-gitops-argocd-flux.html"><span class="num">13</span><span>GitOps</span></a><a href="14-observability-for-cells.html"><span class="num">14</span><span>Observability</span></a><a href="15-temporal-programming-model.html"><span class="num">15</span><span>Temporal: Programming Model</span></a><a href="16-temporal-server-internals.html"><span class="num">16</span><span>Temporal Server Internals</span></a><a href="17-cell-based-architecture.html"><span class="num">17</span><span>Cell-Based Architecture</span></a></nav>
+  <div class="nav-label" style="margin-top:1rem">Practice</div>
+  <nav class="nav"><a href="../drill.html"><span class="num">&#9670;</span><span>Drill deck</span></a></nav>
+</aside><div class="main"><article class="doc"><div class="topbar">
+  <div class="crumbs"><span class="pill">Guide 06</span><span class="pill">40 refs</span><span class="pill">11,338 words</span></div>
+  <div style="display:flex;gap:.5rem;align-items:center">
+    <span>~57 min read</span>
+    <button class="iconbtn" onclick="__toggleTheme()">theme</button>
+  </div>
+</div><h1>Karpenter — Node Autoscaling and Node Lifecycle</h1>
+<div class="lede"><p><strong>Why this matters.</strong> Cell lifecycle work spans AWS, GCP, and Azure — provisioning, upgrading, and tearing down isolated Kubernetes units of Temporal Cloud capacity. Karpenter is the component that decides <em>what machines a cell is made of</em>, and — more dangerously — the component that decides <strong>when to delete a machine that is currently serving traffic</strong>. On a fleet of hundreds of cells running long-lived history hosts, matching engines, and frontends, the interesting Karpenter surface is not "scale up when pods pend." It is disruption: consolidation, drift, expiry, spot interruption, and the budgets and annotations that keep all of that from taking a cell down. Karpenter is also where the multi-cloud story gets uncomfortable, because the three clouds are at three completely different maturity levels.</p></div>
+<p>Everything below was verified against primary sources on <strong>2026-08-29</strong>. Where I could not verify something, I say so.</p>
+<blockquote>
+<p><strong>Stale-content trap, read this first.</strong> A large majority of Karpenter content on the internet — blog posts, Stack Overflow answers, internal wikis, and LLM training data — describes the <strong>v1alpha5</strong> API (<code>Provisioner</code>, <code>AWSNodeTemplate</code>, <code>Machine</code>) or the <strong>v1beta1</strong> API. Both are gone. The v1alpha5 kinds were renamed in v1beta1 (<code>Provisioner</code> → <code>NodePool</code>, <code>Machine</code> → <code>NodeClaim</code>, <code>AWSNodeTemplate</code> → <code>EC2NodeClass</code>) (<a href="https://github.com/aws/karpenter-provider-aws/blob/main/designs/v1beta1-api.md">v1beta1 API design</a>), and <strong>Karpenter 1.1.0 dropped support for the v1beta1 APIs entirely</strong> (<a href="https://karpenter.sh/v1.0/upgrading/v1-migration/">v1 Migration guide</a>). If a snippet you find says <code>apiVersion: karpenter.sh/v1alpha5</code> or <code>v1beta1</code>, or puts <code>kubelet:</code> under the NodePool, it is describing software that is several years and fourteen minor versions out of date. The current stable line is <strong>v1.14.1</strong>, released 2026-08-21 (<a href="https://github.com/kubernetes-sigs/karpenter/releases/tag/v1.14.1">core release</a>, <a href="https://github.com/aws/karpenter-provider-aws/releases/tag/v1.14.1">AWS provider release</a>), and the AWS v1.14.1 release is tagged as a <strong>Long-Term Support release supported until July 2027</strong>.</p>
+</blockquote>
+<hr />
+<h2 id="the-mental-model">The mental model<a class="anchor" href="#the-mental-model">#</a></h2>
+<p>Hold five ideas.</p>
+<p><strong>1. Karpenter is a scheduler that can buy hardware.</strong> Cluster Autoscaler asks "which of my pre-defined node groups, if I made it bigger, would let this pod schedule?" Karpenter asks "what is the cheapest single machine in the cloud's entire catalogue that satisfies the union of these pending pods' requirements?" It runs a real scheduling simulation over the pending pod set, bin-packs them, and then launches an instance shaped to fit. There is no group. There is no <code>desired</code> count to reconcile. The abstraction is one level lower and one level more powerful.</p>
+<p><strong>2. Every node is owned by a NodeClaim, and every NodeClaim is finalizer-protected.</strong> Karpenter sets a finalizer on each Node and NodeClaim it creates. Deleting either cascades to the other, and the finalizer blocks API deletion while the Termination Controller taints, drains, and waits (<a href="https://karpenter.sh/docs/concepts/disruption/">Disruption</a>). This is why <code>kubectl delete node</code> on a Karpenter node behaves <em>correctly</em> (the instance is actually terminated) where on a non-Karpenter node it orphans the VM.</p>
+<p><strong>3. There are two disruption modes and the difference is everything.</strong> <em>Graceful</em> methods (consolidation, drift) pre-spin a replacement, wait for it to be ready, then drain — and they are rate-limited by NodePool disruption budgets. <em>Forceful</em> methods (expiration, interruption, node repair) start draining immediately, do not pre-spin, and <strong>cannot be rate-limited by disruption budgets</strong> (<a href="https://karpenter.sh/docs/concepts/disruption/">Disruption</a>). Almost every "Karpenter took my cell down" incident is a forceful method meeting a workload that assumed graceful.</p>
+<p><strong>4. Configuration drift is a feature, not a bug.</strong> Karpenter hashes the NodePool's <code>NodeClaimTemplateSpec</code> and the NodeClass spec and compares it against each NodeClaim. Change the AMI selector, and every node in the pool is marked <code>Drifted</code> and rolled. This is the mechanism you will use for cell node-image upgrades — and it is also the mechanism that will roll your entire fleet at 3 a.m. if you <code>kubectl apply</code> a NodeClass change without a budget in place.</p>
+<p><strong>5. Karpenter is a core library plus per-cloud providers at wildly different maturity.</strong> <code>kubernetes-sigs/karpenter</code> is a Go <strong>library</strong>, not a binary — the only <code>package main</code> in the repo is the KWOK test provider. AWS is mature and LTS-tagged. Azure is production but on a <code>v1beta1</code> NodeClass and effectively AKS-only. GCP has <strong>no official provider at all</strong>. Plan accordingly.</p>
+<div class="codehilite"><pre><span></span><code>                    pending pods
+                         │
+                         ▼
+   ┌─────────────────────────────────────────────────┐
+   │  Provisioning Controller                        │
+   │  batch (1s idle / 10s max) → simulate schedule  │
+   │  → pick instance types → create NodeClaim(s)    │
+   └─────────────────────────────────────────────────┘
+                         │ CloudProvider.Create()
+                         ▼
+   NodeClaim ──owns──▶ Node ──backed by──▶ EC2 / VMSS / GCE instance
+        ▲                                       │
+        │                                       │
+   ┌────┴────────────────────────────┐     ┌────┴──────────────┐
+   │ Disruption Controller            │     │ Termination Ctrl  │
+   │  1. Drift    (graceful, budgeted)│     │  taint → evict →  │
+   │  2. Consolidation (graceful, bud)│     │  wait volumes →   │
+   │  ---- not budgeted -------------- │     │  terminate → rm   │
+   │  Expiration / Interruption /      │     │  finalizer        │
+   │  Node Repair (forceful)           │     └───────────────────┘
+   └──────────────────────────────────┘
+</code></pre></div>
+
+<hr />
+<h2 id="core-concepts">Core concepts<a class="anchor" href="#core-concepts">#</a></h2>
+<h3 id="why-karpenter-exists-the-cluster-autoscaler-comparison">Why Karpenter exists: the Cluster Autoscaler comparison<a class="anchor" href="#why-karpenter-exists-the-cluster-autoscaler-comparison">#</a></h3>
+<p>Cluster Autoscaler (CA) is a <em>node group</em> autoscaler. It knows about ASGs, MIGs, and VMSSes, it simulates whether adding one node <strong>shaped like the existing nodes in that group</strong> would let a pending pod schedule, and it changes the group's desired count (<a href="https://github.com/kubernetes/autoscaler/blob/master/cluster-autoscaler/FAQ.md">kubernetes/autoscaler FAQ</a>). Every design consequence flows from that.</p>
+<table>
+<thead>
+<tr>
+<th>Dimension</th>
+<th>Cluster Autoscaler</th>
+<th>Karpenter</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Unit of scaling</td>
+<td>Node group (ASG / MIG / VMSS); you pre-create one per shape</td>
+<td>None. Instance type is chosen per launch from the whole catalogue</td>
+</tr>
+<tr>
+<td>Instance-type selection</td>
+<td>You encode it in the group; CA picks <em>a group</em></td>
+<td>Karpenter picks the instance type from a <code>NodePool</code>'s requirements at launch time</td>
+</tr>
+<tr>
+<td>Shape diversity</td>
+<td>Requires N groups for N shapes; CA assumes nodes in a group are identical</td>
+<td>One <code>NodePool</code> can span hundreds of instance types</td>
+</tr>
+<tr>
+<td>Bin-packing</td>
+<td>CA does not bin-pack; the kube-scheduler does, after the node exists</td>
+<td>Karpenter simulates the pod→node assignment before choosing a shape</td>
+</tr>
+<tr>
+<td>Provisioning path</td>
+<td>Cloud autoscaling group API</td>
+<td>Direct instance API (<code>ec2:CreateFleet</code> on AWS)</td>
+</tr>
+<tr>
+<td>Multi-AZ</td>
+<td>Groups are usually per-AZ; balancing is a CA feature flag</td>
+<td>Zone is just another requirement key (<code>topology.kubernetes.io/zone</code>)</td>
+</tr>
+<tr>
+<td>Scale-down</td>
+<td>Utilization threshold + unneeded-time, per node</td>
+<td>Consolidation: delete-if-fits-elsewhere, or <em>replace with a cheaper node</em></td>
+</tr>
+<tr>
+<td>Consolidation by replacement</td>
+<td>Not supported</td>
+<td>First-class (<code>Replace</code> mechanism)</td>
+</tr>
+<tr>
+<td>Cost awareness</td>
+<td>None built in</td>
+<td>Prices instance-type offerings; consolidation is explicitly a cost decision</td>
+</tr>
+<tr>
+<td>Node expiry / image rolling</td>
+<td>External tooling</td>
+<td>Built in (<code>expireAfter</code>, drift)</td>
+</tr>
+<tr>
+<td>Spot interruption handling</td>
+<td>Separate component (e.g. AWS Node Termination Handler)</td>
+<td>Built in via SQS interruption queue</td>
+</tr>
+<tr>
+<td>Rate limiting</td>
+<td><code>--max-empty-bulk-delete</code>, etc.</td>
+<td>NodePool disruption budgets with cron windows and per-reason scoping</td>
+</tr>
+</tbody>
+</table>
+<p>Two things CA does that Karpenter deliberately does not: CA works on any cloud with a node-group API (it has ~25 providers), and CA's blast radius is bounded by the groups you defined. Karpenter's power is exactly its danger — a NodePool with <code>requirements: []</code> is "any instance type this cloud sells."</p>
+<p>The migration story is documented end-to-end at <a href="https://karpenter.sh/docs/getting-started/migrating-from-cas/">Migrating from Cluster Autoscaler</a>, and the summary is: scale CA to zero, shrink the managed node group to a minimum that hosts Karpenter itself, and let Karpenter take the rest.</p>
+<h3 id="the-v1-api-three-kinds">The v1 API: three kinds<a class="anchor" href="#the-v1-api-three-kinds">#</a></h3>
+<p>Karpenter's API is three resources across two API groups.</p>
+<table>
+<thead>
+<tr>
+<th>Kind</th>
+<th>Group / version</th>
+<th>Scope</th>
+<th>Owned by</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>NodePool</code></td>
+<td><code>karpenter.sh/v1</code></td>
+<td>Cluster</td>
+<td>You</td>
+<td>Constraints + disruption policy. The template.</td>
+</tr>
+<tr>
+<td><code>NodeClaim</code></td>
+<td><code>karpenter.sh/v1</code></td>
+<td>Cluster</td>
+<td>Karpenter</td>
+<td>One requested machine. You never write these.</td>
+</tr>
+<tr>
+<td><code>EC2NodeClass</code></td>
+<td><code>karpenter.k8s.aws/v1</code></td>
+<td>Cluster</td>
+<td>You</td>
+<td>AWS-specific: subnets, SGs, AMI, IAM role, kubelet, disks</td>
+</tr>
+<tr>
+<td><code>AKSNodeClass</code></td>
+<td><code>karpenter.azure.com/v1beta1</code></td>
+<td>Cluster</td>
+<td>You</td>
+<td>Azure equivalent — note the <strong>v1beta1</strong></td>
+</tr>
+<tr>
+<td><code>GCENodeClass</code></td>
+<td><code>karpenter.k8s.gcp/v1alpha1</code></td>
+<td>Cluster</td>
+<td>You</td>
+<td>Third-party GCP provider — <strong>v1alpha1</strong></td>
+</tr>
+</tbody>
+</table>
+<p>The split is deliberate: <code>NodePool</code>/<code>NodeClaim</code> are the provider-agnostic core (<code>sigs.k8s.io/karpenter</code>), and the NodeClass is the provider's escape hatch. A <code>NodePool</code> points at exactly one NodeClass via <code>nodeClassRef</code>, which in v1 requires <code>group</code>, <code>kind</code>, and <code>name</code> — the <code>apiVersion</code> field was replaced by <code>group</code> because only a single version is served (<a href="https://karpenter.sh/docs/concepts/nodepools/">NodePools</a>).</p>
+<h4 id="the-v1beta1--v1-migration-and-why-the-internet-is-wrong-about-it">The v1beta1 → v1 migration, and why the internet is wrong about it</h4>
+<p>The upgrade path was: Karpenter <strong>1.0</strong> shipped CRDs with both <code>v1beta1</code> and <code>v1</code> versions plus <strong>conversion webhooks</strong> (from the core project and from each cloud provider, for NodeClass changes), so existing objects were converted at runtime. Karpenter <strong>1.1.0 dropped v1beta1 support</strong> (<a href="https://karpenter.sh/v1.0/upgrading/v1-migration/">v1 Migration</a>). If you inherit a cluster pinned below 1.1, you must land on 1.0.x with webhooks healthy <em>before</em> going forward.</p>
+<p>The single field move that breaks the most copy-pasted YAML: <strong><code>kubelet</code> moved from <code>NodePool.spec.template.spec</code> to <code>EC2NodeClass.spec</code></strong>. The migration guide calls this out as hard to handle via conversion webhooks because NodePool→NodeClass is many-to-one. The NodePool docs now carry the note verbatim: <em>"Objects for setting Kubelet features have been moved from the NodePool spec to the EC2NodeClasses spec, to not require other Karpenter providers to support those features"</em> (<a href="https://karpenter.sh/docs/concepts/nodepools/">NodePools</a>).</p>
+<p>The other v1 change worth internalizing: <strong><code>Drift</code> was promoted to stable and its feature gate removed.</strong> You can no longer turn drift off with a flag. The documented replacement is to suppress it with a disruption budget scoped to <code>reasons: [Drifted]</code> (<a href="https://karpenter.sh/docs/reference/settings/#feature-gates">Settings — feature gates</a>).</p>
+<h4 id="a-production-shaped-nodepool">A production-shaped NodePool</h4>
+<div class="codehilite"><pre><span></span><code><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">karpenter.sh/v1</span><span class="w"></span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">NodePool</span><span class="w"></span>
+<span class="nt">metadata</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">temporal-services</span><span class="w"></span>
+<span class="nt">spec</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="c1"># `template` is a NodeClaim template. Karpenter treats it as the MINIMUM</span><span class="w"></span>
+<span class="w">  </span><span class="c1"># constraint set and further narrows it with each pending pod&#39;s requirements.</span><span class="w"></span>
+<span class="w">  </span><span class="nt">template</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">metadata</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="nt">labels</span><span class="p">:</span><span class="w"></span>
+<span class="w">        </span><span class="nt">cell.example.com/pool</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">services</span><span class="w"></span>
+<span class="w">      </span><span class="nt">annotations</span><span class="p">:</span><span class="w"></span>
+<span class="w">        </span><span class="nt">example.com/owner</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">infra-foundation</span><span class="w"></span>
+<span class="w">    </span><span class="nt">spec</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="c1"># v1 requires group+kind+name. There is no apiVersion field here.</span><span class="w"></span>
+<span class="w">      </span><span class="nt">nodeClassRef</span><span class="p">:</span><span class="w"></span>
+<span class="w">        </span><span class="nt">group</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">karpenter.k8s.aws</span><span class="w"></span>
+<span class="w">        </span><span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">EC2NodeClass</span><span class="w"></span>
+<span class="w">        </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">temporal-services</span><span class="w"></span>
+
+<span class="w">      </span><span class="c1"># Applied to every node. Pods must tolerate these to land here.</span><span class="w"></span>
+<span class="w">      </span><span class="nt">taints</span><span class="p">:</span><span class="w"></span>
+<span class="w">        </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">key</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cell.example.com/dedicated</span><span class="w"></span>
+<span class="w">          </span><span class="nt">value</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">services</span><span class="w"></span>
+<span class="w">          </span><span class="nt">effect</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">NoSchedule</span><span class="w"></span>
+
+<span class="w">      </span><span class="c1"># Applied to the node at launch, but pods do NOT need to tolerate them.</span><span class="w"></span>
+<span class="w">      </span><span class="c1"># Karpenter assumes some other agent removes them. If you get this list</span><span class="w"></span>
+<span class="w">      </span><span class="c1"># wrong, Karpenter will provision infinitely -- see gotcha #4.</span><span class="w"></span>
+<span class="w">      </span><span class="nt">startupTaints</span><span class="p">:</span><span class="w"></span>
+<span class="w">        </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">key</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">node.cilium.io/agent-not-ready</span><span class="w"></span>
+<span class="w">          </span><span class="nt">value</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;true&quot;</span><span class="w"></span>
+<span class="w">          </span><span class="nt">effect</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">NoExecute</span><span class="w"></span>
+
+<span class="w">      </span><span class="c1"># Maximum node lifetime. FORCEFUL: budgets do not gate expiration.</span><span class="w"></span>
+<span class="w">      </span><span class="c1"># Default is 720h (30 days). &quot;Never&quot; disables it.</span><span class="w"></span>
+<span class="w">      </span><span class="nt">expireAfter</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">336h</span><span class="w"></span>
+
+<span class="w">      </span><span class="c1"># Hard cap on how long a node may spend draining before Karpenter</span><span class="w"></span>
+<span class="w">      </span><span class="c1"># force-deletes remaining pods and terminates the instance.</span><span class="w"></span>
+<span class="w">      </span><span class="c1"># Setting this also lets DRIFT bypass blocking PDBs and do-not-disrupt.</span><span class="w"></span>
+<span class="w">      </span><span class="nt">terminationGracePeriod</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">4h</span><span class="w"></span>
+
+<span class="w">      </span><span class="c1"># Requirements narrow the instance-type search space. Operators:</span><span class="w"></span>
+<span class="w">      </span><span class="c1"># In, NotIn, Exists, DoesNotExist, Gt, Lt, Gte, Lte.</span><span class="w"></span>
+<span class="w">      </span><span class="nt">requirements</span><span class="p">:</span><span class="w"></span>
+<span class="w">        </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">key</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">kubernetes.io/arch</span><span class="w"></span>
+<span class="w">          </span><span class="nt">operator</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">In</span><span class="w"></span>
+<span class="w">          </span><span class="nt">values</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;amd64&quot;</span><span class="p p-Indicator">]</span><span class="w"></span>
+<span class="w">        </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">key</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">kubernetes.io/os</span><span class="w"></span>
+<span class="w">          </span><span class="nt">operator</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">In</span><span class="w"></span>
+<span class="w">          </span><span class="nt">values</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;linux&quot;</span><span class="p p-Indicator">]</span><span class="w"></span>
+<span class="w">        </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">key</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">karpenter.sh/capacity-type</span><span class="w"></span>
+<span class="w">          </span><span class="nt">operator</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">In</span><span class="w"></span>
+<span class="w">          </span><span class="nt">values</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;on-demand&quot;</span><span class="p p-Indicator">]</span><span class="w"></span>
+<span class="w">        </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">key</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">karpenter.k8s.aws/instance-category</span><span class="w"></span>
+<span class="w">          </span><span class="nt">operator</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">In</span><span class="w"></span>
+<span class="w">          </span><span class="nt">values</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;c&quot;</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">&quot;m&quot;</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">&quot;r&quot;</span><span class="p p-Indicator">]</span><span class="w"></span>
+<span class="w">          </span><span class="c1"># minValues forces the scheduler to keep at least N distinct values</span><span class="w"></span>
+<span class="w">          </span><span class="c1"># in play, which is how you buy capacity-pool diversity.</span><span class="w"></span>
+<span class="w">          </span><span class="nt">minValues</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">2</span><span class="w"></span>
+<span class="w">        </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">key</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">karpenter.k8s.aws/instance-generation</span><span class="w"></span>
+<span class="w">          </span><span class="nt">operator</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Gte</span><span class="w"></span>
+<span class="w">          </span><span class="nt">values</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;6&quot;</span><span class="p p-Indicator">]</span><span class="w"></span>
+<span class="w">        </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">key</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">node.kubernetes.io/instance-type</span><span class="w"></span>
+<span class="w">          </span><span class="nt">operator</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Exists</span><span class="w"></span>
+<span class="w">          </span><span class="nt">minValues</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">10</span><span class="w"></span>
+<span class="w">        </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">key</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">topology.kubernetes.io/zone</span><span class="w"></span>
+<span class="w">          </span><span class="nt">operator</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">In</span><span class="w"></span>
+<span class="w">          </span><span class="nt">values</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;us-west-2a&quot;</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">&quot;us-west-2b&quot;</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">&quot;us-west-2c&quot;</span><span class="p p-Indicator">]</span><span class="w"></span>
+
+<span class="w">  </span><span class="nt">disruption</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="c1"># WhenEmpty | Balanced | WhenEmptyOrUnderutilized</span><span class="w"></span>
+<span class="w">    </span><span class="nt">consolidationPolicy</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">WhenEmptyOrUnderutilized</span><span class="w"></span>
+<span class="w">    </span><span class="c1"># Stability timer: reset every time a pod is added to or removed from</span><span class="w"></span>
+<span class="w">    </span><span class="c1"># the node. &quot;Never&quot; disables consolidation for this pool.</span><span class="w"></span>
+<span class="w">    </span><span class="nt">consolidateAfter</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">5m</span><span class="w"></span>
+<span class="w">    </span><span class="nt">budgets</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="c1"># Baseline ceiling for everything.</span><span class="w"></span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">nodes</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;10%&quot;</span><span class="w"></span>
+<span class="w">      </span><span class="c1"># Absolute ceiling regardless of pool size.</span><span class="w"></span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">nodes</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;5&quot;</span><span class="w"></span>
+<span class="w">      </span><span class="c1"># No voluntary churn during business hours, UTC only.</span><span class="w"></span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">nodes</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;0&quot;</span><span class="w"></span>
+<span class="w">        </span><span class="nt">schedule</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;0</span><span class="nv"> </span><span class="s">14</span><span class="nv"> </span><span class="s">*</span><span class="nv"> </span><span class="s">*</span><span class="nv"> </span><span class="s">mon-fri&quot;</span><span class="w"></span>
+<span class="w">        </span><span class="nt">duration</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">10h</span><span class="w"></span>
+
+<span class="w">  </span><span class="c1"># Hard ceiling on total pool size. Eventually consistent -- see gotcha #9.</span><span class="w"></span>
+<span class="w">  </span><span class="nt">limits</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">cpu</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;2000&quot;</span><span class="w"></span>
+<span class="w">    </span><span class="nt">memory</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">4000Gi</span><span class="w"></span>
+<span class="w">    </span><span class="nt">nodes</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;80&quot;</span><span class="w"></span>
+
+<span class="w">  </span><span class="c1"># Higher weight wins when multiple NodePools match a pod.</span><span class="w"></span>
+<span class="w">  </span><span class="nt">weight</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">50</span><span class="w"></span>
+</code></pre></div>
+
+<h4 id="requirements-well-known-keys-and-the-100-key-ceiling">Requirements, well-known keys, and the 100-key ceiling</h4>
+<p>Karpenter respects the Kubernetes well-known labels plus provider-specific ones. The AWS set includes <code>karpenter.k8s.aws/instance-family</code>, <code>instance-category</code>, <code>instance-generation</code>, <code>instance-cpu</code>, <code>instance-hypervisor</code>, <code>instance-tenancy</code>, and <code>instance-capability-flex</code>; the core set includes <code>kubernetes.io/arch</code>, <code>kubernetes.io/os</code>, <code>topology.kubernetes.io/zone</code>, <code>node.kubernetes.io/instance-type</code>, and <code>karpenter.sh/capacity-type</code> (<a href="https://karpenter.sh/docs/concepts/nodepools/">NodePools</a>).</p>
+<p>Three sharp edges:</p>
+<ul>
+<li><strong><code>karpenter.sh/capacity-type</code> now has three values: <code>reserved</code>, <code>spot</code>, <code>on-demand</code>.</strong> <code>reserved</code> means on-demand capacity reservations and capacity blocks, <em>not</em> Reserved Instances. When a NodePool allows several, Karpenter prioritizes <code>reserved</code> → <code>spot</code> → <code>on-demand</code>. This is gated by <code>ReservedCapacity</code>, which has been <strong>Beta and on by default since v1.6</strong> (<a href="https://karpenter.sh/docs/reference/settings/">Settings</a>).</li>
+<li><strong>There is a hard limit of 100 requirements across a NodePool and its NodeClaim</strong>, and <code>spec.template.metadata.labels</code> are propagated as requirements too — so labels count against the same 100 (<a href="https://karpenter.sh/docs/concepts/nodepools/">NodePools</a>).</li>
+<li><strong><code>minValues</code> behavior is policy-driven.</strong> <code>MIN_VALUES_POLICY</code> / <code>--min-values-policy</code> defaults to <code>Strict</code>, which fails the scheduling loop for that NodePool if the minimum flexibility cannot be met (falling back to another NodePool, or leaving the pod pending). <code>BestEffort</code> relaxes <code>minValues</code> instead (<a href="https://karpenter.sh/docs/reference/settings/">Settings</a>). If multiple <code>minValues</code> are given for the same key, the maximum wins.</li>
+</ul>
+<h4 id="weights-and-multiple-nodepools">Weights and multiple NodePools</h4>
+<p><code>spec.weight</code> is a scheduling preference between NodePools, analogous to affinity weights; unspecified is equivalent to 0, and the highest weight wins when several match (<a href="https://karpenter.sh/docs/concepts/nodepools/">NodePools</a>). The docs are explicit that you should <em>prefer mutually exclusive NodePools</em> and use weight only as a tie-break. The canonical weighted pattern is: a high-weight <code>reserved</code>/<code>spot</code> pool and a low-weight <code>on-demand</code> fallback pool with otherwise identical requirements.</p>
+<p>Note the interaction with drift: <code>spec.weight</code>, <code>spec.limits</code>, and everything under <code>spec.disruption.*</code> are classified as <strong>behavioral fields and are explicitly not considered for drift</strong> (<a href="https://karpenter.sh/docs/concepts/disruption/">Disruption — behavioral fields</a>). Changing a budget does not roll your fleet. Changing <code>spec.template.spec.requirements</code> may.</p>
+<h4 id="ec2nodeclass--the-aws-specific-half">EC2NodeClass — the AWS-specific half</h4>
+<div class="codehilite"><pre><span></span><code><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">karpenter.k8s.aws/v1</span><span class="w"></span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">EC2NodeClass</span><span class="w"></span>
+<span class="nt">metadata</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">temporal-services</span><span class="w"></span>
+<span class="nt">spec</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="c1"># kubelet lives HERE in v1, not on the NodePool.</span><span class="w"></span>
+<span class="w">  </span><span class="nt">kubelet</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">maxPods</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">110</span><span class="w"></span>
+<span class="w">    </span><span class="nt">systemReserved</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="nt">cpu</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">200m</span><span class="w"></span>
+<span class="w">      </span><span class="nt">memory</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">512Mi</span><span class="w"></span>
+<span class="w">      </span><span class="nt">ephemeral-storage</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">2Gi</span><span class="w"></span>
+<span class="w">    </span><span class="nt">kubeReserved</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="nt">cpu</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">200m</span><span class="w"></span>
+<span class="w">      </span><span class="nt">memory</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1Gi</span><span class="w"></span>
+<span class="w">    </span><span class="nt">evictionHard</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="nt">memory.available</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">5%</span><span class="w"></span>
+<span class="w">      </span><span class="nt">nodefs.available</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">10%</span><span class="w"></span>
+<span class="w">    </span><span class="nt">imageGCHighThresholdPercent</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">85</span><span class="w"></span>
+<span class="w">    </span><span class="nt">imageGCLowThresholdPercent</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">80</span><span class="w"></span>
+
+<span class="w">  </span><span class="c1"># amiFamily drives UserData generation and default block device mappings.</span><span class="w"></span>
+<span class="w">  </span><span class="c1"># May be omitted when using an `alias` amiSelectorTerm.</span><span class="w"></span>
+<span class="w">  </span><span class="nt">amiFamily</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">AL2023</span><span class="w"></span>
+
+<span class="w">  </span><span class="c1"># Discovery is tag-based. Terms are OR&#39;d; conditions within a term are AND&#39;d.</span><span class="w"></span>
+<span class="w">  </span><span class="nt">subnetSelectorTerms</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">tags</span><span class="p">:</span><span class="w"></span>
+<span class="w">        </span><span class="nt">karpenter.sh/discovery</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;${CLUSTER_NAME}&quot;</span><span class="w"></span>
+<span class="w">        </span><span class="nt">cell.example.com/tier</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">private</span><span class="w"></span>
+<span class="w">  </span><span class="nt">securityGroupSelectorTerms</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">tags</span><span class="p">:</span><span class="w"></span>
+<span class="w">        </span><span class="nt">karpenter.sh/discovery</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;${CLUSTER_NAME}&quot;</span><span class="w"></span>
+
+<span class="w">  </span><span class="c1"># Pin the image. `alias: al2023@latest` is a moving target and WILL drift</span><span class="w"></span>
+<span class="w">  </span><span class="c1"># your whole fleet whenever AWS publishes a new AMI.</span><span class="w"></span>
+<span class="w">  </span><span class="nt">amiSelectorTerms</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">alias</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">al2023@v20260812</span><span class="w"></span>
+
+<span class="w">  </span><span class="c1"># One of role / instanceProfile is required.</span><span class="w"></span>
+<span class="w">  </span><span class="nt">role</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;KarpenterNodeRole-${CLUSTER_NAME}&quot;</span><span class="w"></span>
+
+<span class="w">  </span><span class="nt">tags</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">cell.example.com/cell</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;${CELL_ID}&quot;</span><span class="w"></span>
+<span class="w">    </span><span class="nt">team</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">infra-foundation</span><span class="w"></span>
+
+<span class="w">  </span><span class="nt">metadataOptions</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">httpEndpoint</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">enabled</span><span class="w"></span>
+<span class="w">    </span><span class="nt">httpTokens</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">required</span><span class="w">        </span><span class="c1"># IMDSv2 only</span><span class="w"></span>
+<span class="w">    </span><span class="nt">httpPutResponseHopLimit</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1</span><span class="w">  </span><span class="c1"># blocks IMDS from non-hostNetwork containers</span><span class="w"></span>
+
+<span class="w">  </span><span class="nt">blockDeviceMappings</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">deviceName</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">/dev/xvda</span><span class="w"></span>
+<span class="w">      </span><span class="nt">ebs</span><span class="p">:</span><span class="w"></span>
+<span class="w">        </span><span class="nt">volumeSize</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">200Gi</span><span class="w"></span>
+<span class="w">        </span><span class="nt">volumeType</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">gp3</span><span class="w"></span>
+<span class="w">        </span><span class="nt">iops</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">6000</span><span class="w"></span>
+<span class="w">        </span><span class="nt">throughput</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">250</span><span class="w"></span>
+<span class="w">        </span><span class="nt">encrypted</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span><span class="w"></span>
+<span class="w">        </span><span class="nt">kmsKeyID</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;arn:aws:kms:us-west-2:111122223333:key/...&quot;</span><span class="w"></span>
+<span class="w">        </span><span class="nt">deleteOnTermination</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span><span class="w"></span>
+
+<span class="w">  </span><span class="c1"># Use NVMe instance storage for ephemeral-storage instead of EBS.</span><span class="w"></span>
+<span class="w">  </span><span class="nt">instanceStorePolicy</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">RAID0</span><span class="w"></span>
+
+<span class="w">  </span><span class="nt">detailedMonitoring</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span><span class="w"></span>
+</code></pre></div>
+
+<p><code>status</code> on an EC2NodeClass is worth watching in CI: it publishes the <em>resolved</em> <code>subnets</code> (with zones), <code>securityGroups</code>, and <code>amis</code> (with per-architecture requirements). A cell that provisions nothing is very often an EC2NodeClass whose <code>status.subnets</code> is empty because the discovery tag was never applied.</p>
+<p>Two v1 additions relevant to cells: <code>capacityReservationSelectorTerms</code> (for ODCRs/capacity blocks, paired with <code>capacity-type: reserved</code>) and <code>placementGroupSelector</code> (<a href="https://karpenter.sh/docs/concepts/nodeclasses/">NodeClasses</a>).</p>
+<h3 id="disruption-in-depth">Disruption in depth<a class="anchor" href="#disruption-in-depth">#</a></h3>
+<p>This is the part that matters for long-lived workloads. Read the control flow literally:</p>
+<ol>
+<li>Pick a disruption method — <strong>Drift first, then Consolidation</strong> — and build a prioritized candidate list.</li>
+<li>For each candidate, check the NodePool's disruption budget, then run a scheduling simulation to determine what replacements are needed.</li>
+<li>Taint the node(s) with <code>karpenter.sh/disrupted:NoSchedule</code>.</li>
+<li><strong>Pre-spin replacements and wait for them to become ready.</strong> If a replacement fails to initialize, un-taint and restart from step 1.</li>
+<li>Delete the node(s); the Termination Controller drains them.</li>
+</ol>
+<p>(<a href="https://karpenter.sh/docs/concepts/disruption/">Disruption</a>)</p>
+<p>Step 4 is the property you want and CA does not give you: capacity exists before capacity is removed.</p>
+<h4 id="consolidation-policies">Consolidation policies</h4>
+<table>
+<thead>
+<tr>
+<th>Policy</th>
+<th>Nodes considered</th>
+<th>Use when</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>WhenEmpty</code></td>
+<td>Only nodes whose remaining pods have zero disruption cost (DaemonSets, annotated-cheap pods)</td>
+<td>Maximum conservatism. Nothing running gets evicted for cost.</td>
+</tr>
+<tr>
+<td><code>Balanced</code></td>
+<td>Same set as <code>WhenEmptyOrUnderutilized</code>, but each action is <em>scored</em> — savings vs. weighted pod disruption — and skipped when the savings do not justify the churn</td>
+<td>You want most of the savings without marginal churn</td>
+</tr>
+<tr>
+<td><code>WhenEmptyOrUnderutilized</code></td>
+<td>Any node that can be removed or replaced to reduce cost</td>
+<td>Lowest cost, most churn</td>
+</tr>
+</tbody>
+</table>
+<p>Defaults if you write nothing: <code>consolidationPolicy: WhenEmptyOrUnderutilized</code>, <code>consolidateAfter: 0s</code> (<a href="https://karpenter.sh/docs/concepts/disruption/">Disruption — defaults</a>). That default is aggressive. <code>consolidateAfter: 0s</code> means a node becomes a consolidation candidate the instant its pod set stops changing.</p>
+<p><code>Balanced</code> is the newer, quieter option. Every pod contributes equal weight by default (so "disruption" is effectively pod count), with higher-priority pods weighted more. Decisions emit a <code>ConsolidationApproved</code> event carrying the score and the savings/disruption percentages, and are exported as <code>karpenter_consolidation_score</code> and <code>karpenter_consolidation_moves_total</code>, labeled by decision, NodePool, and policy (<a href="https://karpenter.sh/docs/concepts/disruption/">Disruption — balanced consolidation</a>).</p>
+<p>Consolidation runs three mechanisms <strong>in this order</strong>:</p>
+<ol>
+<li><strong>Empty node consolidation</strong> — delete all fully-empty nodes in parallel.</li>
+<li><strong>Multi-node consolidation</strong> — delete two or more nodes together, possibly launching one cheaper replacement. Heuristic, because the search space is exponential.</li>
+<li><strong>Single-node consolidation</strong> — delete or replace one node at a time. Every node is evaluated individually.</li>
+</ol>
+<p>When several nodes are candidates, Karpenter prefers to terminate nodes running <strong>fewer pods</strong>, nodes that will <strong>expire soon</strong>, and nodes with <strong>lower-priority pods</strong>.</p>
+<h4 id="disruption-budgets--syntax-and-semantics">Disruption budgets — syntax and semantics</h4>
+<div class="codehilite"><pre><span></span><code><span class="nt">spec</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">disruption</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">budgets</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="c1"># Applies only to Empty and Drifted reasons.</span><span class="w"></span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">nodes</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;20%&quot;</span><span class="w"></span>
+<span class="w">        </span><span class="nt">reasons</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;Empty&quot;</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">&quot;Drifted&quot;</span><span class="p p-Indicator">]</span><span class="w"></span>
+<span class="w">      </span><span class="c1"># No `reasons` =&gt; applies to ALL reasons. Acts as a global ceiling.</span><span class="w"></span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">nodes</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;5&quot;</span><span class="w"></span>
+<span class="w">      </span><span class="c1"># Time-windowed. schedule + duration must be set together.</span><span class="w"></span>
+<span class="w">      </span><span class="c1"># Cron is 5-field; macros (@daily, @hourly) supported. UTC only.</span><span class="w"></span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">nodes</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;0&quot;</span><span class="w"></span>
+<span class="w">        </span><span class="nt">schedule</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;@daily&quot;</span><span class="w"></span>
+<span class="w">        </span><span class="nt">duration</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">10m</span><span class="w"></span>
+<span class="w">        </span><span class="nt">reasons</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;Underutilized&quot;</span><span class="p p-Indicator">]</span><span class="w"></span>
+</code></pre></div>
+
+<p>Semantics that bite:</p>
+<ul>
+<li><strong>The default, if you specify nothing, is a single budget of <code>nodes: 10%</code></strong> (<a href="https://karpenter.sh/docs/concepts/disruption/">Disruption — NodePool disruption budgets</a>).</li>
+<li>Valid <code>reasons</code> are <code>Drifted</code>, <code>Underutilized</code>, and <code>Empty</code>. <strong>A budget with no <code>reasons</code> applies to all of them.</strong> When computing the allowance for a given reason, Karpenter takes the <strong>minimum</strong> across every budget that lists that reason or omits <code>reasons</code> entirely.</li>
+<li>The percentage formula is <code>allowed_disruptions = roundup(total * percentage) - total_deleting - total_notready</code>. Non-percentage values use the static ceiling minus the same subtractions. <strong><code>NotReady</code> nodes consume budget.</strong> A cell with unhealthy nodes has less headroom for voluntary disruption, which is usually what you want but occasionally deadlocks you.</li>
+<li><strong>Budgets do not prevent Karpenter from terminating expired nodes</strong>, and do not apply to interruption or node repair. This is stated explicitly in the docs and it is the single most common misreading of the feature.</li>
+<li><code>duration</code> accepts hours and minutes only (<code>10h5m</code>, <code>30m</code>, <code>160h</code>) — cron has no sub-minute granularity. <strong>Timezones are not supported; schedules are always UTC.</strong></li>
+<li><code>budgets: [{nodes: "0"}]</code> is the documented way to disable all voluntary disruption for a NodePool.</li>
+</ul>
+<h4 id="drift">Drift</h4>
+<p>Karpenter annotates the owning NodePool and NodeClass with a hash of the <code>NodeClaimTemplateSpec</code>/<code>EC2NodeClassSpec</code>, exactly like <code>deployment.spec.template</code> → pods. A NodeClaim whose values no longer match is given the <code>Drifted</code> status condition.</p>
+<p>Special cases where drift is <em>resolved</em> rather than hashed:</p>
+<table>
+<thead>
+<tr>
+<th>Resource</th>
+<th>Fields</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>NodePool</td>
+<td><code>spec.template.spec.requirements</code></td>
+</tr>
+<tr>
+<td>EC2NodeClass</td>
+<td><code>spec.subnetSelectorTerms</code>, <code>spec.securityGroupSelectorTerms</code>, <code>spec.amiSelectorTerms</code></td>
+</tr>
+</tbody>
+</table>
+<p>The asymmetry is instructive: widening <code>instance-type In [m5.large]</code> to <code>In [m5.large, m5.2xlarge]</code> does <strong>not</strong> drift an existing <code>m5.large</code> node, because its value is still compatible. But publishing a new AMI that <code>amiSelectorTerms</code> resolves to <strong>does</strong> drift every node, with no CRD change at all (<a href="https://karpenter.sh/docs/concepts/disruption/">Disruption — drift</a>). That is the trap in <code>alias: al2023@latest</code>.</p>
+<h4 id="expiration-and-terminationgraceperiod">Expiration and terminationGracePeriod</h4>
+<p><code>expireAfter</code> lives on <code>spec.template.spec</code> and is persisted to each NodeClaim. <strong>Default 720h (30 days)</strong>, or the literal string <code>Never</code>. Changing it on the NodePool does not update existing NodeClaims — it <em>drifts</em> them, and replacements get the new value.</p>
+<p>The docs are careful about a distinction people get wrong: <code>expireAfter</code> is a <strong>maximum</strong> lifetime, not a minimum. Drift, consolidation, or emptiness can end a node much earlier. To get a <em>true</em> maximum you must combine <code>expireAfter</code> with budgets that suppress the other reasons.</p>
+<p><code>terminationGracePeriod</code> (<code>spec.template.spec.terminationGracePeriod</code>, persisted to <code>NodeClaim.spec.terminationGracePeriod</code>) is the hard cap on draining. Two consequences that matter enormously for Temporal-shaped workloads:</p>
+<ul>
+<li><strong>Setting it changes drift eligibility.</strong> With <code>terminationGracePeriod</code> configured, a node may be disrupted via drift <em>even if</em> it hosts pods with blocking PDBs or the <code>karpenter.sh/do-not-disrupt</code> annotation. This is deliberate — it lets an operator guarantee CVE-driven AMI rollouts cannot be blocked by an application team.</li>
+<li><strong>Pods are preemptively deleted so their own <code>terminationGracePeriodSeconds</code> fits inside the node's window.</strong> A pod with a 5-minute grace period on a node with a 1-hour <code>terminationGracePeriod</code> gets deleted at the 55-minute mark. And if a pod's grace period <em>exceeds</em> the node's, the node wins and the pod is deleted as soon as draining starts, never receiving its full grace period.</li>
+</ul>
+<p>Maximum node lifetime is therefore <code>expireAfter + terminationGracePeriod</code>.</p>
+<p>The docs carry an explicit warning worth repeating: <strong>do not set <code>expireAfter</code> without <code>terminationGracePeriod</code> if any pod carries <code>karpenter.sh/do-not-disrupt</code></strong>, because expiration is forceful, <code>do-not-disrupt</code> blocks draining, and you end up with partially-drained nodes stuck in the cluster forever, requiring manual intervention.</p>
+<h4 id="karpentershdo-not-disrupt"><code>karpenter.sh/do-not-disrupt</code></h4>
+<p>Two formats on <strong>pods</strong>:</p>
+<table>
+<thead>
+<tr>
+<th>Format</th>
+<th>Example</th>
+<th>Behavior</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Boolean</td>
+<td><code>karpenter.sh/do-not-disrupt: "true"</code></td>
+<td>Permanent protection</td>
+</tr>
+<tr>
+<td>Go duration</td>
+<td><code>karpenter.sh/do-not-disrupt: "30m"</code></td>
+<td>Protection for that long after the pod starts running</td>
+</tr>
+</tbody>
+</table>
+<p>The duration format is the newer and, for a job-shaped workload, the better one: it protects a long activity without permanently pinning the node. An invalid duration string is ignored and an event is emitted on the pod.</p>
+<p>Semantics: treat it as a <strong>single-pod blocking PDB</strong>. Nodes hosting active <code>do-not-disrupt</code> pods are excluded from consolidation, and <em>conditionally</em> excluded from drift (excluded unless <code>terminationGracePeriod</code> is set). The Termination Controller will not gracefully evict such pods, so node termination cannot complete until the annotation lapses, the pod reaches a terminal phase, or <code>terminationGracePeriod</code> elapses.</p>
+<p>It also exists at <strong>node</strong> level (<code>karpenter.sh/do-not-disrupt: "true"</code> on the Node object), which blocks voluntary disruption of that node. Neither form protects against expiration, interruption, node repair, or manual <code>kubectl delete node</code>.</p>
+<h4 id="interruption">Interruption</h4>
+<p>Karpenter watches an <strong>SQS queue</strong> fed by EventBridge rules for: Spot Interruption Warnings, Scheduled Change Health Events, Instance Terminating/Stopping events, and Instance Status Check Failures. You enable it with <code>--interruption-queue</code> / <code>INTERRUPTION_QUEUE</code>; if unset, interruption handling is <strong>disabled</strong> (<a href="https://karpenter.sh/docs/concepts/disruption/">Disruption — interruption</a>, <a href="https://karpenter.sh/docs/reference/settings/">Settings</a>). The CloudFormation template in the getting-started guide provisions the queue and rules.</p>
+<p>Spot gives a <strong>2-minute notice</strong>. On receipt Karpenter provisions a replacement in parallel with draining, and the docs claim average startup time is usually enough to have the replacement ready first. Notably, Karpenter publishes events for <strong>Spot Rebalance Recommendations</strong> but <strong>does not act on them</strong> — if you want rebalance handling you must run AWS Node Termination Handler alongside, accepting more churn.</p>
+<p>Separately, Karpenter polls <strong>EC2 <code>DescribeInstanceStatus</code></strong> for System Status, Instance Status, and Scheduled Maintenance Events. This path needs no SQS queue, only the IAM permission.</p>
+<h4 id="node-auto-repair">Node Auto Repair</h4>
+<p><code>NodeRepair=true</code> is <strong>alpha, off by default, since v1.1</strong> (<a href="https://karpenter.sh/docs/reference/settings/">Settings — feature gates</a>). It requires a node diagnostic agent (EKS Node Monitoring Agent or Node Problem Detector) that writes status conditions. Karpenter then force-terminates nodes past a toleration duration, <strong>bypassing drain and grace period entirely</strong>.</p>
+<table>
+<thead>
+<tr>
+<th>Condition</th>
+<th>Status</th>
+<th>Toleration</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Ready</code></td>
+<td><code>False</code></td>
+<td>30m</td>
+</tr>
+<tr>
+<td><code>Ready</code></td>
+<td><code>Unknown</code></td>
+<td>30m</td>
+</tr>
+<tr>
+<td><code>AcceleratedHardwareReady</code></td>
+<td><code>False</code></td>
+<td>10m</td>
+</tr>
+<tr>
+<td><code>StorageReady</code> / <code>NetworkingReady</code> / <code>KernelReady</code> / <code>ContainerRuntimeReady</code></td>
+<td><code>False</code></td>
+<td>30m</td>
+</tr>
+</tbody>
+</table>
+<p>Safety valve: <strong>Karpenter will not repair if more than 20% of nodes in a NodePool are unhealthy</strong> (for standalone NodeClaims, the threshold is evaluated against all nodes in the cluster). That is a good circuit breaker against a bad AMI or a broken CNI rollout turning into fleet-wide force-termination.</p>
+<h3 id="spot">Spot<a class="anchor" href="#spot">#</a></h3>
+<p>Three mechanisms, all worth knowing precisely.</p>
+<p><strong>Allocation strategy.</strong> Karpenter selects lower-priced spot instance types using the <strong><code>price-capacity-optimized</code></strong> strategy (<a href="https://karpenter.sh/docs/concepts/disruption/">Disruption — spot consolidation</a>, <a href="https://aws.amazon.com/blogs/compute/introducing-price-capacity-optimized-allocation-strategy-for-ec2-spot-instances/">AWS: price-capacity-optimized</a>). This trades a little price for a lot of interruption-rate improvement versus <code>lowest-price</code>. Karpenter does not expose a knob to change it.</p>
+<p><strong>Spot-to-spot consolidation.</strong> For spot nodes, <strong>deletion</strong> consolidation is on by default, but <strong>replacement</strong> consolidation requires the <code>SpotToSpotConsolidation</code> feature gate, which is <strong>alpha and off by default since v0.34</strong> (<a href="https://karpenter.sh/docs/reference/settings/">Settings</a>). When enabled, Karpenter uses "instance type flexibility" — the number of instance types available at a price lower than the current node — as a heuristic, and <strong>requires a minimum of 15 instance types</strong> for a single-node (1→1) spot-to-spot consolidation. Multi-node (many→1) consolidations have no such requirement, because they cannot produce a race to the bottom. The stated goals: don't consolidate down to the cheapest, highest-interruption instance, and always land with enough diversity that the replacement has comparable availability.</p>
+<p><strong>Diversification.</strong> This is on you. The <code>minValues</code> mechanism is the lever: set <code>minValues</code> on <code>instance-family</code> and <code>node.kubernetes.io/instance-type</code> so the scheduler keeps a wide pool in play. The docs' own spot example asks for at least 2 instance categories, 5 families, and 10 instance types.</p>
+<p>For Temporal history hosts, my opinion: spot is defensible for stateless frontend and worker tiers with generous replica counts, and is not defensible for anything holding shard ownership, because a 2-minute notice against a shard-rebalance window is a bad trade even with pre-spun replacements.</p>
+<h3 id="how-karpenter-interacts-with-pdbs-statefulsets-and-long-lived-workloads">How Karpenter interacts with PDBs, StatefulSets, and long-lived workloads<a class="anchor" href="#how-karpenter-interacts-with-pdbs-statefulsets-and-long-lived-workloads">#</a></h3>
+<p><strong>PDBs.</strong> The Termination Controller evicts via the Kubernetes Eviction API, so PDBs are honored — but the composition rule is harsher than people expect. From the docs: if a pod matches <strong>multiple</strong> PDBs, <strong>all</strong> of them must allow disruption; when different pods on the same node belong to different PDBs, <strong>all</strong> must simultaneously permit eviction; and <strong>a single blocking PDB prevents the entire node from being voluntarily disrupted</strong> (<a href="https://karpenter.sh/docs/concepts/disruption/">Disruption — pod-level controls</a>). The docs' own example: Pod A matching both <code>maxUnavailable: 0</code> and <code>maxUnavailable: 1</code> is blocked by the stricter one. The practical corollary is that dense nodes with many distinct PDBs become effectively immortal.</p>
+<p>Static pods, pods tolerating <code>karpenter.sh/disrupted:NoSchedule</code>, and Succeeded/Failed pods are ignored during drain.</p>
+<p><strong>StatefulSets.</strong> Karpenter has no special StatefulSet handling. What it does have is <strong>VolumeAttachment verification</strong>: step 3 of the termination flow explicitly verifies that all <code>VolumeAttachment</code> resources for drain-able pods are deleted before terminating the instance. This is what prevents the classic "new pod can't attach the EBS volume because the old node still holds it" stall. For a StatefulSet the practical controls are: a PDB with <code>maxUnavailable: 1</code>, a <code>terminationGracePeriod</code> long enough for your longest legitimate shutdown, and — for genuinely non-relocatable state — <code>karpenter.sh/do-not-disrupt</code> with a duration.</p>
+<p><strong>Long-running workloads.</strong> The combination I would ship for a Temporal cell:</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># On the workload</span><span class="w"></span>
+<span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">apps/v1</span><span class="w"></span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">StatefulSet</span><span class="w"></span>
+<span class="nt">spec</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">template</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">metadata</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="nt">annotations</span><span class="p">:</span><span class="w"></span>
+<span class="w">        </span><span class="c1"># Cheap-to-move? Omit. Expensive? Use a duration, not &quot;true&quot;.</span><span class="w"></span>
+<span class="w">        </span><span class="nt">karpenter.sh/do-not-disrupt</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;45m&quot;</span><span class="w"></span>
+<span class="w">    </span><span class="nt">spec</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="nt">terminationGracePeriodSeconds</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">900</span><span class="w"></span>
+<span class="nn">---</span><span class="w"></span>
+<span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">policy/v1</span><span class="w"></span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">PodDisruptionBudget</span><span class="w"></span>
+<span class="nt">spec</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">maxUnavailable</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1</span><span class="w"></span>
+<span class="w">  </span><span class="nt">selector</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">matchLabels</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="nt">app.kubernetes.io/name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">temporal-history</span><span class="w"></span>
+</code></pre></div>
+
+<p>paired with a NodePool that sets <code>terminationGracePeriod: 4h</code> (so drift can still land AMI CVE fixes), <code>consolidateAfter: 15m</code> (so normal shard rebalancing does not look like an idle node), and a budget of <code>nodes: "1"</code> for <code>reasons: [Drifted]</code> so image rollouts are strictly serial.</p>
+<p><em>See also: <a href="04-managed-kubernetes-eks-gke-aks.html#upgrade-mechanics">upgrade mechanics</a> for the baseline PDB, drain, and eviction semantics the managed node upgraders enforce — Karpenter's eviction path is the same Eviction API with harsher composition rules on top.</em></p>
+<h3 id="scheduling-inputs-karpenter-respects--and-the-ones-it-handles-poorly">Scheduling inputs Karpenter respects — and the ones it handles poorly<a class="anchor" href="#scheduling-inputs-karpenter-respects--and-the-ones-it-handles-poorly">#</a></h3>
+<p>Karpenter runs a scheduling simulation, so it must reimplement a meaningful subset of kube-scheduler. What it consumes (<a href="https://karpenter.sh/docs/concepts/scheduling/">Scheduling</a>):</p>
+<table>
+<thead>
+<tr>
+<th>Input</th>
+<th>Handling</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Resource requests</td>
+<td>First-class. This is the bin-packing input. <strong>Limits are ignored</strong> for sizing.</td>
+</tr>
+<tr>
+<td><code>nodeSelector</code></td>
+<td>First-class; intersected with NodePool requirements</td>
+</tr>
+<tr>
+<td><code>requiredDuringScheduling</code> node affinity</td>
+<td>First-class</td>
+</tr>
+<tr>
+<td>Taints / tolerations</td>
+<td>First-class; a NodePool whose taints a pod does not tolerate is skipped</td>
+</tr>
+<tr>
+<td><code>topologySpreadConstraints</code> (<code>DoNotSchedule</code>)</td>
+<td>Supported; zone, hostname, and <code>karpenter.sh/capacity-type</code> are usable topology keys</td>
+</tr>
+<tr>
+<td>Pod affinity / anti-affinity (required)</td>
+<td>Supported, with topology-key caveats</td>
+</tr>
+<tr>
+<td>Persistent volume topology</td>
+<td>Supported — PVC zone constraints narrow the launchable zones</td>
+</tr>
+<tr>
+<td>DaemonSets</td>
+<td>Accounted for in capacity math (<code>karpenter_nodes_total_daemon_requests</code>)</td>
+</tr>
+<tr>
+<td><strong>Preferences</strong> (<code>preferredDuringScheduling</code>, <code>ScheduleAnyway</code>)</td>
+<td>Handled, but this is the weak spot</td>
+</tr>
+<tr>
+<td><strong>DRA (Dynamic Resource Allocation)</strong></td>
+<td>Not formally supported; <code>IGNORE_DRA_REQUESTS</code> exists as a stopgap</td>
+</tr>
+</tbody>
+</table>
+<p>The preference problem is real and documented in a warning box:</p>
+<blockquote>
+<p><em>"Using preferred anti-affinity and topology spreads can reduce the effectiveness of consolidation. At node launch, Karpenter attempts to satisfy affinity and topology spread preferences. In order to reduce node churn, consolidation must also attempt to satisfy these constraints to avoid immediately consolidating nodes after they launch. This means that consolidation may not disrupt nodes in order to avoid violating preferences, even if kube-scheduler can fit the host pods elsewhere."</em> (<a href="https://karpenter.sh/docs/concepts/disruption/">Disruption</a>)</p>
+</blockquote>
+<p>Karpenter logs these, e.g. <code>pod default/inflate-anti-self-55894c5d8b-522jd has a preferred Anti-Affinity which can prevent consolidation</code>. The global escape hatch is <code>PREFERENCE_POLICY</code> / <code>--preference-policy</code>, which accepts <code>Respect</code> (default) or <code>Ignore</code> and covers preferred node/pod affinities and <code>ScheduleAnyway</code> topology spreads (<a href="https://karpenter.sh/docs/reference/settings/">Settings</a>). Setting it to <code>Ignore</code> makes bin-packing tighter and consolidation more effective, at the cost of ignoring soft spreading intent — a reasonable trade for a homogeneous cell, a bad one for a multi-tenant cluster.</p>
+<p><strong>DRA is the honest gap.</strong> <code>IGNORE_DRA_REQUESTS</code> is documented as <em>"NOTE: This flag will be removed once formal DRA support is GA in Karpenter"</em> (<a href="https://karpenter.sh/docs/reference/settings/">Settings</a>). If your cells move to DRA-based device allocation, verify Karpenter's status at that time rather than assuming.</p>
+<p><strong>Batching.</strong> Karpenter batches pending pods before deciding. <code>BATCH_IDLE_DURATION</code> defaults to <strong>1s</strong> (each new pending pod extends the window) and <code>BATCH_MAX_DURATION</code> caps the window at <strong>10s</strong>. Larger values yield fewer, larger nodes; smaller values yield faster, smaller launches.</p>
+<p><strong>Memory overhead.</strong> <code>VM_MEMORY_OVERHEAD_PERCENT</code> defaults to <strong>0.075</strong> — 7.5% subtracted from advertised memory when cached allocatable data is unavailable. Get this wrong and you either waste capacity or Karpenter launches nodes that turn out too small and immediately provisions again.</p>
+<h3 id="newer-capabilities-worth-knowing-exist">Newer capabilities worth knowing exist<a class="anchor" href="#newer-capabilities-worth-knowing-exist">#</a></h3>
+<table>
+<thead>
+<tr>
+<th>Feature</th>
+<th>Gate</th>
+<th>Stage / since</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>ReservedCapacity</code></td>
+<td>on by default</td>
+<td>Beta since <strong>v1.6</strong></td>
+<td><code>capacity-type: reserved</code> for ODCRs and capacity blocks</td>
+</tr>
+<tr>
+<td><code>SpotToSpotConsolidation</code></td>
+<td>off</td>
+<td>Alpha since <strong>v0.34</strong></td>
+<td>Replacement consolidation between spot nodes</td>
+</tr>
+<tr>
+<td><code>NodeRepair</code></td>
+<td>off</td>
+<td>Alpha since <strong>v1.1</strong></td>
+<td>Auto-replace unhealthy nodes</td>
+</tr>
+<tr>
+<td><code>NodeOverlay</code></td>
+<td>off</td>
+<td>Alpha since <strong>v1.7</strong></td>
+<td>Adjust instance-type capacity/price data Karpenter reasons over</td>
+</tr>
+<tr>
+<td><code>StaticCapacity</code></td>
+<td>off</td>
+<td>Alpha since <strong>v1.8</strong></td>
+<td><code>NodePool.spec.replicas</code> — a fixed-size pool</td>
+</tr>
+<tr>
+<td><code>CapacityBuffer</code></td>
+<td>off</td>
+<td>Alpha since <strong>v1.13</strong></td>
+<td>Headroom / over-provisioning</td>
+</tr>
+</tbody>
+</table>
+<p>Source: <a href="https://karpenter.sh/docs/reference/settings/">Settings — feature gates</a>.</p>
+<p><strong>Static NodePools</strong> deserve a note for cell work, because they are the closest thing to a node group Karpenter has. Setting <code>spec.replicas</code> maintains a fixed node count regardless of pod demand. Constraints: cannot be removed once set (no static↔dynamic switching), only <code>limits.nodes</code> is allowed in <code>limits</code>, <code>weight</code> cannot be set, <strong>nodes are not considered for consolidation</strong>, and scale operations <strong>bypass node disruption budgets but still respect PodDisruptionBudgets</strong>. You scale with <code>kubectl scale nodepool &lt;name&gt; --replicas=&lt;n&gt;</code> (<a href="https://karpenter.sh/docs/concepts/nodepools/">NodePools — spec.replicas</a>). This is a plausible answer to "where do the cell's own control-plane-adjacent pods run."</p>
+<h3 id="multi-cloud-status--verified-not-assumed">Multi-cloud status — verified, not assumed<a class="anchor" href="#multi-cloud-status--verified-not-assumed">#</a></h3>
+<p>This is the section where you should trust nothing you read elsewhere.</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>AWS</th>
+<th>Azure</th>
+<th>GCP</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Repo</td>
+<td><a href="https://github.com/aws/karpenter-provider-aws"><code>aws/karpenter-provider-aws</code></a></td>
+<td><a href="https://github.com/Azure/karpenter-provider-azure"><code>Azure/karpenter-provider-azure</code></a></td>
+<td><a href="https://github.com/cloudpilot-ai/karpenter-provider-gcp"><code>cloudpilot-ai/karpenter-provider-gcp</code></a> — <strong>third party</strong></td>
+</tr>
+<tr>
+<td>Governance</td>
+<td>AWS-maintained, CNCF-adjacent via kubernetes-sigs core</td>
+<td>Microsoft-maintained</td>
+<td>Vendor-maintained</td>
+</tr>
+<tr>
+<td>Version (2026-08)</td>
+<td>v1.14.1, LTS to Jul 2027</td>
+<td>v1.14.2</td>
+<td>v0.6.0</td>
+</tr>
+<tr>
+<td>NodeClass kind</td>
+<td><code>EC2NodeClass</code></td>
+<td><code>AKSNodeClass</code></td>
+<td><code>GCENodeClass</code></td>
+</tr>
+<tr>
+<td>NodeClass group/version</td>
+<td><code>karpenter.k8s.aws/**v1**</code></td>
+<td><code>karpenter.azure.com/**v1beta1**</code></td>
+<td><code>karpenter.k8s.gcp/**v1alpha1**</code></td>
+</tr>
+<tr>
+<td>Managed offering</td>
+<td>none (you run it)</td>
+<td><strong>AKS Node Auto Provisioning (NAP)</strong> — GA</td>
+<td>none</td>
+</tr>
+<tr>
+<td>Runs outside the managed service?</td>
+<td>Yes, any Kubernetes on EC2</td>
+<td><strong>No</strong> — requires an AKS cluster</td>
+<td><strong>No</strong> — requires a GKE Standard node pool</td>
+</tr>
+<tr>
+<td>Interruption handling</td>
+<td>SQS + EventBridge</td>
+<td>provider-specific</td>
+<td>limited</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Core.</strong> <a href="https://github.com/kubernetes-sigs/karpenter"><code>kubernetes-sigs/karpenter</code></a> is a Go library (<code>module sigs.k8s.io/karpenter</code>), not a runnable controller. Its <code>CloudProvider</code> interface is nine methods — <code>Create</code>, <code>Delete</code>, <code>Get</code>, <code>List</code>, <code>GetInstanceTypes</code>, <code>IsDrifted</code>, <code>RepairPolicies</code>, <code>Name</code>, <code>GetSupportedNodeClasses</code> (<a href="https://github.com/kubernetes-sigs/karpenter/blob/main/pkg/cloudprovider/types.go">types.go</a>). Every provider vendors the library and ships its own binary. Core and the AWS provider version in lockstep; both released v1.14.1 on 2026-08-21 within minutes of each other.</p>
+<p><strong>Azure.</strong> The provider is real and production-grade, but two facts constrain how you'd use it. First, <strong><code>AKSNodeClass</code> is still <code>karpenter.azure.com/v1beta1</code></strong> — the <code>v1beta1</code> package carries the <code>+kubebuilder:storageversion</code> marker and there is no <code>v1</code> package in the repo, and both the repo README and Microsoft Learn use <code>v1beta1</code> in every example (<a href="https://learn.microsoft.com/en-us/azure/aks/node-auto-provisioning-aksnodeclass">AKSNodeClass on Microsoft Learn</a>). So a multi-cloud abstraction over NodeClasses must handle a version skew between clouds. Second, <strong>AKS Node Auto Provisioning <em>is</em> this provider</strong>, run as a managed addon: NAP "automatically deploys, configures, and manages Karpenter on your AKS clusters and is based on the open-source Karpenter and AKS Karpenter provider projects" (<a href="https://learn.microsoft.com/en-us/azure/aks/node-auto-provisioning">AKS NAP</a>), enabled with <code>az aks create/update --node-provisioning-mode Auto</code>. The repo README explicitly recommends NAP over self-hosting and notes that Microsoft support channels cover NAP only, with self-hosted supported best-effort via GitHub issues. <strong>Self-hosted still requires AKS</strong> — the provider's own install script calls <code>az aks show</code> to read the node resource group, network profile, and kubelet identity. NAP is GA; I could not verify the exact GA date from a primary source (the Azure Updates page would not render), so treat "mid-2025" as approximate. Key <code>AKSNodeClass</code> fields: <code>imageFamily</code> (<code>Ubuntu</code> | <code>Ubuntu2204</code> | <code>Ubuntu2404</code> | <code>AzureLinux</code>), <code>osDiskSizeGB</code> (30–2048, default 128), <code>maxPods</code> (10–250), <code>vnetSubnetID</code>, <code>kubelet</code>, <code>fipsMode</code>, <code>tags</code>.</p>
+<p><strong>GCP.</strong> There is <strong>no official Karpenter provider for GCP</strong> — nothing under <code>kubernetes-sigs</code>, nothing under <code>google</code>. The <code>kubernetes-sigs/karpenter</code> README's GCP entry points at the third-party CloudPilot AI repo. That provider is at v0.6.0, defines <code>GCENodeClass</code> at <code>karpenter.k8s.gcp/v1alpha1</code>, and requires <strong>GKE Standard</strong> with an existing node pool — architecturally, because it reads bootstrap metadata (instance templates and <code>kube-env</code>) from that node pool. GKE's native answers are Cluster Autoscaler, <a href="https://cloud.google.com/kubernetes-engine/docs/concepts/node-auto-provisioning">node auto-provisioning</a> (described as "an extension of the GKE cluster autoscaler," creating and deleting whole node pools), and <a href="https://cloud.google.com/kubernetes-engine/docs/concepts/about-custom-compute-classes">custom ComputeClasses</a>, whose <code>spec.priorities</code> hierarchy is the closest native analogue to a Karpenter NodePool's fallback behavior.</p>
+<p><strong>Practical consequence for a three-cloud cell platform:</strong> you cannot write "one NodePool YAML, three clouds." You can write one <code>NodePool</code> (<code>karpenter.sh/v1</code> is genuinely portable) and three NodeClass templates at three API versions, and on GCP you should probably not use Karpenter at all — use ComputeClasses and accept that GCP cells have a different node-lifecycle implementation. Be honest about that in design docs rather than pretending the abstraction is uniform.</p>
+<p>There is also <a href="https://github.com/kubernetes-sigs/karpenter-provider-cluster-api"><code>kubernetes-sigs/karpenter-provider-cluster-api</code></a>, which drives CAPI <code>MachineDeployment</code>s. Its README calls it "an experimental proof of concept," it has exactly one release (v0.2.0, Oct 2025), and drift detection, consolidation, and cost integration are all unimplemented. Interesting as a design reference; not a production path today.</p>
+<h3 id="installation-iam-and-the-bootstrap-chicken-and-egg">Installation, IAM, and the bootstrap chicken-and-egg<a class="anchor" href="#installation-iam-and-the-bootstrap-chicken-and-egg">#</a></h3>
+<p>The AWS install is a Helm chart from <code>oci://public.ecr.aws/karpenter/karpenter</code>, into the <strong><code>kube-system</code></strong> namespace in the current guide, with <code>settings.clusterName</code>, <code>settings.interruptionQueue</code>, and an IRSA role annotation (<a href="https://karpenter.sh/docs/getting-started/migrating-from-cas/">Migrating from CAS</a>).</p>
+<p><strong>Two IAM roles, not one:</strong></p>
+<ul>
+<li><strong><code>KarpenterNodeRole-&lt;cluster&gt;</code></strong> — assumed by EC2, attached policies <code>AmazonEKSWorkerNodePolicy</code>, <code>AmazonEKS_CNI_Policy</code>, <code>AmazonEC2ContainerRegistryPullOnly</code>, <code>AmazonSSMManagedInstanceCore</code>. Referenced from <code>EC2NodeClass.spec.role</code>.</li>
+<li><strong><code>KarpenterControllerRole-&lt;cluster&gt;</code></strong> — assumed by the controller's ServiceAccount via IRSA (OIDC trust scoped to <code>system:serviceaccount:kube-system:karpenter</code>).</li>
+</ul>
+<p>The controller policy is worth reading rather than copying blindly, because it is a real privilege-escalation surface. Broad <code>Resource: "*"</code> actions include <code>ec2:RunInstances</code>, <code>ec2:CreateFleet</code>, <code>ec2:CreateLaunchTemplate</code>, <code>ec2:CreateTags</code>, the <code>Describe*</code> family, <code>ssm:GetParameter</code>, and <code>pricing:GetProducts</code>. Then the scoped parts:</p>
+<ul>
+<li><code>ec2:TerminateInstances</code> is conditioned on <code>StringLike: {"ec2:ResourceTag/karpenter.sh/nodepool": "*"}</code> — Karpenter can only terminate instances it tagged.</li>
+<li><code>iam:PassRole</code> is scoped to exactly the node role ARN.</li>
+<li>Instance-profile create/tag/modify actions are conditioned on <code>aws:RequestTag</code>/<code>aws:ResourceTag</code> for <code>kubernetes.io/cluster/&lt;name&gt;: owned</code>, <code>topology.kubernetes.io/region</code>, and <code>karpenter.k8s.aws/ec2nodeclass</code>.</li>
+</ul>
+<p><strong>Note what this means: <code>ec2:RunInstances</code> is unscoped.</strong> Karpenter can launch any instance type in the account. Your cost control is <code>NodePool.spec.limits</code>, not IAM. For a cell platform, one cell per account (which Temporal's published cell architecture already implies) makes that blast radius acceptable; a shared account makes it a real risk.</p>
+<p><strong>The bootstrap chicken-and-egg.</strong> Karpenter provisions nodes, so something must provision the node Karpenter runs on. Karpenter cannot run on a node it owns — if it did, consolidating that node would kill the controller mid-flight, and a cold cluster with zero nodes could never start it. The documented answers:</p>
+<ol>
+<li><strong>A small managed node group</strong> (EKS MNG / AKS system pool) sized for Karpenter plus other cluster-critical pods. The migration guide pins Karpenter to it with node affinity:</li>
+</ol>
+<p><code>yaml
+   affinity:
+     nodeAffinity:
+       requiredDuringSchedulingIgnoredDuringExecution:
+         nodeSelectorTerms:
+           - matchExpressions:
+               - key: karpenter.sh/nodepool
+                 operator: DoesNotExist     # never on a Karpenter node
+               - key: eks.amazonaws.com/nodegroup
+                 operator: In
+                 values: ["${NODEGROUP}"]
+     podAntiAffinity:
+       requiredDuringSchedulingIgnoredDuringExecution:
+         # The labelSelector is load-bearing: a PodAffinityTerm with a null
+         # selector matches no pods, so without it this term does nothing.
+         - topologyKey: "kubernetes.io/hostname"
+           labelSelector:
+             matchLabels:
+               app.kubernetes.io/instance: karpenter</code></p>
+<p>The guide recommends a <strong>minimum of 2 instances for a single multi-AZ node group, or 1 per group for single-AZ groups</strong>, and suggests doing the same for CoreDNS and metrics-server.</p>
+<ol start="2">
+<li>
+<p><strong>EKS Fargate</strong> for the Karpenter deployment — no node group at all. Not covered in the migration guide, but it is the other common production answer and removes the "who upgrades the bootstrap node group" question.</p>
+</li>
+<li>
+<p><strong>AKS NAP</strong> dodges it entirely: the addon runs on the AKS-managed system pool.</p>
+</li>
+</ol>
+<p>For cell lifecycle, this is a real design decision, because the bootstrap node group is <em>another thing to upgrade</em> on every cell, with its own AMI and its own drain semantics — and it is not managed by Karpenter's drift mechanism.</p>
+<p><strong>Upgrade path.</strong> Karpenter follows semver; breaking changes appear in minor releases with a permanent "upgrading to x.y.z+" section in the release notes (<a href="https://karpenter.sh/docs/upgrading/compatibility/">Compatibility</a>). The Kubernetes compatibility matrix as of v1.14:</p>
+<table>
+<thead>
+<tr>
+<th>Kubernetes</th>
+<th>1.30</th>
+<th>1.31</th>
+<th>1.32</th>
+<th>1.33</th>
+<th>1.34</th>
+<th>1.35</th>
+<th>1.36</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Minimum Karpenter</td>
+<td>&gt;= 0.37</td>
+<td>&gt;= 1.0.5</td>
+<td>&gt;= 1.2</td>
+<td>&gt;= 1.5</td>
+<td>&gt;= 1.6</td>
+<td>&gt;= 1.9</td>
+<td>&gt;= 1.13</td>
+</tr>
+</tbody>
+</table>
+<p>Three release channels: <strong>stable</strong> (semver-tagged, the only one for production), <strong>release candidates</strong> (<code>x.y.z-rc.N</code>), and <strong>snapshot</strong> (per-commit, published to a private ECR at <code>021119463062.dkr.ecr.us-east-1.amazonaws.com</code>, <strong>removed after 90 days</strong>, never for production).</p>
+<p>The upgrade procedure that people skip: <strong>CRDs are not upgraded by <code>helm upgrade</code> on the main chart.</strong> The migration guide applies them explicitly from raw GitHub URLs (<code>karpenter.sh_nodepools.yaml</code>, <code>karpenter.sh_nodeclaims.yaml</code>, <code>karpenter.k8s.aws_ec2nodeclasses.yaml</code>). If you use Helm for templating only, with no release state, this is actually <em>easier</em> — render CRDs as part of the manifest set and apply them with everything else — but it must be explicit.</p>
+<p><em>See also: <a href="03-multicloud-aws-gcp-azure.html#workload-identity-how-a-pod-gets-a-cloud-credential">workload identity: how a pod gets a cloud credential</a> for the IRSA-versus-Pod-Identity trade behind that controller ServiceAccount annotation, and why a fleet of cells wants the latter.</em></p>
+<h3 id="observability-metrics-events-logs">Observability: metrics, events, logs<a class="anchor" href="#observability-metrics-events-logs">#</a></h3>
+<p>Metrics are Prometheus format on <code>:8080/metrics</code> (<code>METRICS_PORT</code>), default service address <code>karpenter.kube-system.svc.cluster.local:8080</code> (<a href="https://karpenter.sh/docs/reference/metrics/">Metrics</a>). Karpenter labels each metric with a stability level (STABLE / BETA / ALPHA / DEPRECATED) — build dashboards on STABLE and BETA, and expect ALPHA names to move.</p>
+<p>The dashboard I would build for a cell fleet:</p>
+<p><strong>"Is Karpenter healthy at all?"</strong></p>
+<ul>
+<li><code>karpenter_cluster_state_synced</code> — 1 if Karpenter's in-memory state matches the API server (STABLE)</li>
+<li><code>karpenter_cluster_state_unsynced_time_seconds</code> — alert if this is ever non-trivially positive (STABLE)</li>
+<li><code>karpenter_build_info</code> — version, for fleet-wide upgrade tracking (STABLE)</li>
+<li><code>leader_election_master_status</code>, <code>controller_runtime_reconcile_errors_total</code>, <code>controller_runtime_reconcile_panics_total</code></li>
+</ul>
+<p><strong>"Why didn't it scale up?"</strong></p>
+<ul>
+<li><code>karpenter_scheduler_unschedulable_pods_count</code> — pods Karpenter itself deems unschedulable (ALPHA)</li>
+<li><code>karpenter_scheduler_ignored_pods_count</code> — pods it skipped entirely (ALPHA)</li>
+<li><code>karpenter_scheduler_queue_depth</code>, <code>karpenter_scheduler_scheduling_duration_seconds</code> (STABLE)</li>
+<li><code>karpenter_scheduler_pending_pods_by_effective_zone_count</code> — dimensioned by the <em>intersection</em> of pod zone signals, PVC zones, and topology constraints; the value <code>none</code> means "no valid zone intersection exists," which is the single most useful signal for a stuck StatefulSet (ALPHA)</li>
+<li><code>karpenter_cloudprovider_instance_launch_failures_total</code> — by AZ, zone ID, capacity type, and <strong>launch failure reason</strong>; this is where <code>InsufficientInstanceCapacity</code> shows up (BETA)</li>
+<li><code>karpenter_cloudprovider_instance_type_offering_available</code> (BETA)</li>
+<li><code>karpenter_nodepools_limit</code> vs <code>karpenter_nodepools_usage</code> (ALPHA) — did you hit <code>spec.limits</code>?</li>
+<li><code>karpenter_nodeclaims_created_total</code> is labeled with <strong>whether minValues was relaxed</strong> for that claim (STABLE)</li>
+</ul>
+<p><strong>"Why did it kill my node?"</strong></p>
+<ul>
+<li><code>karpenter_voluntary_disruption_decisions_total</code> — labeled by decision, <strong>reason</strong>, and consolidation type (STABLE). This is the first query to run in a postmortem.</li>
+<li><code>karpenter_voluntary_disruption_eligible_nodes</code> by reason (BETA)</li>
+<li><code>karpenter_nodepools_allowed_disruptions</code> and <code>karpenter_nodepools_nodes_consuming_budgets</code> — is the budget doing anything? (ALPHA)</li>
+<li><code>karpenter_nodeclaims_disrupted_total</code> by reason and NodePool (ALPHA)</li>
+<li><code>karpenter_interruption_received_messages_total</code> by message type and actionability (STABLE) — separates "spot took it" from "we consolidated it"</li>
+<li><code>karpenter_nodeclaims_unhealthy_disrupted_total</code> — labeled by node condition and <strong>image ID</strong>, which is exactly what you want when a bad AMI is the cause (ALPHA)</li>
+<li><code>karpenter_pods_drained_total</code> and <code>karpenter_pods_eviction_requests_total</code> <strong>by response code</strong> (ALPHA) — 429s here mean PDBs are blocking</li>
+</ul>
+<p><strong>Status conditions.</strong> NodePools carry <code>NodeClassReady</code>, <code>ValidationSucceeded</code>, <code>NodeRegistrationHealthy</code>, and a rolled-up <code>Ready</code>. <code>NodeRegistrationHealthy</code> is the one that catches the ugliest class of bug — <em>"Indicates whether a misconfiguration is preventing launched nodes from registering successfully and requires manual investigation"</em> — and it is <strong>informational and does not affect the top-level <code>Ready</code></strong> (<a href="https://karpenter.sh/docs/concepts/nodepools/">NodePools — status.conditions</a>). Alert on it separately; a NodePool that is <code>Ready=True</code> but <code>NodeRegistrationHealthy=False</code> is launching instances that never join the cluster, i.e. burning money silently. A NodePool that is not <code>Ready</code> is not considered for scheduling at all.</p>
+<p><strong>Events.</strong> <code>kubectl describe node</code> on a node you expected to be consolidated is the fastest debug loop:</p>
+<div class="codehilite"><pre><span></span><code>Events:
+  Type     Reason             Age                From        Message
+  Normal   Unconsolidatable   66s                karpenter   pdb default/inflate-pdb prevents pod evictions
+  Normal   Unconsolidatable   33s (x3 over 30m)  karpenter   can&#39;t replace with a lower-priced node
+</code></pre></div>
+
+<p><code>ConsolidationApproved</code> events (on Node/NodeClaim for single-node actions, on the NodePool for multi-node) carry the <code>Balanced</code> score and savings/disruption percentages.</p>
+<p><strong>Logs.</strong> <code>LOG_LEVEL</code> accepts <code>debug</code>, <code>info</code> (default), <code>error</code>. Balanced-consolidation scoring decisions are logged at <code>debug</code>, as are the "pod X has a preferred Anti-Affinity which can prevent consolidation" warnings. <code>DISABLE_CLUSTER_STATE_OBSERVABILITY</code> turns off cluster state metrics and events — useful at extreme scale, terrible for debugging.</p>
+<p><strong>A concrete debug ladder for "why didn't it scale up":</strong></p>
+<ol>
+<li><code>kubectl get nodepool -o wide</code> — is <code>Ready</code> true? Is <code>NodeClassReady</code> true?</li>
+<li><code>kubectl get ec2nodeclass &lt;name&gt; -o jsonpath='{.status}'</code> — are <code>subnets</code>, <code>securityGroups</code>, <code>amis</code> all populated? Empty means a discovery tag is missing.</li>
+<li><code>kubectl describe pod &lt;pending&gt;</code> — does its requirement set actually intersect the NodePool's? A <code>nodeSelector</code> for an instance type outside the NodePool's list means Karpenter will never launch.</li>
+<li><code>karpenter_nodepools_usage</code> vs <code>karpenter_nodepools_limit</code>.</li>
+<li>Controller logs — look for <code>InsufficientInstanceCapacity</code>, or the min-values relaxation message.</li>
+<li>Remember offering-unavailability is <strong>cached for 3 minutes</strong> per instance-type/zone (<a href="https://karpenter.sh/docs/concepts/nodepools/">NodePools — capacity type</a>), so a fix may take that long to take effect.</li>
+</ol>
+<p><em>See also: <a href="14-observability-for-cells.html#what-to-actually-monitor-in-a-cell">what to actually monitor in a cell</a> for where these metrics belong in the cell's alert set, and why <code>karpenter_nodepools_usage</code> against <code>_limit</code> is a fleet metric rather than a dashboard panel.</em></p>
+<h3 id="cost-implications-and-instance-type-selection-strategy">Cost implications and instance-type selection strategy<a class="anchor" href="#cost-implications-and-instance-type-selection-strategy">#</a></h3>
+<p>Karpenter's cost model is: the cheaper the instance mix that satisfies the pods, the better. Levers, roughly in order of impact:</p>
+<ol>
+<li><strong>Requirement breadth.</strong> The single biggest lever. <code>requirements: []</code> gives Karpenter the whole catalogue; a five-instance-type allowlist gives it almost nothing. The docs' recommendation is to constrain <em>"only in ways that are absolutely necessary,"</em> with a suggested baseline of arch, os, capacity-type, <code>instance-category In [c, m, r]</code>, and <code>instance-generation Gte 3</code>. For Temporal cells I would add a generation floor much higher than 3 (Graviton-era instances are meaningfully cheaper per unit of throughput) and would allow both <code>amd64</code> and <code>arm64</code> only if the images are genuinely multi-arch.</li>
+<li><strong>Capacity type mix.</strong> <code>reserved</code> → <code>spot</code> → <code>on-demand</code> priority means adding <code>reserved</code> to a NodePool's allowed types transparently soaks up ODCR/capacity-block capacity you have already paid for before spending on-demand.</li>
+<li><strong>Consolidation policy.</strong> <code>WhenEmptyOrUnderutilized</code> saves the most and churns the most; <code>Balanced</code> is the right default for stateful cells; <code>WhenEmpty</code> is nearly free of churn and leaves real money on the table.</li>
+<li><strong><code>consolidateAfter</code>.</strong> Short values chase every transient dip. For workloads with bursty pod turnover, a longer value is both cheaper (fewer wasted launches) and safer.</li>
+<li><strong>Node overhead.</strong> <code>VM_MEMORY_OVERHEAD_PERCENT</code> (0.075) and the <code>kubelet.systemReserved</code>/<code>kubeReserved</code> block on the NodeClass directly determine allocatable, and therefore how many nodes you buy.</li>
+<li><strong><code>karpenter_nodepools_cost_total</code></strong> exists (ALPHA) — <em>"Total cost of the nodepool from Karpenter's perspective. Units are determined by the cloud provider. Not an authoritative source for billing."</em> Good for relative comparison across cells; do not reconcile it against an invoice.</li>
+</ol>
+<p>An honest caveat: Karpenter's pricing data comes from the AWS on-demand pricing endpoint plus spot price history. In an isolated VPC (<code>ISOLATED_VPC=true</code>), the on-demand pricing lookup is <strong>disabled</strong> (<a href="https://karpenter.sh/docs/reference/settings/">Settings</a>), so cost-based consolidation degrades to whatever static data is compiled in. If your cells run in isolated VPCs — plausible for a security-conscious multi-tenant cloud — validate that consolidation is still making sensible choices.</p>
+<hr />
+<h2 id="hands-on">Hands-on<a class="anchor" href="#hands-on">#</a></h2>
+<h3 id="honest-framing">Honest framing<a class="anchor" href="#honest-framing">#</a></h3>
+<p><strong>Karpenter cannot be fully exercised on <code>kind</code>.</strong> Its whole job is calling a cloud provider's instance API. What you <em>can</em> do on kind is exercise the entire core: the scheduling simulator, NodePool/NodeClaim lifecycle, consolidation, drift, disruption budgets, and the termination flow — using the <strong>KWOK provider</strong>, which is a fake cloud provider that fabricates instance types and lets <a href="https://kwok.sigs.k8s.io/">KWOK</a> simulate the nodes. That is genuinely most of the learning, and it is free.</p>
+<p>For anything provider-specific — EC2NodeClass discovery, AMI drift, spot interruption via SQS, IAM — you need a real cloud. Lab 3 is costed.</p>
+<h3 id="lab-1--karpenter-on-kind-with-the-kwok-provider-free">Lab 1 — Karpenter on kind with the KWOK provider (free)<a class="anchor" href="#lab-1--karpenter-on-kind-with-the-kwok-provider-free">#</a></h3>
+<p>This is the reference test harness the Karpenter maintainers themselves use.</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># Prereqs: docker, kind, kubectl, go, make, helm</span>
+git clone https://github.com/kubernetes-sigs/karpenter.git
+<span class="nb">cd</span> karpenter
+
+kind create cluster --name karpenter-lab
+
+<span class="c1"># Build the KWOK provider image into the kind cluster directly.</span>
+<span class="nb">export</span> <span class="nv">KWOK_REPO</span><span class="o">=</span>kind.local
+<span class="nb">export</span> <span class="nv">KIND_CLUSTER_NAME</span><span class="o">=</span>karpenter-lab
+
+make install-kwok     <span class="c1"># installs KWOK itself</span>
+make apply            <span class="c1"># builds + deploys the KWOK-backed Karpenter; re-run to redeploy</span>
+
+<span class="c1"># Push real workloads off the kind control-plane node so they land on kwok nodes.</span>
+kubectl taint nodes karpenter-lab-control-plane <span class="nv">CriticalAddonsOnly</span><span class="o">=</span>true:NoSchedule
+</code></pre></div>
+
+<p>Source: <a href="https://github.com/kubernetes-sigs/karpenter/blob/main/kwok/README.md"><code>kwok/README.md</code></a>. Note the fake labels it introduces — <code>karpenter.kwok.sh/instance-type</code>, <code>instance-size</code>, <code>instance-family</code>, <code>instance-cpu</code>, and <code>karpenter.sh/instance-memory</code> — which the README warns <em>"will not work with a real Karpenter installation."</em></p>
+<p>Now create a NodePool against the KWOK NodeClass:</p>
+<div class="codehilite"><pre><span></span><code><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">karpenter.kwok.sh/v1alpha1</span><span class="w"></span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">KWOKNodeClass</span><span class="w"></span>
+<span class="nt">metadata</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">default</span><span class="w"></span>
+<span class="nt">spec</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">{}</span><span class="w"></span>
+<span class="nn">---</span><span class="w"></span>
+<span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">karpenter.sh/v1</span><span class="w"></span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">NodePool</span><span class="w"></span>
+<span class="nt">metadata</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">default</span><span class="w"></span>
+<span class="nt">spec</span><span class="p">:</span><span class="w"></span>
+<span class="w">  </span><span class="nt">template</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">spec</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="nt">nodeClassRef</span><span class="p">:</span><span class="w"></span>
+<span class="w">        </span><span class="nt">group</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">karpenter.kwok.sh</span><span class="w"></span>
+<span class="w">        </span><span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">KWOKNodeClass</span><span class="w"></span>
+<span class="w">        </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">default</span><span class="w"></span>
+<span class="w">      </span><span class="nt">requirements</span><span class="p">:</span><span class="w"></span>
+<span class="w">        </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">key</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">kubernetes.io/arch</span><span class="w"></span>
+<span class="w">          </span><span class="nt">operator</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">In</span><span class="w"></span>
+<span class="w">          </span><span class="nt">values</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;amd64&quot;</span><span class="p p-Indicator">]</span><span class="w"></span>
+<span class="w">      </span><span class="nt">expireAfter</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1h</span><span class="w"></span>
+<span class="w">      </span><span class="nt">terminationGracePeriod</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">5m</span><span class="w"></span>
+<span class="w">  </span><span class="nt">disruption</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">consolidationPolicy</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">WhenEmptyOrUnderutilized</span><span class="w"></span>
+<span class="w">    </span><span class="nt">consolidateAfter</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">30s</span><span class="w"></span>
+<span class="w">    </span><span class="nt">budgets</span><span class="p">:</span><span class="w"></span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">nodes</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;1&quot;</span><span class="w"></span>
+<span class="w">  </span><span class="nt">limits</span><span class="p">:</span><span class="w"></span>
+<span class="w">    </span><span class="nt">cpu</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;200&quot;</span><span class="w"></span>
+</code></pre></div>
+
+<p><strong>Exercise 1 — provisioning and bin-packing.</strong></p>
+<div class="codehilite"><pre><span></span><code>kubectl create deployment inflate --image<span class="o">=</span>public.ecr.aws/eks-distro/kubernetes/pause:3.7 --replicas<span class="o">=</span><span class="m">0</span>
+kubectl <span class="nb">set</span> resources deployment inflate --requests<span class="o">=</span><span class="nv">cpu</span><span class="o">=</span><span class="m">1</span>,memory<span class="o">=</span>1Gi
+kubectl scale deployment inflate --replicas<span class="o">=</span><span class="m">12</span>
+kubectl get nodeclaims -w
+</code></pre></div>
+
+<p>Watch how <em>many</em> nodes appear and how large they are. Then set <code>BATCH_MAX_DURATION=1s</code> on the Karpenter deployment and repeat — you should get more, smaller nodes.</p>
+<p><strong>Exercise 2 — consolidation.</strong></p>
+<div class="codehilite"><pre><span></span><code>kubectl scale deployment inflate --replicas<span class="o">=</span><span class="m">2</span>
+kubectl get nodeclaims -w
+<span class="c1"># then, once it settles:</span>
+kubectl describe node &lt;a node that survived&gt; <span class="p">|</span> sed -n <span class="s1">&#39;/Events/,$p&#39;</span>
+</code></pre></div>
+
+<p>Then flip <code>consolidationPolicy</code> to <code>WhenEmpty</code> and repeat. Then try <code>Balanced</code> and look for <code>ConsolidationApproved</code> events and the <code>karpenter_consolidation_score</code> metric.</p>
+<p><strong>Exercise 3 — a PDB blocks consolidation.</strong></p>
+<div class="codehilite"><pre><span></span><code>kubectl create poddisruptionbudget inflate-pdb --selector<span class="o">=</span><span class="nv">app</span><span class="o">=</span>inflate --max-unavailable<span class="o">=</span><span class="m">0</span>
+kubectl scale deployment inflate --replicas<span class="o">=</span><span class="m">2</span>
+kubectl describe node &lt;underutilized node&gt; <span class="p">|</span> grep Unconsolidatable
+</code></pre></div>
+
+<p>You should see <code>pdb default/inflate-pdb prevents pod evictions</code>. Now set <code>max-unavailable=1</code> and watch it unblock.</p>
+<p><strong>Exercise 4 — drift.</strong> Edit <code>NodePool.spec.template.spec.requirements</code> to exclude an instance family currently in use. Every incompatible NodeClaim should get the <code>Drifted</code> status condition. Now set <code>budgets: [{nodes: "0", reasons: ["Drifted"]}]</code> and confirm the drift is detected but <em>not acted on</em> — this is the exact mechanism you'd use to freeze image rollouts during a change freeze.</p>
+<div class="codehilite"><pre><span></span><code>kubectl get nodeclaims -o custom-columns<span class="o">=</span><span class="se">\</span>
+<span class="s1">&#39;NAME:.metadata.name,DRIFTED:.status.conditions[?(@.type==&quot;Drifted&quot;)].status&#39;</span>
+</code></pre></div>
+
+<p><strong>Exercise 5 — <code>do-not-disrupt</code> and the expiry deadlock.</strong> Annotate the deployment with <code>karpenter.sh/do-not-disrupt: "true"</code>, set <code>expireAfter: 2m</code>, and <strong>remove</strong> <code>terminationGracePeriod</code>. Watch a node get stuck mid-drain forever. This reproduces the documented failure mode in about three minutes, and it is the single most valuable thing on this list to have seen with your own eyes. Then add <code>terminationGracePeriod: 5m</code> and watch it resolve. Then change the annotation to <code>"30s"</code> and watch the duration form expire cleanly.</p>
+<p><strong>Exercise 6 — budgets under load.</strong> Set <code>budgets: [{nodes: "1"}]</code>, create 10 nodes, then drift all of them at once. Confirm the rollout is strictly serial, and watch <code>karpenter_nodepools_allowed_disruptions</code> and <code>karpenter_nodepools_nodes_consuming_budgets</code>.</p>
+<p>Teardown:</p>
+<div class="codehilite"><pre><span></span><code>make delete
+make uninstall-kwok
+kind delete cluster --name karpenter-lab
+</code></pre></div>
+
+<h3 id="lab-2--the-aws-kwok-provider-free-more-realistic">Lab 2 — the AWS KWOK provider (free, more realistic)<a class="anchor" href="#lab-2--the-aws-kwok-provider-free-more-realistic">#</a></h3>
+<p><a href="https://github.com/aws/karpenter-provider-aws/tree/main/kwok"><code>aws/karpenter-provider-aws/kwok</code></a> is a <em>separate</em> harness that fakes the EC2 API while running the real AWS controllers. Its make targets live in <code>kwok/Makefile</code>, not the repo root. This is the right place to exercise EC2NodeClass-shaped behavior without spending money, and it is what AWS uses for scale testing.</p>
+<h3 id="lab-3--a-real-eks-cluster-costed">Lab 3 — a real EKS cluster (costed)<a class="anchor" href="#lab-3--a-real-eks-cluster-costed">#</a></h3>
+<p>Do this once, deliberately, and tear it down the same day.</p>
+<p><strong>Rough cost, <code>us-west-2</code>, ~3 hours:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Item</th>
+<th>Rate</th>
+<th>3h</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>EKS control plane</td>
+<td>$0.10/hr</td>
+<td>$0.30</td>
+</tr>
+<tr>
+<td>2 × <code>m5.large</code> bootstrap node group (on-demand)</td>
+<td>~$0.096/hr each</td>
+<td>~$0.58</td>
+</tr>
+<tr>
+<td>Karpenter-provisioned nodes (say 3 × <code>c6g.xlarge</code> on-demand, intermittent)</td>
+<td>~$0.136/hr each</td>
+<td>~$1.20</td>
+</tr>
+<tr>
+<td>NAT gateway (1)</td>
+<td>$0.045/hr + data</td>
+<td>~$0.15</td>
+</tr>
+<tr>
+<td>EBS gp3 (5 × 100 GiB, partial hour)</td>
+<td>$0.08/GiB-month</td>
+<td>~$0.16</td>
+</tr>
+<tr>
+<td>SQS interruption queue</td>
+<td>effectively free at this volume</td>
+<td>~$0.00</td>
+</tr>
+<tr>
+<td><strong>Total</strong></td>
+<td></td>
+<td><strong>~$2.50</strong></td>
+</tr>
+</tbody>
+</table>
+<p>Prices are indicative; check the <a href="https://aws.amazon.com/ec2/pricing/on-demand/">AWS pricing pages</a> for current rates and your region. The dominant risk is not the hourly rate, it is <em>forgetting to delete</em>. Set a budget alarm before you start.</p>
+<p>Follow <a href="https://karpenter.sh/docs/getting-started/getting-started-with-karpenter/">Getting Started with Karpenter</a>, which uses <code>eksctl</code> and a CloudFormation template that creates the interruption queue and EventBridge rules for you. Then run the exercises that only work for real:</p>
+<ol>
+<li><strong>AMI drift.</strong> Set <code>amiSelectorTerms: [{alias: al2023@latest}]</code>, then pin it to a specific version, then unpin it. Confirm that unpinning drifts every node with no other change.</li>
+<li><strong>Spot interruption.</strong> Create a spot NodePool, then use <a href="https://docs.aws.amazon.com/fis/latest/userguide/fis-actions-reference.html">AWS FIS</a> <code>aws:ec2:send-spot-instance-interruptions</code> to inject a real interruption. Watch <code>karpenter_interruption_received_messages_total</code> increment and a replacement pre-spin.</li>
+<li><strong>Spot diversification.</strong> Create a NodePool with <code>instance-type In [&lt;one type&gt;]</code> and spot capacity, and watch launch failures under <code>karpenter_cloudprovider_instance_launch_failures_total</code>. Then add <code>minValues: 10</code> on <code>instance-type</code> and see the difference.</li>
+<li><strong>Delete the whole thing.</strong> <code>kubectl delete nodepool --all</code> and watch the cascading NodeClaim → Node → instance teardown via owner references. This is your cell-teardown dry run, and it is worth timing.</li>
+</ol>
+<div class="codehilite"><pre><span></span><code>eksctl delete cluster --name &lt;name&gt;
+<span class="c1"># then verify no orphaned instances remain:</span>
+aws ec2 describe-instances <span class="se">\</span>
+  --filters <span class="s2">&quot;Name=tag-key,Values=karpenter.sh/nodepool&quot;</span> <span class="s2">&quot;Name=instance-state-name,Values=running&quot;</span> <span class="se">\</span>
+  --query <span class="s1">&#39;Reservations[].Instances[].InstanceId&#39;</span>
+</code></pre></div>
+
+<hr />
+<h2 id="production-gotchas">Production gotchas<a class="anchor" href="#production-gotchas">#</a></h2>
+<ol>
+<li>
+<p><strong>Every internet example you find is for a dead API.</strong> <code>Provisioner</code>, <code>AWSNodeTemplate</code>, <code>Machine</code>, <code>apiVersion: karpenter.sh/v1beta1</code>, and <code>kubelet:</code> under the NodePool are all removed. Karpenter 1.1.0 dropped v1beta1 support outright (<a href="https://karpenter.sh/v1.0/upgrading/v1-migration/">v1 Migration</a>). Before trusting any snippet, check for <code>apiVersion: karpenter.sh/v1</code> and <code>nodeClassRef.group</code>. Pin your docs reading to <a href="https://karpenter.sh/docs/">karpenter.sh/docs</a> (currently v1.14), not a version-less Google result.</p>
+</li>
+<li>
+<p><strong>The default disruption config is aggressive, and silence means you accepted it.</strong> Omitting <code>spec.disruption</code> gives you <code>consolidationPolicy: WhenEmptyOrUnderutilized</code> and <code>consolidateAfter: 0s</code> (<a href="https://karpenter.sh/docs/concepts/disruption/">Disruption — defaults</a>). Omitting <code>budgets</code> gives you a single <code>nodes: 10%</code>. On a 10-node cell that is one node at a time, which is probably fine; on a 200-node cell it is 20 nodes churning simultaneously. Always write budgets explicitly.</p>
+</li>
+<li>
+<p><strong>Disruption budgets do not stop expiration, interruption, or node repair.</strong> The docs state this in two separate places. A team that sets <code>budgets: [{nodes: "0"}]</code> believing they have frozen all node churn, and then hits <code>expireAfter: 720h</code> on a fleet built the same week, will get a synchronized fleet-wide expiry. Stagger <code>expireAfter</code> across cells, or set it to <code>Never</code> and roll exclusively via drift, which <em>is</em> budgeted.</p>
+</li>
+<li>
+<p><strong>A missing <code>startupTaint</code> causes runaway provisioning.</strong> From the NodePool docs: <em>"Failure to provide accurate <code>startupTaints</code> can result in Karpenter continually provisioning new nodes. When the new node joins and the startup taint that Karpenter is unaware of is added, Karpenter now considers the pending pod to be unschedulable to this node. Karpenter will attempt to provision yet another new node."</em> Any CNI, security agent, or node-init DaemonSet that taints on boot — Cilium's <code>node.cilium.io/agent-not-ready</code> is the canonical case — must be declared in <code>startupTaints</code>. This bug looks like a cost incident, not a config error.</p>
+</li>
+<li>
+<p><strong><code>alias: al2023@latest</code> will roll your entire fleet without you touching anything.</strong> Drift on <code>amiSelectorTerms</code> is <em>resolved</em>, not hashed: a new AMI publication drifts every node (<a href="https://karpenter.sh/docs/concepts/disruption/">Disruption — special cases on drift</a>), and <code>AMI_REFRESH_INTERVAL</code> defaults to <strong>1 minute</strong>. Pin the alias to a version and bump it as a deliberate, budgeted change. This is the correct primitive for cell node-image upgrades — but only if you drive it.</p>
+</li>
+<li>
+<p><strong>You cannot turn drift off any more.</strong> The <code>Drift</code> feature gate was removed when drift went stable in v1 (<a href="https://karpenter.sh/docs/reference/settings/">Settings — feature gates</a>). The only control is a disruption budget with <code>reasons: [Drifted]</code>. Write that budget before you write your first NodeClass.</p>
+</li>
+<li>
+<p><strong>PDBs compose by AND, and one blocking PDB immortalizes a whole node.</strong> <em>"If a pod matches multiple PDBs (via label selectors), ALL of these PDBs must allow for disruption... A single blocking PDB can prevent the entire node from being voluntary disrupted"</em> (<a href="https://karpenter.sh/docs/concepts/disruption/">Disruption — pod-level controls</a>). A team shipping <code>maxUnavailable: 0</code> "temporarily" can silently pin nodes for months. Audit for <code>maxUnavailable: 0</code> and <code>minAvailable: 100%</code> across the fleet; they are almost always mistakes.</p>
+</li>
+<li>
+<p><strong><code>expireAfter</code> + <code>do-not-disrupt</code> without <code>terminationGracePeriod</code> is a documented deadlock.</strong> Expiration begins a forceful drain; <code>do-not-disrupt</code> blocks eviction; nothing resolves it. The docs say the result is <em>"partially drained nodes stuck in the cluster, driving up cluster cost and potentially requiring manual intervention."</em> If you allow the annotation anywhere in your platform, mandate <code>terminationGracePeriod</code> on every NodePool. Enforce it with policy (see the <a href="07-kyverno.html#a-starter-policy-set-a-platform-team-would-actually-ship">Kyverno guide</a>, which ships this exact rule).</p>
+</li>
+<li>
+<p><strong><code>spec.limits</code> is eventually consistent and can be overrun.</strong> <em>"Karpenter provisioning is highly parallel. Because of this, limit checking is eventually consistent, which can result in overrun during rapid scale outs"</em> (<a href="https://karpenter.sh/docs/concepts/nodepools/">NodePools — spec.limits</a>). Do not treat limits as a hard safety boundary against a runaway workload; treat them as a guardrail and back them with cloud-account quotas. Also: use string quantities (<code>cpu: "1000"</code>) — the docs warn the API coerces CPU to a string and integers cause GitOps diff churn.</p>
+</li>
+<li>
+<p><strong>The 100-requirement ceiling counts your labels.</strong> <code>spec.template.metadata.labels</code> are propagated as NodeClaim requirements, so labels plus requirements share one budget of 100 (<a href="https://karpenter.sh/docs/concepts/nodepools/">NodePools</a>). A platform that stamps 30 cell-metadata labels onto every node has just spent a third of the budget.</p>
+</li>
+<li>
+<p><strong><code>NodeRegistrationHealthy: False</code> does not make a NodePool <code>NotReady</code>.</strong> It is explicitly informational (<a href="https://karpenter.sh/docs/concepts/nodepools/">NodePools — status.conditions</a>). A NodePool that launches instances which never register looks green in a naive dashboard while burning money. Alert on this condition directly.</p>
+</li>
+<li>
+<p><strong>Preferred affinities and <code>ScheduleAnyway</code> spreads quietly suppress consolidation.</strong> Karpenter honors preferences at launch <em>and</em> at consolidation, so a soft anti-affinity can make a node permanently unconsolidatable (<a href="https://karpenter.sh/docs/concepts/disruption/">Disruption</a>). Grep the logs for <code>has a preferred Anti-Affinity which can prevent consolidation</code>. <code>PREFERENCE_POLICY=Ignore</code> is the blunt fix.</p>
+</li>
+<li>
+<p><strong>Spot-to-spot <em>replacement</em> consolidation is off by default and needs 15 instance types.</strong> <code>SpotToSpotConsolidation</code> is alpha and disabled (<a href="https://karpenter.sh/docs/reference/settings/">Settings</a>); enabling it imposes a minimum instance-type flexibility of 15 on single-node consolidations (<a href="https://karpenter.sh/docs/concepts/disruption/">Disruption — spot consolidation</a>). A narrow spot NodePool will simply never spot-to-spot consolidate, and you will conclude the feature is broken when it is working exactly as designed.</p>
+</li>
+<li>
+<p><strong>Karpenter cannot run on a node it manages.</strong> Pin it with <code>karpenter.sh/nodepool DoesNotExist</code> node affinity plus hostname anti-affinity, on a bootstrap node group or Fargate (<a href="https://karpenter.sh/docs/getting-started/migrating-from-cas/">Migrating from CAS</a>). That bootstrap group becomes a second, un-Karpenter-managed lifecycle you must upgrade per cell. Design for it explicitly; do not discover it during a cell upgrade.</p>
+</li>
+<li>
+<p><strong>CRDs are not managed by the Helm chart upgrade path.</strong> The documented flow applies the three CRD YAMLs separately from raw GitHub URLs. With Helm-for-templating-only this is straightforward, but it must be a deliberate step in the cell pipeline — a Karpenter binary running against stale CRDs fails in confusing, partially-functional ways.</p>
+</li>
+<li>
+<p><strong><code>ISOLATED_VPC=true</code> disables on-demand pricing lookups.</strong> Cost-based consolidation then reasons over compiled-in data (<a href="https://karpenter.sh/docs/reference/settings/">Settings</a>). If cells run in isolated VPCs, either accept degraded cost decisions or budget for a pricing VPC endpoint.</p>
+</li>
+<li>
+<p><strong>Snapshot releases are deleted after 90 days.</strong> If anyone pins a cell to a snapshot tag to get an unreleased fix, that image will vanish and the cell will fail to pull on the next node launch (<a href="https://karpenter.sh/docs/upgrading/compatibility/">Compatibility — snapshot releases</a>). Only stable tags belong in a cell manifest.</p>
+</li>
+<li>
+<p><strong>The Azure NodeClass is <code>v1beta1</code> while the AWS one is <code>v1</code>.</strong> Any code, CRD-validation, or templating layer that assumes a single NodeClass API version across clouds is wrong (<a href="https://learn.microsoft.com/en-us/azure/aks/node-auto-provisioning-aksnodeclass">AKSNodeClass</a>). Encode the version per provider.</p>
+</li>
+<li>
+<p><strong>There is no supported GCP path.</strong> The only GCP provider is third-party, at <code>v1alpha1</code>, and requires an existing GKE Standard node pool to read bootstrap metadata. Do not put "Karpenter everywhere" in a design doc without stating this. GKE's ComputeClasses are the native answer.</p>
+</li>
+<li>
+<p><strong>Capacity unavailability is cached for 3 minutes.</strong> When a provider API reports no capacity for an instance-type/zone, Karpenter caches that across all provisioning attempts for 3 minutes (<a href="https://karpenter.sh/docs/concepts/nodepools/">NodePools — capacity type</a>). During a capacity crunch this makes recovery look slower than it is; do not chase a phantom bug for the first 3 minutes of an incident.</p>
+</li>
+</ol>
+<hr />
+<h2 id="how-this-shows-up-in-cell-lifecycle">How this shows up in cell lifecycle<a class="anchor" href="#how-this-shows-up-in-cell-lifecycle">#</a></h2>
+<p><strong>Cell provisioning.</strong> Karpenter is part of the cell's bootstrap graph, and its ordering constraints are real: cluster exists → bootstrap node group / Fargate profile exists → IAM roles and OIDC trust exist → subnets and security groups carry <code>karpenter.sh/discovery</code> tags → CRDs applied → Karpenter deployment healthy → NodeClass <code>status</code> resolved → NodePool <code>Ready</code> → workload NodePools created. A cell provisioning workflow (which, at Temporal, is plausibly itself a Temporal workflow) should have an activity that polls <code>NodePool.status.conditions[Ready]</code> and <code>NodeClassReady</code> rather than sleeping. The discovery-tag step is the one most likely to be forgotten, and it fails silently as an EC2NodeClass with an empty <code>status.subnets</code>.</p>
+<p><strong>Cell upgrade — the two axes.</strong> Kubernetes control-plane upgrades and node-image upgrades are separate problems with separate mechanisms:</p>
+<ul>
+<li><em>Control plane</em>: check the <a href="https://karpenter.sh/docs/upgrading/compatibility/">compatibility matrix</a> first. Moving a cell to Kubernetes 1.36 requires Karpenter ≥ 1.13. Karpenter itself upgrades before the control plane.</li>
+<li><em>Nodes</em>: bump <code>amiSelectorTerms</code> (or <code>imageFamily</code>/image version on Azure), which drifts every NodeClaim, and let a <code>reasons: [Drifted]</code> budget pace the rollout. This is genuinely elegant — a declarative image bump plus a rate limit is the whole node upgrade — but it is <em>only</em> safe if the budget is written, the AMI is pinned rather than <code>@latest</code>, and <code>terminationGracePeriod</code> is set so a stuck pod cannot wedge the rollout.</li>
+</ul>
+<p>For a fleet, the right shape is: budget of <code>nodes: "1"</code> for <code>Drifted</code> on stateful pools, a wider budget on stateless pools, and a cell-level workflow that bumps the pin, watches <code>karpenter_nodeclaims_disrupted_total{reason="drifted"}</code> climb, and gates the next cell on the previous one finishing clean. A drift rollout with no observer is a fleet-wide change with no rollback.</p>
+<p><strong>Cell teardown.</strong> The finalizer + owner-reference chain is your friend: deleting a NodePool cascades to NodeClaims, which cascade to Nodes and instances (<a href="https://karpenter.sh/docs/concepts/disruption/">Disruption — manual methods</a>). But teardown is exactly when things wedge: a <code>do-not-disrupt</code> pod, a <code>maxUnavailable: 0</code> PDB, or a stuck VolumeAttachment will hold the finalizer indefinitely. <code>terminationGracePeriod</code> is the bound that makes teardown <em>terminate</em>, which is why I'd argue it should be mandatory on every NodePool a cell platform ships, not optional. Teardown verification should independently query the cloud for instances tagged <code>karpenter.sh/nodepool</code> belonging to the cell — trusting Kubernetes to have cleaned up is how you accumulate orphaned instances across hundreds of cells.</p>
+<p><strong>Capacity and cost per cell.</strong> <code>NodePool.spec.limits</code> is your per-cell blast radius against a runaway tenant, backed by account-level quotas because limits are eventually consistent. <code>karpenter_nodepools_cost_total</code> and <code>karpenter_cluster_utilization_percent</code> give you a per-cell efficiency signal that is comparable across the fleet even if it is not billing-accurate.</p>
+<p><strong>Networking, when another team owns it.</strong> Karpenter's node-side surface touches theirs in three specific places worth naming in a design review: <code>subnetSelectorTerms</code> and <code>securityGroupSelectorTerms</code> determine which subnets and SGs new nodes land in, so a subnet-tagging change is a networking change; <code>startupTaints</code> must match whatever CNI the networking team runs, or provisioning runs away; and <code>EC2NodeClass.spec.connectionTracking</code> (TCP/UDP idle timeouts) and <code>networkInterfaces</code> are node-level networking knobs that live in a CRD you own but have networking-team consequences. <code>RESERVED_ENIS</code> matters if VPC CNI custom networking is in use, because it changes max-pods math.</p>
+<p><strong>Helm-for-templating-only.</strong> Karpenter's chart is straightforward to render with <code>helm template</code> and apply — the migration guide literally does this (<code>helm template ... &gt; karpenter.yaml</code>). The only thing to handle deliberately is CRDs, which are applied separately. This suits your model well.</p>
+<hr />
+<h2 id="learning-path">Learning path<a class="anchor" href="#learning-path">#</a></h2>
+<p><strong>Day 1 — get the model right, and unlearn the internet.</strong></p>
+<ul>
+<li>Read <a href="https://karpenter.sh/docs/concepts/">Concepts</a> end to end: NodePools, NodeClasses, NodeClaims, Scheduling, Disruption. Ninety minutes, and it replaces a week of blog posts.</li>
+<li>Read <a href="https://karpenter.sh/docs/concepts/disruption/">Disruption</a> a <strong>second</strong> time, specifically the graceful/forceful split and the budget semantics. This is the part that causes incidents.</li>
+<li>Skim <a href="https://karpenter.sh/docs/reference/settings/">Settings</a> for the feature-gate table so you know what is alpha in your version.</li>
+<li>Run Lab 1 exercises 1–3. Getting a NodeClaim to appear on a kind cluster in under an hour is very good for morale.</li>
+</ul>
+<p><strong>Week 1 — build the muscle memory for disruption.</strong></p>
+<ul>
+<li>Lab 1 exercises 4–6: drift, the <code>do-not-disrupt</code> deadlock, and serial budget rollouts. Exercise 5 is the highest-value hour on this list.</li>
+<li>Read the <a href="https://karpenter.sh/v1.0/upgrading/v1-migration/">v1 Migration guide</a> even though you will never do that migration, because it enumerates every field that moved and inoculates you against stale YAML.</li>
+<li>Read the controller IAM policy in <a href="https://karpenter.sh/docs/getting-started/migrating-from-cas/">Migrating from Cluster Autoscaler</a> line by line and be able to explain why <code>ec2:TerminateInstances</code> is tag-scoped but <code>ec2:RunInstances</code> is not.</li>
+<li>Skim the <a href="https://karpenter.sh/docs/reference/metrics/">Metrics reference</a> and draft the three dashboards above. Write the PromQL, even without data.</li>
+<li>Run Lab 3 once. Spend the $2.50. Inject a spot interruption with FIS.</li>
+<li>Read Temporal's own <a href="https://temporal.io/blog/building-durable-cloud-control-systems-with-temporal">cell architecture writeup</a> and map "cell" onto "cluster + NodePools" concretely.</li>
+</ul>
+<p><strong>Month 1 — operate it like you own it.</strong></p>
+<ul>
+<li>Read <a href="https://github.com/kubernetes-sigs/karpenter/blob/main/pkg/cloudprovider/types.go"><code>kubernetes-sigs/karpenter/pkg/cloudprovider/types.go</code></a> and the disruption controller source. The nine-method interface makes the whole multi-cloud story legible, and it tells you exactly what a provider can and cannot customize.</li>
+<li>Read the <a href="https://github.com/kubernetes-sigs/karpenter/blob/main/designs/v1-api.md">v1 API design doc</a> and the <a href="https://github.com/aws/karpenter-core/blob/main/designs/drift.md">drift design</a> for the reasoning behind the current shape.</li>
+<li>Stand up the <a href="https://github.com/Azure/karpenter-provider-azure"><code>Azure/karpenter-provider-azure</code></a> provider on an AKS cluster via NAP and diff <code>AKSNodeClass</code> against <code>EC2NodeClass</code> field by field. Write down what your cell abstraction must branch on.</li>
+<li>Write the team's NodePool standard: mandatory <code>terminationGracePeriod</code>, pinned AMI aliases, explicit budgets per reason, <code>expireAfter</code> staggered across cells, and a <code>NodeRegistrationHealthy</code> alert. Then enforce it with admission policy.</li>
+<li>Build the "why did Karpenter kill this node" runbook from <code>karpenter_voluntary_disruption_decisions_total</code> + node events + interruption metrics, and test it against a real consolidation.</li>
+<li>Read the <a href="https://karpenter.sh/docs/reference/threat-model/">Threat Model</a> before any conversation about running Karpenter in a multi-tenant account.</li>
+</ul>
+<hr />
+<h2 id="references">References<a class="anchor" href="#references">#</a></h2>
+<ol>
+<li><a href="https://karpenter.sh/docs/">Karpenter documentation (v1.14, current)</a> — the only documentation you should trust; note the version selector in the header.</li>
+<li><a href="https://karpenter.sh/docs/concepts/disruption/">Karpenter — Disruption</a> — control flow, consolidation policies, drift, expiration, interruption, node repair, budgets, <code>do-not-disrupt</code>. The single most important page.</li>
+<li><a href="https://karpenter.sh/docs/concepts/nodepools/">Karpenter — NodePools</a> — full annotated NodePool spec, well-known labels, <code>minValues</code>, weights, limits, static NodePools, status conditions.</li>
+<li><a href="https://karpenter.sh/docs/concepts/nodeclasses/">Karpenter — NodeClasses</a> — full <code>EC2NodeClass</code> v1 spec including <code>kubelet</code>, selector terms, block devices, IMDS, capacity reservations.</li>
+<li><a href="https://karpenter.sh/docs/concepts/nodeclaims/">Karpenter — NodeClaims</a> — the object Karpenter creates for each machine.</li>
+<li><a href="https://karpenter.sh/docs/concepts/scheduling/">Karpenter — Scheduling</a> — which pod scheduling constructs Karpenter simulates, topology spread, PV topology, weighted NodePools.</li>
+<li><a href="https://karpenter.sh/docs/reference/settings/">Karpenter — Settings reference</a> — every env var and CLI flag, plus the feature-gate table with stages and versions.</li>
+<li><a href="https://karpenter.sh/docs/reference/metrics/">Karpenter — Metrics reference</a> — every metric with its stability level; the source for the dashboards above.</li>
+<li><a href="https://karpenter.sh/docs/upgrading/compatibility/">Karpenter — Compatibility</a> — Kubernetes/Karpenter version matrix, breaking-change policy, release channels.</li>
+<li><a href="https://karpenter.sh/docs/upgrading/upgrade-guide/">Karpenter — Upgrade Guide</a> — per-version upgrade notes.</li>
+<li><a href="https://karpenter.sh/v1.0/upgrading/v1-migration/">Karpenter — v1 Migration guide</a> — what moved between v1beta1 and v1; read it as a stale-YAML detector.</li>
+<li><a href="https://karpenter.sh/v1.0/upgrading/v1beta1-migration/">Karpenter — v1beta1 Migration guide</a> — the earlier alpha→beta rename (<code>Provisioner</code>→<code>NodePool</code>, etc.).</li>
+<li><a href="https://karpenter.sh/docs/getting-started/migrating-from-cas/">Karpenter — Migrating from Cluster Autoscaler</a> — the complete IAM policy, Helm install, node-affinity pinning, and CAS decommission steps.</li>
+<li><a href="https://karpenter.sh/docs/getting-started/getting-started-with-karpenter/">Karpenter — Getting Started</a> — eksctl + CloudFormation path that creates the interruption queue.</li>
+<li><a href="https://karpenter.sh/docs/troubleshooting/">Karpenter — Troubleshooting</a> — the symptom-indexed debugging page; bookmark it.</li>
+<li><a href="https://karpenter.sh/docs/reference/threat-model/">Karpenter — Threat Model</a> — required reading before running Karpenter in a shared account.</li>
+<li><a href="https://karpenter.sh/docs/reference/instance-types/">Karpenter — Instance Types reference</a> — the AWS catalogue Karpenter reasons over, with resources per type.</li>
+<li><a href="https://karpenter.sh/docs/tasks/managing-amis/">Karpenter — Managing AMIs</a> — pinning strategy and the mechanics of image-driven drift.</li>
+<li><a href="https://github.com/kubernetes-sigs/karpenter">kubernetes-sigs/karpenter</a> — the provider-agnostic core library; the README lists every known cloud provider implementation.</li>
+<li><a href="https://github.com/kubernetes-sigs/karpenter/blob/main/pkg/cloudprovider/types.go">kubernetes-sigs/karpenter — <code>pkg/cloudprovider/types.go</code></a> — the nine-method <code>CloudProvider</code> interface every provider implements.</li>
+<li><a href="https://github.com/kubernetes-sigs/karpenter/blob/main/designs/v1-api.md">kubernetes-sigs/karpenter — v1 API design</a> — the reasoning behind the v1 shape.</li>
+<li><a href="https://github.com/kubernetes-sigs/karpenter/blob/main/kwok/README.md">kubernetes-sigs/karpenter — KWOK provider README</a> — the exact kind-cluster commands for Lab 1.</li>
+<li><a href="https://github.com/kubernetes-sigs/karpenter/releases/tag/v1.14.1">kubernetes-sigs/karpenter — release v1.14.1</a> — current core release, 2026-08-21.</li>
+<li><a href="https://github.com/aws/karpenter-provider-aws">aws/karpenter-provider-aws</a> — the AWS provider; also hosts the karpenter.sh website source.</li>
+<li><a href="https://github.com/aws/karpenter-provider-aws/releases/tag/v1.14.1">aws/karpenter-provider-aws — release v1.14.1</a> — current AWS release, tagged LTS through July 2027.</li>
+<li><a href="https://github.com/aws/karpenter-provider-aws/blob/main/designs/v1beta1-api.md">aws/karpenter-provider-aws — v1beta1 API design</a> — where the <code>Provisioner</code>→<code>NodePool</code> renames are enumerated.</li>
+<li><a href="https://github.com/aws/karpenter-provider-aws/tree/main/kwok">aws/karpenter-provider-aws — AWS KWOK provider</a> — fake-EC2 harness for Lab 2; make targets live in <code>kwok/Makefile</code>.</li>
+<li><a href="https://github.com/aws/karpenter-provider-aws/tree/main/examples/v1">aws/karpenter-provider-aws — v1 examples</a> — canonical, current NodePool and EC2NodeClass YAML.</li>
+<li><a href="https://aws.amazon.com/blogs/compute/introducing-price-capacity-optimized-allocation-strategy-for-ec2-spot-instances/">AWS — price-capacity-optimized allocation strategy</a> — the spot strategy Karpenter uses; explains the price/interruption trade.</li>
+<li><a href="https://aws.github.io/aws-eks-best-practices/karpenter/">AWS EKS Best Practices — Karpenter</a> — AWS's own opinionated guidance; secondary but high quality.</li>
+<li><a href="https://docs.aws.amazon.com/fis/latest/userguide/fis-actions-reference.html">AWS FIS actions reference</a> — <code>aws:ec2:send-spot-instance-interruptions</code> for injecting real spot interruptions in Lab 3.</li>
+<li><a href="https://github.com/Azure/karpenter-provider-azure">Azure/karpenter-provider-azure</a> — the AKS provider; README documents NAP vs self-hosted and the AKS-only constraint.</li>
+<li><a href="https://learn.microsoft.com/en-us/azure/aks/node-auto-provisioning">Microsoft Learn — AKS Node Auto Provisioning</a> — NAP as managed Karpenter; enablement via <code>--node-provisioning-mode Auto</code>.</li>
+<li><a href="https://learn.microsoft.com/en-us/azure/aks/node-auto-provisioning-aksnodeclass">Microsoft Learn — Configure AKSNodeClass</a> — the <code>karpenter.azure.com/v1beta1</code> NodeClass fields and defaults.</li>
+<li><a href="https://github.com/cloudpilot-ai/karpenter-provider-gcp">cloudpilot-ai/karpenter-provider-gcp</a> — the only GCP provider; third-party, <code>GCENodeClass</code> at <code>v1alpha1</code>, GKE Standard only.</li>
+<li><a href="https://cloud.google.com/kubernetes-engine/docs/concepts/about-custom-compute-classes">Google Cloud — Custom compute classes</a> — GKE's native Karpenter-NodePool analogue, with a priority hierarchy and fallback.</li>
+<li><a href="https://cloud.google.com/kubernetes-engine/docs/concepts/node-auto-provisioning">Google Cloud — Node auto-provisioning</a> — GKE's node-pool-creating extension of Cluster Autoscaler.</li>
+<li><a href="https://github.com/kubernetes/autoscaler/blob/master/cluster-autoscaler/FAQ.md">kubernetes/autoscaler — Cluster Autoscaler FAQ</a> — the authoritative source for CA's node-group model, scale-down thresholds, and eviction annotations.</li>
+<li><a href="https://github.com/kubernetes-sigs/karpenter-provider-cluster-api">kubernetes-sigs/karpenter-provider-cluster-api</a> — experimental CAPI-backed provider; useful design reference, not a production path.</li>
+<li><a href="https://kwok.sigs.k8s.io/">KWOK — Kubernetes WithOut Kubelet</a> — the node simulator underneath Lab 1; also useful on its own for scheduler testing.</li>
+</ol><p class="disclaimer"><strong>Disclaimer.</strong> I wrote this library before I joined Temporal, to ramp up on the areas my new role would likely touch. It contains no internal information &mdash; nothing here was sourced from Temporal&rsquo;s internal knowledge. Temporal is open source, so the programming model and server internals come from public code and documentation, and every statement about Temporal Cloud comes from Temporal&rsquo;s public docs and engineering blog, linked inline. Most of the library is general infrastructure technology &mdash; Go, gRPC, Kubernetes, Karpenter, Terraform, Helm, Vault, cert-manager, GitOps, observability &mdash; that has nothing to do with any one company. Where a guide goes beyond public sources, it says so and labels the claim as inference.</p></article><aside class="rail"><div class="rail-label">On this page</div><a href="#the-mental-model">The mental model</a><a href="#core-concepts">Core concepts</a><a class="h3" href="#why-karpenter-exists-the-cluster-autoscaler-comparison">Why Karpenter exists: the Cluster Autoscaler comparison</a><a class="h3" href="#the-v1-api-three-kinds">The v1 API: three kinds</a><a class="h3" href="#disruption-in-depth">Disruption in depth</a><a class="h3" href="#spot">Spot</a><a class="h3" href="#how-karpenter-interacts-with-pdbs-statefulsets-and-long-lived-workloads">How Karpenter interacts with PDBs, StatefulSets, and long-lived workloads</a><a class="h3" href="#scheduling-inputs-karpenter-respects--and-the-ones-it-handles-poorly">Scheduling inputs Karpenter respects — and the ones it handles poorly</a><a class="h3" href="#newer-capabilities-worth-knowing-exist">Newer capabilities worth knowing exist</a><a class="h3" href="#multi-cloud-status--verified-not-assumed">Multi-cloud status — verified, not assumed</a><a class="h3" href="#installation-iam-and-the-bootstrap-chicken-and-egg">Installation, IAM, and the bootstrap chicken-and-egg</a><a class="h3" href="#observability-metrics-events-logs">Observability: metrics, events, logs</a><a class="h3" href="#cost-implications-and-instance-type-selection-strategy">Cost implications and instance-type selection strategy</a><a href="#hands-on">Hands-on</a><a class="h3" href="#honest-framing">Honest framing</a><a class="h3" href="#lab-1--karpenter-on-kind-with-the-kwok-provider-free">Lab 1 — Karpenter on kind with the KWOK provider (free)</a><a class="h3" href="#lab-2--the-aws-kwok-provider-free-more-realistic">Lab 2 — the AWS KWOK provider (free, more realistic)</a><a class="h3" href="#lab-3--a-real-eks-cluster-costed">Lab 3 — a real EKS cluster (costed)</a><a href="#production-gotchas">Production gotchas</a><a href="#how-this-shows-up-in-cell-lifecycle">How this shows up in cell lifecycle</a><a href="#learning-path">Learning path</a><a href="#references">References</a></aside></div></div><script>
+document.querySelectorAll('.codehilite').forEach(function(block){
+  var wrap=document.createElement('div'); wrap.className='codewrap';
+  block.parentNode.insertBefore(wrap,block); wrap.appendChild(block);
+  var b=document.createElement('button'); b.className='copybtn'; b.textContent='copy';
+  b.addEventListener('click',function(){
+    var txt=block.innerText;
+    if(navigator.clipboard&&navigator.clipboard.writeText){
+      navigator.clipboard.writeText(txt).then(function(){
+        b.textContent='copied'; setTimeout(function(){b.textContent='copy';},1200);
+      }).catch(function(){b.textContent='select manually';});
+    } else {
+      var ta=document.createElement('textarea'); ta.value=txt; document.body.appendChild(ta);
+      ta.select(); try{document.execCommand('copy'); b.textContent='copied';}catch(e){}
+      document.body.removeChild(ta); setTimeout(function(){b.textContent='copy';},1200);
+    }
+  });
+  wrap.appendChild(b);
+});
+
+document.querySelectorAll('.doc table').forEach(function(t){
+  if(t.parentNode.classList.contains('tablewrap'))return;
+  var w=document.createElement('div'); w.className='tablewrap';
+  t.parentNode.insertBefore(w,t); w.appendChild(t);
+});
+
+(function(){
+  var links=Array.prototype.slice.call(document.querySelectorAll('.rail a'));
+  if(!links.length)return;
+  var map={};
+  links.forEach(function(a){
+    var el=document.getElementById(a.getAttribute('href').slice(1));
+    if(el)map[a.getAttribute('href').slice(1)]=a;
+  });
+  var obs=new IntersectionObserver(function(entries){
+    entries.forEach(function(e){
+      var a=map[e.target.id]; if(!a)return;
+      if(e.isIntersecting){
+        links.forEach(function(x){x.classList.remove('here');});
+        a.classList.add('here');
+      }
+    });
+  },{rootMargin:'0px 0px -78% 0px',threshold:0});
+  Object.keys(map).forEach(function(id){
+    var el=document.getElementById(id); if(el)obs.observe(el);
+  });
+})();
+</script>
+<script>/* open external links in a new tab; links within the library stay in this tab */
+document.addEventListener('click',function(e){var a=e.target.closest&&e.target.closest('a[href]');if(!a)return;var h=a.getAttribute('href');if(!h||h.charAt(0)==='#'||h.indexOf('javascript:')===0||a.hasAttribute('download'))return;if(!/^https?:$/.test(a.protocol)||a.host===location.host)return;a.target='_blank';a.rel='noopener';},true);
+</script>
+</body>
+</html>
